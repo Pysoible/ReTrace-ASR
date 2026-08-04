@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+config.llm.json
+.env
+frontend/dist/
+frontend/node_modules/
+node_modules/
+.DS_Store
+.worktrees/

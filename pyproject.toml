@@ -1,0 +1,30 @@
+[project]
+name = "retrace-asr"
+version = "0.1.0"
+description = "Evidence-grounded retrospective revision for conversational ASR."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.116.0",
+  "uvicorn[standard]>=0.35.0",
+  "pydantic>=2.10.0",
+]
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28.0",
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+retrace-asr = "asr_agent.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/asr_agent"]
