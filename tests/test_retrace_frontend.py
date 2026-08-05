@@ -22,3 +22,12 @@ def test_workspace_renders_live_subtitles_and_inline_revisions():
     assert "revision-link" in source
     assert "incorrect" in source
     assert "corrected" in source
+
+
+def test_workspace_has_audio_input_panel():
+    source = Path("frontend/src/main.ts").read_text(encoding="utf-8")
+    lower = source.lower()
+    assert "qwen-omni audio input" in lower
+    assert "dropzone" in lower
+    assert "audio/upload" in lower
+    assert 'type="file"' in source
