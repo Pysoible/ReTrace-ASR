@@ -150,6 +150,46 @@ class ReTraceService:
         self._save(session)
         return {"session": session.as_dict(), "event": asdict(undo)}
 
+    def confirm_hypothesis(self, session_id: str, turn_id: str, span: str, candidate: str, *, reason: str = "") -> dict[str, Any]:
+        """Commit a known candidate only after an operator explicitly confirms it."""
+        session = self._load(session_id)
+        turn = next((item for item in session.turns if item.turn_id == turn_id), None)
+        if turn is None:
+            raise ValueError(f"unknown turn: {turn_id}")
+        hypothesis = next((item for item in turn.hypotheses if item.span == span), None)
+        if hypothesis is None or candidate not in hypothesis.text_candidates:
+            raise ValueError("candidate is not available for this hypothesis")
+        if candidate == span:
+            hypothesis.decision = "WAIT"
+            hypothesis.decision_rationale = ["operator_kept_original"]
+            self._save(session)
+            return {"session": session.as_dict(), "event": None}
+        before = turn.current_text
+        if span not in before:
+            raise ValueError("hypothesis span is not present in the current subtitle")
+        turn.current_text = before.replace(span, candidate, 1)
+        hypothesis.action = "REVISE_TEXT"
+        hypothesis.decision = "COMMIT"
+        hypothesis.decision_rationale = ["operator_confirmed"]
+        event = RevisionEvent(
+            event_id=uuid.uuid4().hex,
+            action="REVISE_TEXT",
+            target_turn_id=turn_id,
+            source_turn_id=turn_id,
+            span=span,
+            before_text=before,
+            after_text=turn.current_text,
+            entity_id=None,
+            score=1.0,
+            evidence=["operator confirmation"],
+            resolver="user-confirmed",
+            rationale=reason,
+            replacement=candidate,
+        )
+        session.revision_events.append(event)
+        self._save(session)
+        return {"session": session.as_dict(), "event": asdict(event)}
+
     @staticmethod
     def _replay(session: Session) -> None:
         """Derive visible text and memory only from immutable raw turns and active events."""

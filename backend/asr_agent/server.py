@@ -26,6 +26,15 @@ class TurnRequest(BaseModel):
     text_candidates: dict[str, list[str]] = Field(default_factory=dict)
     entity_candidate_ids: dict[str, list[str]] = Field(default_factory=dict)
     use_llm: bool = False
+    nbest: list[str] = Field(default_factory=list)
+    risk: str = "medium"
+    speaker: str | None = None
+
+
+class ConfirmHypothesisRequest(BaseModel):
+    span: str
+    candidate: str
+    reason: str = ""
 
 
 class UndoRequest(BaseModel):
@@ -100,6 +109,9 @@ def create_app(workspace: Path | None = None) -> FastAPI:
                 entity_candidate_ids=request.entity_candidate_ids,
                 use_llm=request.use_llm,
                 source="text",
+                risk=request.risk,
+                nbest=request.nbest,
+                meta={"speaker": request.speaker} if request.speaker else None,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -224,6 +236,13 @@ def create_app(workspace: Path | None = None) -> FastAPI:
             return service.undo_revision(session_id, event_id, reason=request.reason)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/sessions/{session_id}/hypotheses/{turn_id}/confirm")
+    def confirm_hypothesis(session_id: str, turn_id: str, request: ConfirmHypothesisRequest) -> dict[str, Any]:
+        try:
+            return service.confirm_hypothesis(session_id, turn_id, request.span, request.candidate, reason=request.reason)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     frontend = Path(__file__).parents[2] / "frontend" / "dist"
     if frontend.exists():

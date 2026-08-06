@@ -44,3 +44,24 @@ def test_audio_upload_endpoint_rejects_empty_file(tmp_path):
         files={"file": ("empty.wav", b"", "audio/wav")},
     )
     assert response.status_code == 400
+
+
+def test_confirmation_commits_known_candidate_as_auditable_event(tmp_path):
+    client = TestClient(create_app(tmp_path))
+    client.post(
+        "/api/sessions/s/turns",
+        json={
+            "turn_id": "t1", "text": "图博士到了", "risk": "high",
+            "confidence": {"图博士": 0.2},
+            "text_candidates": {"图博士": ["图博士", "涂博士"]},
+        },
+    )
+
+    response = client.post(
+        "/api/sessions/s/hypotheses/t1/confirm",
+        json={"span": "图博士", "candidate": "涂博士", "reason": "operator confirmed"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["session"]["turns"][0]["current_text"] == "涂博士到了"
+    assert response.json()["event"]["resolver"] == "user-confirmed"
