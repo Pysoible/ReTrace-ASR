@@ -56,6 +56,7 @@ class RevisionEvent:
     rationale: str = ""
     reverted_event_id: str | None = None
     reason: str = ""
+    replacement: str = ""
 
 
 @dataclass
@@ -92,9 +93,10 @@ class Session:
 
 
 class ReTraceService:
-    def __init__(self, storage_dir: Path, evidence_scorer: Callable[..., dict[str, Any]] | None = None) -> None:
+    def __init__(self, storage_dir: Path, evidence_scorer: Callable[..., dict[str, Any]] | None = None, reflector: Callable[..., list[dict[str, Any]]] | None = None) -> None:
         self.storage_dir = storage_dir
         self.evidence_scorer = evidence_scorer
+        self.reflector = reflector
 
     def upsert_entities(self, session_id: str, profiles: list[EntityProfile]) -> dict[str, Any]:
         session = self._load(session_id)
@@ -116,13 +118,12 @@ class ReTraceService:
         if turn is None:
             raise ValueError(f"revision target is missing: {event.target_turn_id}")
         before = turn.current_text
-        turn.current_text = event.before_text
         event.active = False
-        if event.entity_id:
-            session.verified_memory.pop(event.entity_id, None)
-            profile = session.entities.get(event.entity_id)
-            if profile:
-                session.quarantine_memory[event.entity_id] = {"name": profile.name, "status": "candidate"}
+        for hypothesis in turn.hypotheses:
+            if hypothesis.span == event.span:
+                hypothesis.action = "DEFER"
+                hypothesis.entity_id = None
+        self._replay(session)
         undo = RevisionEvent(
             event_id=uuid.uuid4().hex,
             action="UNDO_REVISION",
@@ -141,6 +142,35 @@ class ReTraceService:
         session.revision_events.append(undo)
         self._save(session)
         return {"session": session.as_dict(), "event": asdict(undo)}
+
+    @staticmethod
+    def _replay(session: Session) -> None:
+        """Derive visible text and memory only from immutable raw turns and active events."""
+        for turn in session.turns:
+            turn.current_text = turn.raw_text
+        session.verified_memory = {}
+        session.quarantine_memory = {}
+        turns = {turn.turn_id: turn for turn in session.turns}
+        for event in session.revision_events:
+            if not event.active or event.action not in {"REVISE_TEXT", "REVISE_ENTITY"}:
+                continue
+            turn = turns.get(event.target_turn_id)
+            if not turn:
+                continue
+            if event.replacement and event.span in turn.current_text:
+                turn.current_text = turn.current_text.replace(event.span, event.replacement, 1)
+            else:
+                turn.current_text = event.after_text
+            if event.entity_id and event.entity_id in session.entities:
+                profile = session.entities[event.entity_id]
+                session.verified_memory[event.entity_id] = {"name": profile.name, "source_turn_id": event.source_turn_id}
+        for turn in session.turns:
+            for hypothesis in turn.hypotheses:
+                if hypothesis.action == "DEFER":
+                    for entity_id in hypothesis.entity_candidate_ids:
+                        profile = session.entities.get(entity_id)
+                        if profile:
+                            session.quarantine_memory[entity_id] = {"name": profile.name, "status": "candidate"}
 
     def reset_session(self, session_id: str) -> dict[str, Any]:
         """Replace an existing session with an empty one (one long audio = one session)."""
@@ -196,7 +226,8 @@ class ReTraceService:
                 meta=llm_meta,
             )
         )
-        revisions = self._reassess(session, source_index=len(session.turns) - 1, use_llm=use_llm)
+        source_index = len(session.turns) - 1
+        revisions = self._reflect(session, source_index) + self._reassess(session, source_index=source_index, use_llm=use_llm)
         self._save(session)
         return {
             "session": session.as_dict(),
@@ -204,6 +235,56 @@ class ReTraceService:
             "actions": [item.action for item in hypotheses],
             "integrations": {"source": source},
         }
+
+    def _reflect(self, session: Session, source_index: int) -> list[dict[str, Any]]:
+        if source_index == 0:
+            return []
+        reflector = self.reflector
+        if reflector is None:
+            from asr_agent.integrations.deepseek import reflect_timeline
+
+            reflector = reflect_timeline
+        proposals = reflector(
+            prior_turns=[{"turn_id": turn.turn_id, "raw_text": turn.raw_text} for turn in session.turns[:source_index]],
+            new_turn={"turn_id": session.turns[source_index].turn_id, "raw_text": session.turns[source_index].raw_text},
+        )
+        indexes = {turn.turn_id: index for index, turn in enumerate(session.turns)}
+        committed: list[dict[str, Any]] = []
+        for proposal in proposals or []:
+            target_id = str(proposal.get("target_turn_id") or "")
+            target_index = indexes.get(target_id, source_index)
+            before = str(proposal.get("before_text") or "")
+            after = str(proposal.get("after_text") or "")
+            score = float(proposal.get("score") or 0.0)
+            target = session.turns[target_index] if target_index < source_index else None
+            if target is None or not before or not after or before == after or before not in target.current_text or score < 0.7:
+                continue
+            evidence: list[str] = []
+            valid = True
+            for item in proposal.get("evidence") or []:
+                if not isinstance(item, dict):
+                    valid = False
+                    break
+                evidence_id, quote = str(item.get("turn_id") or ""), str(item.get("quote") or "")
+                evidence_index = indexes.get(evidence_id, -1)
+                if not quote or evidence_index <= target_index or evidence_index > source_index or quote not in session.turns[evidence_index].raw_text:
+                    valid = False
+                    break
+                evidence.append(f"{evidence_id}:{quote}")
+            if not valid or not evidence:
+                continue
+            before_display = target.current_text
+            target.current_text = target.current_text.replace(before, after, 1)
+            event = RevisionEvent(
+                event_id=uuid.uuid4().hex, action="REVISE_TEXT", target_turn_id=target.turn_id,
+                source_turn_id=session.turns[source_index].turn_id, span=before, before_text=before_display,
+                after_text=target.current_text, entity_id=None, score=round(score, 3), evidence=evidence,
+                resolver="deepseek-reflect", rationale=str(proposal.get("rationale") or ""),
+                replacement=after,
+            )
+            session.revision_events.append(event)
+            committed.append(asdict(event))
+        return committed
 
     @staticmethod
     def _recall_entity_fallbacks(session: Session, text: str) -> list[tuple[str, str, str]]:
@@ -346,6 +427,7 @@ class ReTraceService:
             evidence=evidence,
             resolver=resolver,
             rationale=rationale,
+            replacement=candidate if action == "REVISE_TEXT" else "",
         )
         session.revision_events.append(event)
         return asdict(event)
