@@ -322,14 +322,6 @@ main {
 }
 .asr-result dl { margin: 10px 0 0; }
 .asr-result p { margin: 8px 0 0; font-size: 14.5px; }
-.evolve-result ol {
-  margin: 10px 0 0;
-  padding-left: 20px;
-  font-size: 14px;
-  color: #4f5b62;
-  line-height: 1.5;
-}
-.evolve-result li { margin: 8px 0; }
 
 .subtitle-stage,
 .explainer {
@@ -442,6 +434,11 @@ dt {
   letter-spacing: 0.08em;
 }
 dd { margin: 0; word-break: break-word; }
+
+.undo-field { display: block; margin: 16px 0 8px; font: 700 11px ui-monospace, monospace; color: #53656a; }
+.undo-field input { display: block; width: 100%; box-sizing: border-box; margin-top: 6px; padding: 9px; border: 1px solid #bcc8c8; background: #fff; }
+.btn-danger { border: 1px solid #a9464f; background: #fff; color: #922d36; padding: 9px 12px; font: 700 11px ui-monospace, monospace; cursor: pointer; }
+.status-line { grid-column: 1 / -1; margin: 0; color: #587178; font: 12px ui-monospace, monospace; }
 
 @media (max-width: 1200px) {
   .studio { grid-template-columns: minmax(320px, 380px) minmax(0, 1fr); }

@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass
@@ -39,12 +40,32 @@ class Turn:
 
 
 @dataclass
+class RevisionEvent:
+    event_id: str
+    action: str
+    target_turn_id: str
+    source_turn_id: str
+    span: str
+    before_text: str
+    after_text: str
+    entity_id: str | None
+    score: float
+    evidence: list[str]
+    resolver: str
+    active: bool = True
+    rationale: str = ""
+    reverted_event_id: str | None = None
+    reason: str = ""
+
+
+@dataclass
 class Session:
     session_id: str
     entities: dict[str, EntityProfile] = field(default_factory=dict)
     turns: list[Turn] = field(default_factory=list)
     verified_memory: dict[str, dict[str, str]] = field(default_factory=dict)
     quarantine_memory: dict[str, dict[str, str]] = field(default_factory=dict)
+    revision_events: list[RevisionEvent] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -66,12 +87,14 @@ class Session:
         ]
         session.verified_memory = raw.get("verified_memory", {})
         session.quarantine_memory = raw.get("quarantine_memory", {})
+        session.revision_events = [RevisionEvent(**item) for item in raw.get("revision_events", [])]
         return session
 
 
 class ReTraceService:
-    def __init__(self, storage_dir: Path) -> None:
+    def __init__(self, storage_dir: Path, evidence_scorer: Callable[..., dict[str, Any]] | None = None) -> None:
         self.storage_dir = storage_dir
+        self.evidence_scorer = evidence_scorer
 
     def upsert_entities(self, session_id: str, profiles: list[EntityProfile]) -> dict[str, Any]:
         session = self._load(session_id)
@@ -81,6 +104,38 @@ class ReTraceService:
 
     def get_session(self, session_id: str) -> dict[str, Any]:
         return self._load(session_id).as_dict()
+
+    def undo_revision(self, session_id: str, event_id: str, *, reason: str = "") -> dict[str, Any]:
+        session = self._load(session_id)
+        event = next((item for item in session.revision_events if item.event_id == event_id), None)
+        if event is None or event.action not in {"REVISE_TEXT", "REVISE_ENTITY"}:
+            raise ValueError(f"unknown revision event: {event_id}")
+        if not event.active:
+            raise ValueError(f"revision event already inactive: {event_id}")
+        turn = next((item for item in session.turns if item.turn_id == event.target_turn_id), None)
+        if turn is None:
+            raise ValueError(f"revision target is missing: {event.target_turn_id}")
+        before = turn.current_text
+        turn.current_text = event.before_text
+        event.active = False
+        undo = RevisionEvent(
+            event_id=uuid.uuid4().hex,
+            action="UNDO_REVISION",
+            target_turn_id=event.target_turn_id,
+            source_turn_id=event.source_turn_id,
+            span=event.span,
+            before_text=before,
+            after_text=turn.current_text,
+            entity_id=event.entity_id,
+            score=1.0,
+            evidence=["manual undo"],
+            resolver="controller",
+            reverted_event_id=event.event_id,
+            reason=reason,
+        )
+        session.revision_events.append(undo)
+        self._save(session)
+        return {"session": session.as_dict(), "event": asdict(undo)}
 
     def reset_session(self, session_id: str) -> dict[str, Any]:
         """Replace an existing session with an empty one (one long audio = one session)."""
@@ -98,7 +153,6 @@ class ReTraceService:
         text_candidates: dict[str, list[str]] | None = None,
         entity_candidate_ids: dict[str, list[str]] | None = None,
         use_llm: bool = False,
-        correct_with_llm: bool = False,
         source: str = "text",
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -108,13 +162,6 @@ class ReTraceService:
 
         llm_meta: dict[str, Any] = dict(meta or {})
         working_text = text
-        if correct_with_llm:
-            from asr_agent.integrations.deepseek import correct_text_with_deepseek
-
-            correction = correct_text_with_deepseek(working_text)
-            llm_meta["deepseek_correct"] = correction
-            if correction.get("ok") and correction.get("corrected"):
-                working_text = str(correction["corrected"])
 
         confidence, text_candidates, entity_candidate_ids = confidence or {}, text_candidates or {}, entity_candidate_ids or {}
         spans = set(text_candidates) | set(entity_candidate_ids)
@@ -148,7 +195,7 @@ class ReTraceService:
             "session": session.as_dict(),
             "revisions": revisions,
             "actions": [item.action for item in hypotheses],
-            "integrations": {"use_llm": use_llm, "correct_with_llm": correct_with_llm, "source": source},
+            "integrations": {"source": source},
         }
 
     def _reassess(self, session: Session, source_index: int, *, use_llm: bool = False) -> list[dict[str, Any]]:
@@ -161,8 +208,7 @@ class ReTraceService:
                 rule_hit = self._rule_resolve(session, turn, hypothesis, evidence_text, source_index)
                 if rule_hit:
                     revisions.append(rule_hit)
-                    continue
-                if use_llm:
+                elif use_llm:
                     llm_hit = self._llm_resolve(session, turn, hypothesis, evidence_text, source_index)
                     if llm_hit:
                         revisions.append(llm_hit)
@@ -203,77 +249,39 @@ class ReTraceService:
             resolver="rule",
         )
 
-    def _llm_resolve(
-        self,
-        session: Session,
-        turn: Turn,
-        hypothesis: Hypothesis,
-        evidence_text: str,
-        source_index: int,
-    ) -> dict[str, Any] | None:
-        from asr_agent.integrations.deepseek import revise_with_deepseek
+    def _llm_resolve(self, session: Session, turn: Turn, hypothesis: Hypothesis, evidence_text: str, source_index: int) -> dict[str, Any] | None:
+        scorer = self.evidence_scorer
+        if scorer is None:
+            from asr_agent.integrations.deepseek import score_evidence
 
-        entity_candidates = []
-        for entity_id in hypothesis.entity_candidate_ids:
-            profile = session.entities.get(entity_id)
-            if profile:
-                entity_candidates.append(
-                    {
-                        "entity_id": profile.entity_id,
-                        "name": profile.name,
-                        "aliases": profile.aliases,
-                        "attributes": profile.attributes,
-                    }
-                )
-        result = revise_with_deepseek(
+            scorer = score_evidence
+        candidates = list(dict.fromkeys(hypothesis.text_candidates or [hypothesis.span]))
+        entities = [session.entities[item] for item in hypothesis.entity_candidate_ids if item in session.entities]
+        result = scorer(
             span=hypothesis.span,
-            text_candidates=hypothesis.text_candidates,
-            entity_candidates=entity_candidates,
+            text_candidates=candidates,
+            entity_candidates=[asdict(item) for item in entities],
             prior_text=turn.current_text,
             evidence_text=evidence_text,
         )
-        if not result.get("ok"):
+        action = str(result.get("action") or "DEFER").upper()
+        candidate = str(result.get("candidate") or hypothesis.span)
+        entity_id = str(result.get("entity_id") or "")
+        if action not in {"KEEP", "REVISE_TEXT", "REVISE_ENTITY", "DEFER", "CLARIFY"}:
             return None
-        action = str(result.get("action") or "DEFER")
         if action in {"KEEP", "DEFER", "CLARIFY"}:
             if action == "KEEP":
                 hypothesis.action = "KEEP"
-            return {
-                "action": action,
-                "target_turn_id": turn.turn_id,
-                "source_turn_id": session.turns[source_index].turn_id,
-                "span": hypothesis.span,
-                "before_text": turn.current_text,
-                "after_text": turn.current_text,
-                "entity_id": result.get("entity_id"),
-                "score": round(float(result.get("score") or 0.0), 3),
-                "evidence": list(result.get("evidence") or []),
-                "resolver": "deepseek",
-                "rationale": result.get("rationale"),
-            }
-        if action not in {"REVISE_TEXT", "REVISE_ENTITY"}:
             return None
-
-        entity_id = result.get("entity_id")
-        profile = session.entities.get(str(entity_id)) if entity_id else None
-        if profile is None and hypothesis.entity_candidate_ids:
-            # Fall back to first known candidate if model omitted/mismatched id.
-            profile = session.entities.get(hypothesis.entity_candidate_ids[0])
-        if profile is None:
+        if candidate not in candidates or (entity_id and entity_id not in hypothesis.entity_candidate_ids):
             return None
-        candidate = str(result.get("candidate") or hypothesis.span)
+        profile = session.entities.get(entity_id) if entity_id else None
+        if action == "REVISE_ENTITY" and profile is None:
+            return None
         return self._commit_revision(
-            session,
-            turn,
-            hypothesis,
-            source_index,
-            profile=profile,
-            candidate=candidate,
-            score=float(result.get("score") or 0.0),
-            evidence=list(result.get("evidence") or [result.get("rationale") or "deepseek"]),
-            resolver="deepseek",
-            forced_action=action,
-            rationale=str(result.get("rationale") or ""),
+            session, turn, hypothesis, source_index, profile=profile, candidate=candidate,
+            score=float(result.get("score") or 0.0), evidence=[str(item) for item in result.get("evidence") or []],
+            resolver="deepseek", forced_action=action, rationale=str(result.get("rationale") or ""),
         )
 
     def _commit_revision(
@@ -283,7 +291,7 @@ class ReTraceService:
         hypothesis: Hypothesis,
         source_index: int,
         *,
-        profile: EntityProfile,
+        profile: EntityProfile | None,
         candidate: str,
         score: float,
         evidence: list[str],
@@ -295,27 +303,27 @@ class ReTraceService:
         action = forced_action or ("REVISE_TEXT" if candidate != hypothesis.span else "REVISE_ENTITY")
         if action == "REVISE_TEXT" and candidate != hypothesis.span and hypothesis.span in turn.current_text:
             turn.current_text = turn.current_text.replace(hypothesis.span, candidate, 1)
-        hypothesis.entity_id, hypothesis.action = profile.entity_id, action
-        session.verified_memory[profile.entity_id] = {
-            "name": profile.name,
-            "source_turn_id": session.turns[source_index].turn_id,
-        }
-        session.quarantine_memory.pop(profile.entity_id, None)
-        item = {
-            "action": action,
-            "target_turn_id": turn.turn_id,
-            "source_turn_id": session.turns[source_index].turn_id,
-            "span": hypothesis.span,
-            "before_text": before,
-            "after_text": turn.current_text,
-            "entity_id": profile.entity_id,
-            "score": round(score, 3),
-            "evidence": evidence,
-            "resolver": resolver,
-        }
-        if rationale:
-            item["rationale"] = rationale
-        return item
+        hypothesis.action = action
+        if profile:
+            hypothesis.entity_id = profile.entity_id
+            session.verified_memory[profile.entity_id] = {"name": profile.name, "source_turn_id": session.turns[source_index].turn_id}
+            session.quarantine_memory.pop(profile.entity_id, None)
+        event = RevisionEvent(
+            event_id=uuid.uuid4().hex,
+            action=action,
+            target_turn_id=turn.turn_id,
+            source_turn_id=session.turns[source_index].turn_id,
+            span=hypothesis.span,
+            before_text=before,
+            after_text=turn.current_text,
+            entity_id=profile.entity_id if profile else None,
+            score=round(score, 3),
+            evidence=evidence,
+            resolver=resolver,
+            rationale=rationale,
+        )
+        session.revision_events.append(event)
+        return asdict(event)
 
     def _path(self, session_id: str) -> Path:
         return self.storage_dir / f"{session_id}.json"

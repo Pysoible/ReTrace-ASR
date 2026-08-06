@@ -1,39 +1,32 @@
 # ReTrace-ASR
 
-Evidence-grounded retrospective revision for conversational ASR. Qwen-Omni observations are stored immutably; later conversational evidence can revise a prior text span or bind a same-name entity while preserving a complete audit record.
+ReTrace-ASR is an evidence-grounded retrospective agent for conversational ASR. Qwen-Omni produces immutable audio observations; later turns can provide evidence for revising an earlier uncertain span while preserving the complete audit trail.
 
-## Core concepts
+## Method
 
-- Versioned transcript state
-- Text candidate and entity candidate hypotheses
-- Future-context evidence only
-- Verified and quarantine entity memory
-- `KEEP`, `REVISE_TEXT`, `REVISE_ENTITY`, `DEFER`, and `CLARIFY`
+1. Qwen-Omni transcribes audio into silence-aware chunks. Each chunk is an ordered `Turn` with immutable `raw_text`.
+2. Low-confidence text or entity alternatives enter `quarantine_memory` as hypotheses, never as facts.
+3. The ReTrace controller first evaluates deterministic later-turn evidence. When it remains unresolved, it calls DeepSeek as a constrained evidence judge and validates its result against the known candidate set before choosing `KEEP`, `REVISE_TEXT`, `REVISE_ENTITY`, `DEFER`, or `CLARIFY`.
+4. A successful decision appends a `RevisionEvent` with its evidence, score and source turn. `verified_memory` records only promoted entities.
+5. `UNDO_REVISION` appends a new event and restores the prior display state; no ASR observation or previous audit event is deleted.
 
 ## Run
 
 ```bash
-uv sync
+uv sync --group dev
 cd frontend && npm install && npm run build && cd ..
 uv run uvicorn asr_agent.server:app --reload
 ```
 
-Submit entity profiles with `PUT /api/sessions/{session_id}/entities`, then submit Qwen-Omni observations with `POST /api/sessions/{session_id}/turns`. The browser workspace shows the versioned timeline and the evidence behind every revision.
+For GPU audio transcription, copy `.env.example` to `.env`, set `ASR_AUDIO_ENABLED=1`, and point `ASR_MODEL_PATH` to a Qwen-Omni checkpoint.
+Set `DEEPSEEK_API_KEY` to enable the controller's fallback evidence-judging action. DeepSeek can never directly overwrite transcript text.
 
-## Integrations (same stack as ASR_agent)
+## APIs
 
-| Backend | How ReTrace connects |
-|---------|----------------------|
-| **DeepSeek** | Reuses sibling `ASR_domainterms` (`llm_client` over Huawei WS / public HTTP). Load via `ASR_DOMAINTERMS_ROOT` + that repo's `.env`. |
-| **Qwen-Omni ASR** | Local ms-swift `VllmEngine` two-pass (Pass1 → dictionary retrieve → Pass2), gated by `ASR_AUDIO_ENABLED=1`. |
+- `POST /api/sessions/{id}/turns` — append a text ASR observation with optional confidence/candidate maps.
+- `POST /api/sessions/{id}/audio/upload` — upload one audio file; its chunks become ordered turns in one session.
+- `GET /api/sessions/{id}` — retrieve raw observations, memory layers and persisted revision events.
+- `POST /api/sessions/{id}/revisions/{event_id}/undo` — append an auditable undo event.
+- `GET /api/integrations/status` — Qwen adapter readiness.
 
-Useful endpoints:
-
-- `GET /api/integrations/status` — DeepSeek / Qwen readiness
-- `POST /api/sessions/{id}/turns` — text observation; set `use_llm=true` for DeepSeek deferred revise, `correct_with_llm=true` for DeepSeek text correction
-- `POST /api/sessions/{id}/audio` — Qwen two-pass ASR then ReTrace revise (`{"turn_id","audio",...}`)
-- `POST /api/integrations/deepseek/correct` — standalone DeepSeek text correction
-
-Long audio is automatically split (silence-aware, default `ASR_CHUNK_MAX_SEC=15`) before Qwen-Omni. **One audio file = one session**; each chunk becomes a turn (`t001`, `t002`, …) so later context can revise earlier turns. Session id defaults from the audio filename (`audio_<name>`).
-
-See `.env.example`. DeepSeek credentials stay in `ASR_domainterms/.env` (do not duplicate keys here).
+The Studio UI renders the current subtitle, original text, subsequent evidence, event state and undo operation.

@@ -1,6 +1,7 @@
 import numpy as np
 
 from asr_agent.integrations.audio_chunk import ChunkConfig, join_transcripts, plan_chunks
+from asr_agent.integrations.qwen_asr import parse_observation
 
 
 def test_short_audio_is_single_chunk():
@@ -24,3 +25,10 @@ def test_long_audio_is_split_under_max_sec():
 
 def test_join_transcripts_concatenates_chinese():
     assert join_transcripts(["施工电梯", "报验完成"]) == "施工电梯报验完成"
+
+
+def test_qwen_observation_preserves_only_valid_uncertainty_candidates():
+    observation = parse_observation('{"text":"图博士到了","uncertain_spans":[{"span":"图博士","candidates":["图博士","涂博士"],"confidence":0.2}]}')
+    assert observation["text"] == "图博士到了"
+    assert observation["uncertainty"]["confidence"] == {"图博士": 0.2}
+    assert observation["uncertainty"]["text_candidates"] == {"图博士": ["图博士", "涂博士"]}
