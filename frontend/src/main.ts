@@ -1,7 +1,9 @@
 import './styles.css';
 
 type RevisionEvent = { event_id: string; action: string; target_turn_id: string; source_turn_id: string; before_text: string; after_text: string; evidence: string[]; score: number; active: boolean; reverted_event_id?: string; reason?: string };
-type Turn = { turn_id: string; raw_text: string; current_text: string; source?: string; meta?: { start_sec?: number; end_sec?: number } };
+type Candidate = { text: string; score: number };
+type Hypothesis = { span: string; candidates: Candidate[]; decision: string; decision_rationale: string[]; evidence_packet?: { asr_uncertainty?: { confidence?: number; nbest?: string[] }; suspicious_span?: { reasons?: string[] } | null; later_raw_evidence?: string[] } };
+type Turn = { turn_id: string; raw_text: string; current_text: string; hypotheses?: Hypothesis[]; source?: string; meta?: { start_sec?: number; end_sec?: number } };
 type Session = { session_id: string; turns: Turn[]; revision_events: RevisionEvent[]; quarantine_memory: Record<string, unknown> };
 
 const root = document.querySelector<HTMLDivElement>('#app')!;
@@ -27,11 +29,28 @@ function renderTurns(): string {
 }
 
 function renderDecision(): string {
+  const pending = session?.turns.flatMap((turn) => (turn.hypotheses ?? []).map((hypothesis) => ({ turn, hypothesis }))).find((item) => item.hypothesis.decision !== 'COMMIT');
+  if (!selected && pending) return renderHypothesis(pending.turn, pending.hypothesis);
   if (!selected) return '<p class="empty">选择一条已修订字幕，查看其后续证据、置信分数和可逆审计事件。</p>';
   const undo = selected.active && selected.action !== 'UNDO_REVISION'
     ? `<label class="undo-field">撤销理由 <input id="undo-reason" placeholder="可选：人工复核结论"></label><button id="undo" class="btn-danger">Undo revision</button>`
     : `<p class="empty">此事件已撤销${selected.reason ? `：${escapeHtml(selected.reason)}` : ''}。</p>`;
   return `<div class="decision method-rail"><span class="status">${escapeHtml(selected.action)}</span><h3>${escapeHtml(selected.before_text)} <i>→</i> ${escapeHtml(selected.after_text)}</h3><p>后续 Turn <b>${escapeHtml(selected.source_turn_id)}</b> 提供了足以重新解释 <b>${escapeHtml(selected.target_turn_id)}</b> 的证据。</p><dl><dt>Evidence</dt><dd>${selected.evidence.map(escapeHtml).join('<br>') || '—'}</dd><dt>Confidence</dt><dd>${selected.score}</dd><dt>Event state</dt><dd>${selected.active ? 'active' : 'reverted'}</dd></dl>${undo}</div>`;
+}
+
+function renderHypothesis(turn: Turn, hypothesis: Hypothesis): string {
+  const asr = hypothesis.evidence_packet?.asr_uncertainty;
+  const reasons = hypothesis.evidence_packet?.suspicious_span?.reasons?.join(' · ') || hypothesis.decision_rationale.join(' · ');
+  const choices = hypothesis.candidates.map((candidate) => {
+    const control = hypothesis.decision === 'ASK_USER'
+      ? `<button class="confirm-candidate" data-turn="${escapeHtml(turn.turn_id)}" data-span="${escapeHtml(hypothesis.span)}" data-candidate="${escapeHtml(candidate.text)}">Confirm</button>`
+      : '';
+    return `<li><span>${escapeHtml(candidate.text)}</span><small>${Math.round(candidate.score * 100)}%</small>${control}</li>`;
+  }).join('');
+  const keep = hypothesis.decision === 'ASK_USER'
+    ? `<button class="confirm-candidate ghost" data-turn="${escapeHtml(turn.turn_id)}" data-span="${escapeHtml(hypothesis.span)}" data-candidate="${escapeHtml(hypothesis.span)}">Keep original</button>`
+    : '';
+  return `<div class="decision method-rail candidate-card"><span class="status action-${escapeHtml(hypothesis.decision)}">${escapeHtml(hypothesis.decision)}</span><h3>Unresolved: ${escapeHtml(hypothesis.span)}</h3><p>${escapeHtml(reasons || 'Awaiting independent evidence.')}</p><ul class="candidate-list">${choices}</ul><dl class="evidence-packet"><dt>ASR confidence</dt><dd>${asr?.confidence ?? '—'}</dd><dt>N-best</dt><dd>${(asr?.nbest ?? []).map(escapeHtml).join('<br>') || '—'}</dd><dt>Later raw evidence</dt><dd>${(hypothesis.evidence_packet?.later_raw_evidence ?? []).map(escapeHtml).join('<br>') || '—'}</dd></dl>${keep}</div>`;
 }
 
 function render(): void {
@@ -42,6 +61,17 @@ function render(): void {
   document.querySelector<HTMLButtonElement>('#submit-text')?.addEventListener('click', submitText);
   document.querySelector<HTMLButtonElement>('#submit-audio')?.addEventListener('click', submitAudio);
   document.querySelector<HTMLButtonElement>('#undo')?.addEventListener('click', undoSelected);
+  document.querySelectorAll<HTMLButtonElement>('.confirm-candidate').forEach((button) => button.addEventListener('click', () => confirmCandidate(button)));
+}
+
+async function confirmCandidate(button: HTMLButtonElement): Promise<void> {
+  if (!session) return;
+  const turnId = button.dataset.turn || '';
+  const span = button.dataset.span || '';
+  const candidate = button.dataset.candidate || '';
+  const result = await fetch(`/api/sessions/${encodeURIComponent(session.session_id)}/hypotheses/${encodeURIComponent(turnId)}/confirm`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ span, candidate, reason: 'Studio operator confirmation' }) });
+  if (!result.ok) { status = `Confirmation failed: ${await result.text()}`; render(); return; }
+  const body = await result.json(); session = body.session; selected = body.event ?? null; status = candidate === span ? 'Original ASR observation retained.' : 'Confirmation event appended.'; render();
 }
 
 async function submitText(): Promise<void> {

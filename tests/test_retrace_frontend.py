@@ -45,3 +45,11 @@ def test_workspace_uses_research_notebook_structure_for_transcript_and_evidence(
     assert "transcript-paper" in source
     assert "evidence-note" in source
     assert "method-rail" in source
+
+
+def test_workspace_renders_uncertainty_candidates_and_confirmation_controls():
+    source = Path("frontend/src/main.ts").read_text(encoding="utf-8")
+    assert "candidate-card" in source
+    assert "evidence-packet" in source
+    assert "ASK_USER" in source
+    assert "/hypotheses/" in source
