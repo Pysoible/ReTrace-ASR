@@ -5,7 +5,7 @@ ReTrace-ASR is an evidence-grounded retrospective agent for conversational ASR. 
 ## Method
 
 1. Qwen-Omni transcribes audio into silence-aware chunks. Each chunk is an ordered `Turn` with immutable `raw_text`.
-2. Before reflection, ReTrace marks suspicious spans from ASR confidence and N-best disagreement. Each span retains competing candidates, an evidence packet and a conservative action: `WAIT`, `RETRIEVE_MEMORY`, `RELISTEN_AUDIO`, `ASK_USER` or `COMMIT`.
+2. Before reflection, ReTrace marks suspicious spans from ASR confidence and N-best disagreement. Each span retains competing candidates, an evidence packet and a conservative decision state: `WAIT`, `ASK_USER` or `COMMIT`. Audio re-listening and memory retrieval are exposed as evidence requirements, not claimed as executed tools.
 3. Each new turn triggers a DeepSeek `REFLECT` action over earlier raw turns. It can discover a previously unnoticed ambiguity; no user-supplied entity list is required.
 4. A proposal must identify the prior span, replacement interpretation, later evidence turn IDs and verbatim evidence quotes. The controller rejects any quote that cannot be located in a later raw turn; already-revised display text is never evidence.
 5. Accepted proposals append `RevisionEvent`s. High-risk hypotheses require explicit operator confirmation before any revision. Visible subtitles and memory are replayed from immutable raw turns plus active events.

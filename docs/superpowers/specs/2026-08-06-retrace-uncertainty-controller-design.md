@@ -15,7 +15,7 @@
 ReTrace 在每个新 Turn 到达后运行三个阶段：
 
 1. **不确定性发现**：从 ASR 低置信度、N-best 分歧、码切换片段和隔离记忆近似匹配中产生 `SuspiciousSpan`。已有上游 `text_candidates` / `entity_candidate_ids` 继续作为候选来源。
-2. **候选与策略**：每个 `Hypothesis` 保存候选、分数、支持/反驳原始证据、风险及动作。控制器选择 `WAIT`、`RETRIEVE_MEMORY`、`RELISTEN_AUDIO`、`ASK_USER` 或 `COMMIT`。只有低不确定性、明显领先且存在已验证后文原文引句时才允许 `COMMIT`。
+2. **候选与策略**：每个 `Hypothesis` 保存候选、分数、支持/反驳原始证据、风险及动作。当前控制器选择 `WAIT`、`ASK_USER` 或 `COMMIT`；音频复听和记忆检索仅以证据需求记录，尚未作为已执行工具声明。只有低不确定性、明显领先且存在已验证后文原文引句时才允许 `COMMIT`。
 3. **证据化提交**：`COMMIT` 仍走现有 `RevisionEvent`。控制器逐项验证 target/source 时序、原文引用、候选集合和分数。事件回放从 raw turns 导出显示字幕；undo 仅停用事件。
 
 ## 数据模型与 API
@@ -31,13 +31,11 @@ ReTrace 在每个新 Turn 到达后运行三个阶段：
 
 - `COMMIT`：候选的后文原始证据完整且领先，追加 `REVISE_TEXT` 或 `REVISE_ENTITY`。
 - `WAIT`：没有可用的追加证据，保留候选以等待未来 Turn。
-- `RETRIEVE_MEMORY`：存在隔离或已验证记忆，但不足以构成提交证据；仅更新 evidence packet。
-- `RELISTEN_AUDIO`：存在低置信度/N-best 分歧且片段时间定位可用；前端显示建议，不伪造新的音频事实。
 - `ASK_USER`：风险为 high 时优先，或竞争候选长期接近时触发；用户可确认候选或保持原文。
 
 ## 前端
 
-维持 Research Notebook 的时间线和 Undo。在 Agent Note 增加未决候选卡：显示候选排名、动作、原因，以及四类证据（后文原句、ASR 置信/N-best、会话记忆、音频片段）。`ASK_USER` 卡提供确认候选和保持原文按钮；已确认/拒绝操作在审计时间线中可见。
+维持 Research Notebook 的时间线和 Undo。在 Agent Note 增加未决候选卡：显示候选排名、动作、原因，以及当前可得的 ASR 与后文原文证据。`ASK_USER` 卡提供确认候选和保持原文按钮；已确认/拒绝操作在审计时间线中可见。
 
 ## 安全与正确性约束
 
