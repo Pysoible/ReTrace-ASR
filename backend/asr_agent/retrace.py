@@ -118,6 +118,11 @@ class ReTraceService:
         before = turn.current_text
         turn.current_text = event.before_text
         event.active = False
+        if event.entity_id:
+            session.verified_memory.pop(event.entity_id, None)
+            profile = session.entities.get(event.entity_id)
+            if profile:
+                session.quarantine_memory[event.entity_id] = {"name": profile.name, "status": "candidate"}
         undo = RevisionEvent(
             event_id=uuid.uuid4().hex,
             action="UNDO_REVISION",
@@ -164,16 +169,18 @@ class ReTraceService:
         working_text = text
 
         confidence, text_candidates, entity_candidate_ids = confidence or {}, text_candidates or {}, entity_candidate_ids or {}
+        for span, candidate, entity_id in self._recall_entity_fallbacks(session, working_text):
+            confidence.setdefault(span, 0.6)
+            text_candidates.setdefault(span, [span, candidate])
+            entity_candidate_ids.setdefault(span, []).append(entity_id)
         spans = set(text_candidates) | set(entity_candidate_ids)
-        hypotheses = [
-            Hypothesis(
-                span=span,
-                text_candidates=text_candidates.get(span, [span]),
-                entity_candidate_ids=entity_candidate_ids.get(span, []),
-            )
-            for span in spans
-            if span in working_text and confidence.get(span, 1.0) < 0.65
-        ]
+        hypotheses = []
+        for span in spans:
+            if span not in working_text or confidence.get(span, 1.0) >= 0.65:
+                continue
+            candidates = text_candidates.get(span, [span])
+            recalled = [profile.entity_id for profile in session.entities.values() if any(value in {profile.name, *profile.aliases} for value in candidates)]
+            hypotheses.append(Hypothesis(span=span, text_candidates=candidates, entity_candidate_ids=list(dict.fromkeys([*entity_candidate_ids.get(span, []), *recalled]))))
         for hypothesis in hypotheses:
             for entity_id in hypothesis.entity_candidate_ids:
                 profile = session.entities.get(entity_id)
@@ -198,10 +205,29 @@ class ReTraceService:
             "integrations": {"source": source},
         }
 
+    @staticmethod
+    def _recall_entity_fallbacks(session: Session, text: str) -> list[tuple[str, str, str]]:
+        """Recall near-matching known entities as quarantined candidates, never as facts."""
+        matches: list[tuple[str, str, str]] = []
+        for profile in session.entities.values():
+            for candidate in [profile.name, *profile.aliases]:
+                if len(candidate) < 2:
+                    continue
+                for start in range(len(text) - len(candidate) + 1):
+                    observed = text[start : start + len(candidate)]
+                    suffix = 0
+                    for left, right in zip(reversed(observed), reversed(candidate)):
+                        if left != right:
+                            break
+                        suffix += 1
+                    if observed != candidate and suffix >= len(candidate) - 1:
+                        matches.append((observed, candidate, profile.entity_id))
+        return matches
+
     def _reassess(self, session: Session, source_index: int, *, use_llm: bool = False) -> list[dict[str, Any]]:
-        evidence_text = session.turns[source_index].current_text
         revisions: list[dict[str, Any]] = []
-        for turn in session.turns[:source_index]:
+        for target_index, turn in enumerate(session.turns[:source_index]):
+            evidence_text = " ".join(item.current_text for item in session.turns[target_index + 1 : source_index + 1])
             for hypothesis in turn.hypotheses:
                 if hypothesis.action != "DEFER":
                     continue
@@ -270,8 +296,7 @@ class ReTraceService:
         if action not in {"KEEP", "REVISE_TEXT", "REVISE_ENTITY", "DEFER", "CLARIFY"}:
             return None
         if action in {"KEEP", "DEFER", "CLARIFY"}:
-            if action == "KEEP":
-                hypothesis.action = "KEEP"
+            # A non-revision decision is provisional: a later turn may contain counterevidence.
             return None
         if candidate not in candidates or (entity_id and entity_id not in hypothesis.entity_candidate_ids):
             return None
