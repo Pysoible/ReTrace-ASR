@@ -56,6 +56,19 @@ def test_reassessment_passes_only_later_raw_text_to_scorer(tmp_path):
     assert seen == ["负责人到了 实验室确认"]
 
 
+def test_high_risk_hypothesis_never_auto_commits_from_later_evidence(tmp_path):
+    service = ReTraceService(tmp_path)
+    service.upsert_entities("s", [EntityProfile("lead", "涂博士", attributes={"role": "负责人"})])
+    service.process_turn(
+        "s", "t1", "图博士来了", risk="high",
+        confidence={"图博士": 0.2}, text_candidates={"图博士": ["图博士", "涂博士"]}, entity_candidate_ids={"图博士": ["lead"]},
+    )
+    result = service.process_turn("s", "t2", "负责人到了")
+
+    assert result["revisions"] == []
+    assert result["session"]["turns"][0]["hypotheses"][0]["decision"] == "ASK_USER"
+
+
 def test_future_evidence_revises_text_and_promotes_entity(tmp_path):
     service = ReTraceService(tmp_path)
     service.upsert_entities("s", [EntityProfile("lead", "涂博士", attributes={"role": "负责人", "org": "实验室"})])

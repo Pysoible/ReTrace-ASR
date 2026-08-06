@@ -472,12 +472,18 @@ class ReTraceService:
         resolver: str,
         forced_action: str | None = None,
         rationale: str = "",
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
+        if hypothesis.risk == "high" and resolver != "user-confirmed":
+            hypothesis.decision = "ASK_USER"
+            hypothesis.decision_rationale = ["high_risk_requires_confirmation"]
+            return None
         before = turn.current_text
         action = forced_action or ("REVISE_TEXT" if candidate != hypothesis.span else "REVISE_ENTITY")
         if action == "REVISE_TEXT" and candidate != hypothesis.span and hypothesis.span in turn.current_text:
             turn.current_text = turn.current_text.replace(hypothesis.span, candidate, 1)
         hypothesis.action = action
+        hypothesis.decision = "COMMIT"
+        hypothesis.decision_rationale = ["verified_later_raw_evidence"]
         if profile:
             hypothesis.entity_id = profile.entity_id
             session.verified_memory[profile.entity_id] = {"name": profile.name, "source_turn_id": session.turns[source_index].turn_id}
