@@ -162,8 +162,23 @@ class ReTraceService:
         if candidate == span:
             hypothesis.decision = "WAIT"
             hypothesis.decision_rationale = ["operator_kept_original"]
+            event = RevisionEvent(
+                event_id=uuid.uuid4().hex,
+                action="KEEP_ORIGINAL",
+                target_turn_id=turn_id,
+                source_turn_id=turn_id,
+                span=span,
+                before_text=turn.current_text,
+                after_text=turn.current_text,
+                entity_id=None,
+                score=1.0,
+                evidence=["operator confirmation"],
+                resolver="user-confirmed",
+                rationale=reason,
+            )
+            session.revision_events.append(event)
             self._save(session)
-            return {"session": session.as_dict(), "event": None}
+            return {"session": session.as_dict(), "event": asdict(event)}
         before = turn.current_text
         if span not in before:
             raise ValueError("hypothesis span is not present in the current subtitle")
@@ -327,6 +342,11 @@ class ReTraceService:
             target = session.turns[target_index] if target_index < source_index else None
             if target is None or not before or not after or before == after or before not in target.current_text or score < 0.7:
                 continue
+            hypothesis = next((item for item in target.hypotheses if item.span == before), None)
+            if hypothesis and hypothesis.risk == "high":
+                hypothesis.decision = "ASK_USER"
+                hypothesis.decision_rationale = ["high_risk_requires_confirmation"]
+                continue
             evidence: list[str] = []
             valid = True
             for item in proposal.get("evidence") or []:
@@ -452,11 +472,29 @@ class ReTraceService:
         profile = session.entities.get(entity_id) if entity_id else None
         if action == "REVISE_ENTITY" and profile is None:
             return None
+        target_index = next((index for index, item in enumerate(session.turns) if item.turn_id == turn.turn_id), -1)
+        evidence = self._validate_later_evidence(session, target_index, source_index, result.get("evidence"))
+        if not evidence:
+            return None
         return self._commit_revision(
             session, turn, hypothesis, source_index, profile=profile, candidate=candidate,
-            score=float(result.get("score") or 0.0), evidence=[str(item) for item in result.get("evidence") or []],
+            score=float(result.get("score") or 0.0), evidence=evidence,
             resolver="deepseek", forced_action=action, rationale=str(result.get("rationale") or ""),
         )
+
+    @staticmethod
+    def _validate_later_evidence(session: Session, target_index: int, source_index: int, items: Any) -> list[str]:
+        indexes = {turn.turn_id: index for index, turn in enumerate(session.turns)}
+        verified: list[str] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                return []
+            turn_id, quote = str(item.get("turn_id") or ""), str(item.get("quote") or "")
+            evidence_index = indexes.get(turn_id, -1)
+            if not quote or evidence_index <= target_index or evidence_index > source_index or quote not in session.turns[evidence_index].raw_text:
+                return []
+            verified.append(f"{turn_id}:{quote}")
+        return verified
 
     def _commit_revision(
         self,

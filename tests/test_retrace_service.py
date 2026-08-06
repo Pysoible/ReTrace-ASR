@@ -69,6 +69,46 @@ def test_high_risk_hypothesis_never_auto_commits_from_later_evidence(tmp_path):
     assert result["session"]["turns"][0]["hypotheses"][0]["decision"] == "ASK_USER"
 
 
+def test_high_risk_reflection_requires_confirmation_even_with_a_valid_quote(tmp_path):
+    def reflector(**_: object) -> list[dict[str, object]]:
+        return [{
+            "target_turn_id": "t1", "before_text": "图博士", "after_text": "涂博士", "score": 0.91,
+            "evidence": [{"turn_id": "t2", "quote": "负责人涂博士"}],
+        }]
+
+    service = ReTraceService(tmp_path, reflector=reflector)
+    service.process_turn("s", "t1", "图博士来了", risk="high", confidence={"图博士": 0.2}, text_candidates={"图博士": ["图博士", "涂博士"]})
+    result = service.process_turn("s", "t2", "负责人涂博士来了")
+
+    assert result["revisions"] == []
+    assert result["session"]["turns"][0]["hypotheses"][0]["decision"] == "ASK_USER"
+
+
+def test_keep_original_appends_an_audit_event(tmp_path):
+    service = ReTraceService(tmp_path)
+    service.process_turn("s", "t1", "图博士来了", risk="high", confidence={"图博士": 0.2}, text_candidates={"图博士": ["图博士", "涂博士"]})
+
+    result = service.confirm_hypothesis("s", "t1", "图博士", "图博士", reason="operator checked audio")
+
+    assert result["event"]["action"] == "KEEP_ORIGINAL"
+    assert result["session"]["turns"][0]["current_text"] == "图博士来了"
+
+
+def test_llm_revision_requires_a_verbatim_later_raw_quote(tmp_path):
+    service = ReTraceService(
+        tmp_path,
+        evidence_scorer=lambda **_: {
+            "action": "REVISE_TEXT", "candidate": "涂博士", "score": 0.95,
+            "evidence": [{"turn_id": "t2", "quote": "不存在的引文"}],
+        },
+    )
+    service.process_turn("s", "t1", "图博士来了", confidence={"图博士": 0.2}, text_candidates={"图博士": ["图博士", "涂博士"]})
+    result = service.process_turn("s", "t2", "负责人到了", use_llm=True)
+
+    assert result["revisions"] == []
+    assert result["session"]["turns"][0]["current_text"] == "图博士来了"
+
+
 def test_future_evidence_revises_text_and_promotes_entity(tmp_path):
     service = ReTraceService(tmp_path)
     service.upsert_entities("s", [EntityProfile("lead", "涂博士", attributes={"role": "负责人", "org": "实验室"})])
@@ -129,7 +169,7 @@ def test_entity_candidates_are_recalled_from_text_candidates_and_later_evidence_
 
     def scorer(**payload: object) -> dict[str, object]:
         evidence_seen.append(str(payload["evidence_text"]))
-        return {"action": "REVISE_TEXT", "candidate": "涂博士", "entity_id": "lead", "score": 0.9, "evidence": ["负责人", "实验室"], "rationale": "two later turns"}
+        return {"action": "REVISE_TEXT", "candidate": "涂博士", "entity_id": "lead", "score": 0.9, "evidence": [{"turn_id": "t2", "quote": "下午需要汇报"}, {"turn_id": "t3", "quote": "实验室负责人"}], "rationale": "two later turns"}
 
     service = ReTraceService(tmp_path, evidence_scorer=scorer)
     service.upsert_entities("s", [EntityProfile("lead", "涂博士", attributes={"role": "未出现属性"})])
@@ -157,8 +197,8 @@ def test_undo_replays_entity_memory_back_to_quarantine(tmp_path):
 
 def test_temporary_keep_does_not_close_a_hypothesis_to_later_counterevidence(tmp_path):
     decisions = iter([
-        {"action": "KEEP", "candidate": "图博士", "score": 0.6, "evidence": ["weak"], "rationale": "not enough"},
-        {"action": "REVISE_TEXT", "candidate": "涂博士", "score": 0.92, "evidence": ["explicit role"], "rationale": "later proof"},
+        {"action": "KEEP", "candidate": "图博士", "score": 0.6, "evidence": [], "rationale": "not enough"},
+        {"action": "REVISE_TEXT", "candidate": "涂博士", "score": 0.92, "evidence": [{"turn_id": "t3", "quote": "负责人涂博士"}], "rationale": "later proof"},
     ])
     service = ReTraceService(tmp_path, evidence_scorer=lambda **_: next(decisions))
     service.process_turn("s", "t1", "图博士来了", confidence={"图博士": 0.2}, text_candidates={"图博士": ["图博士", "涂博士"]})

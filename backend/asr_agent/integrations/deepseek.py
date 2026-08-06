@@ -37,7 +37,7 @@ def score_evidence(*, span: str, text_candidates: list[str], entity_candidates: 
     if not api_key:
         return {"action": "DEFER"}
     payload = {"model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"), "temperature": 0, "response_format": {"type": "json_object"}, "messages": [
-        {"role": "system", "content": "You are an ASR evidence judge. Use only supplied later evidence and candidates. Return JSON action KEEP|REVISE_TEXT|REVISE_ENTITY|DEFER|CLARIFY, candidate, entity_id, score, evidence, rationale."},
+        {"role": "system", "content": "You are an ASR evidence judge. Use only supplied later evidence and candidates. Return JSON action KEEP|REVISE_TEXT|REVISE_ENTITY|DEFER|CLARIFY, candidate, entity_id, score, evidence, rationale. For a revision, evidence must be nonempty [{turn_id,quote}] items whose quote is verbatim in a later raw turn."},
         {"role": "user", "content": json.dumps({"span": span, "text_candidates": text_candidates, "entity_candidates": entity_candidates, "prior_text": prior_text, "later_evidence": evidence_text}, ensure_ascii=False)},
     ]}
     base = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
