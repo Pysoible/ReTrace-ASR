@@ -1,7 +1,8 @@
-"""Qwen-Omni / Qwen-audio two-pass ASR — same stack as ASR_agent.audio_asr."""
+"""Qwen-Omni / Qwen-audio single-pass ASR observation adapter."""
 from __future__ import annotations
 
 import os
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,6 @@ from asr_agent.integrations.audio_chunk import (
     read_chunk_config,
     split_audio_file,
 )
-from asr_agent.integrations.domainterms import ensure_importable
 
 DEFAULT_MODEL_PATH = "/home/ma-user/work/dataset/sjk_data/sjk/model_demo/checkpoint-793-merged"
 DEFAULT_AUDIO_DIR = "/home/ma-user/work/dataset/sjk_data/ASR_audio"
@@ -33,7 +33,6 @@ class AsrConfig:
     gpu: str
     max_model_len: int
     max_tokens: int
-    default_top_k: int
     gpu_memory_utilization: float
     max_num_seqs: int
     enforce_eager: bool
@@ -48,7 +47,6 @@ def read_asr_config() -> AsrConfig:
         # ASR needs headroom for multimodal activations; 8192@0.9 OOMs on 80GB.
         max_model_len=int(os.getenv("ASR_MAX_MODEL_LEN", "4096")),
         max_tokens=int(os.getenv("ASR_MAX_TOKENS", "512")),
-        default_top_k=int(os.getenv("ASR_DEFAULT_TOPK", "30")),
         gpu_memory_utilization=float(os.getenv("ASR_GPU_MEM_UTIL", "0.85")),
         max_num_seqs=int(os.getenv("ASR_MAX_NUM_SEQS", "1")),
         enforce_eager=_truthy(os.getenv("ASR_ENFORCE_EAGER", "1")),
@@ -148,17 +146,30 @@ def _infer_chunks(engine, request_config, chunk_paths: list[Path], prompt: str) 
     return texts
 
 
-def transcribe_audio(
-    audio: str,
-    *,
-    two_pass: bool = True,
-    domain: str | None = None,
-    top_k: int | None = None,
-) -> dict[str, Any]:
-    """Pass1 bare ASR → dictionary retrieve → Pass2 hotword ASR (ASR_agent pattern).
+def parse_observation(raw: str) -> dict[str, Any]:
+    """Parse a Qwen observation without inventing uncertainty on malformed output."""
+    try:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {"text": (raw or "").strip(), "uncertainty": {}}
+    if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
+        return {"text": (raw or "").strip(), "uncertainty": {}}
+    confidence: dict[str, float] = {}
+    candidates: dict[str, list[str]] = {}
+    for item in payload.get("uncertain_spans") or []:
+        if not isinstance(item, dict):
+            continue
+        span = str(item.get("span") or "").strip()
+        alternatives = [str(value).strip() for value in item.get("candidates") or [] if str(value).strip()]
+        score = item.get("confidence")
+        if span and span in payload["text"] and alternatives and span in alternatives and isinstance(score, (int, float)) and 0 <= score < 0.65:
+            confidence[span] = float(score)
+            candidates[span] = list(dict.fromkeys(alternatives))
+    return {"text": payload["text"].strip(), "uncertainty": {"confidence": confidence, "text_candidates": candidates}}
 
-    Long audio is split into short chunks (default <=15s) before Qwen-Omni inference.
-    """
+
+def transcribe_audio(audio: str) -> dict[str, Any]:
+    """Single-pass Qwen-Omni ASR for chunked conversational observations."""
     audio = (audio or "").strip()
     if not audio:
         return {"ok": False, "error": "需要音频路径 audio"}
@@ -172,14 +183,6 @@ def transcribe_audio(
         engine, request_config = _engine()
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
-
-    try:
-        ensure_importable()
-        import context_asr_twopass as cat  # noqa: WPS433
-        from context_retrieval import EntityRetriever  # noqa: WPS433
-        from domain_terms import config as dt_config  # noqa: WPS433
-    except Exception as exc:
-        return {"ok": False, "error": f"无法加载两遍法依赖: {exc}"}
 
     t0 = time.perf_counter()
     try:
@@ -199,53 +202,26 @@ def transcribe_audio(
 
     try:
         try:
-            pass1_parts = _infer_chunks(engine, request_config, chunk_paths, cat.PASS1_PROMPT)
+            raw_parts = _infer_chunks(engine, request_config, chunk_paths, '转写这段中文语音。严格只输出 JSON：{"text":"完整转写","uncertain_spans":[{"span":"原片段","candidates":["原片段","同音候选"],"confidence":0.0}]}。只在确有不确定时给出 uncertain_spans；候选必须包含原片段。')
         except Exception as exc:
-            return {"ok": False, "error": f"Pass1 转写失败: {exc}", "chunks": chunk_meta}
+            return {"ok": False, "error": f"Qwen 转写失败: {exc}", "chunks": chunk_meta}
 
-        pass1 = join_transcripts(pass1_parts)
+        observations = [parse_observation(raw) for raw in raw_parts]
+        parts = [item["text"] for item in observations]
+        final_text = join_transcripts(parts)
         out: dict[str, Any] = {
             "ok": True,
             "audio": str(path),
-            "pass1_text": pass1,
-            "pass1_chunks": pass1_parts,
-            "two_pass": two_pass,
+            "final_text": final_text,
+            "chunks_text": parts,
+            "uncertainties": [item["uncertainty"] for item in observations],
             "backend": "qwen-omni-vllm",
             "duration_sec": chunk_info.get("duration_sec"),
             "chunked": bool(chunk_info.get("chunked")),
             "chunk_count": int(chunk_info.get("chunk_count") or 1),
             "chunks": chunk_meta,
         }
-        if not two_pass:
-            out["final_text"] = pass1
-            out["elapsed_sec"] = round(time.perf_counter() - t0, 2)
-            return out
-
-        k = int(top_k or cfg.default_top_k)
-        retriever = EntityRetriever(str(dt_config.DICT_PATH))
-        retrieved = retriever.retrieve(pass1, domain_label=domain, k=k)
-        pass2_prompt = cat.build_pass2_prompt(retrieved)
-
-        try:
-            pass2_parts = _infer_chunks(engine, request_config, chunk_paths, pass2_prompt)
-            pass2 = join_transcripts(pass2_parts)
-        except Exception as exc:
-            out["final_text"] = pass1
-            out["retrieved"] = retrieved
-            out["correction_error"] = str(exc)
-            out["elapsed_sec"] = round(time.perf_counter() - t0, 2)
-            return out
-
-        out.update(
-            {
-                "domain": domain,
-                "retrieved": retrieved,
-                "final_text": pass2,
-                "pass2_chunks": pass2_parts,
-                "applied_terms": [term for term in retrieved if term in pass2 and term not in pass1],
-                "elapsed_sec": round(time.perf_counter() - t0, 2),
-            }
-        )
+        out["elapsed_sec"] = round(time.perf_counter() - t0, 2)
         return out
     finally:
         cleanup_chunks(chunk_info)
