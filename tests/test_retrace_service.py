@@ -13,6 +13,49 @@ def test_detect_suspicious_span_combines_asr_signals():
     assert {"low_confidence", "nbest_disagreement"} <= set(spans[0].reasons)
 
 
+def test_high_entropy_hypothesis_waits_without_mutating_subtitle(tmp_path):
+    service = ReTraceService(tmp_path)
+    service.process_turn(
+        "s", "t1", "请图博士审批",
+        confidence={"图博士": 0.2},
+        text_candidates={"图博士": ["图博士", "涂博士", "屠博士"]},
+    )
+
+    state = service.get_session("s")["turns"][0]["hypotheses"][0]
+    assert state["decision"] == "WAIT"
+    assert len(state["candidates"]) == 3
+    assert service.get_session("s")["turns"][0]["current_text"] == "请图博士审批"
+
+
+def test_high_risk_hypothesis_requests_user_before_commit(tmp_path):
+    service = ReTraceService(tmp_path)
+    service.process_turn(
+        "s", "t1", "请图博士审批",
+        confidence={"图博士": 0.2},
+        text_candidates={"图博士": ["图博士", "涂博士"]},
+        risk="high",
+    )
+
+    assert service.get_session("s")["turns"][0]["hypotheses"][0]["decision"] == "ASK_USER"
+
+
+def test_reassessment_passes_only_later_raw_text_to_scorer(tmp_path):
+    seen: list[str] = []
+    service = ReTraceService(
+        tmp_path,
+        evidence_scorer=lambda **payload: seen.append(payload["evidence_text"]) or {"action": "DEFER"},
+    )
+    service.process_turn("s", "t1", "图博士来了", confidence={"图博士": 0.2}, text_candidates={"图博士": ["图博士", "涂博士"]})
+    service.process_turn("s", "t2", "负责人到了")
+    session = service._load("s")
+    session.turns[1].current_text = "已修订的伪证据"
+    service._save(session)
+
+    service.process_turn("s", "t3", "实验室确认", use_llm=True)
+
+    assert seen == ["负责人到了 实验室确认"]
+
+
 def test_future_evidence_revises_text_and_promotes_entity(tmp_path):
     service = ReTraceService(tmp_path)
     service.upsert_entities("s", [EntityProfile("lead", "涂博士", attributes={"role": "负责人", "org": "实验室"})])

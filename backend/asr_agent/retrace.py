@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from asr_agent.uncertainty import detect_suspicious_spans
+
 
 @dataclass
 class EntityProfile:
@@ -27,6 +29,11 @@ class Hypothesis:
     entity_candidate_ids: list[str]
     entity_id: str | None = None
     action: str = "DEFER"
+    candidates: list[dict[str, Any]] = field(default_factory=list)
+    risk: str = "medium"
+    decision: str = "WAIT"
+    decision_rationale: list[str] = field(default_factory=list)
+    evidence_packet: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -190,6 +197,8 @@ class ReTraceService:
         use_llm: bool = False,
         source: str = "text",
         meta: dict[str, Any] | None = None,
+        risk: str = "medium",
+        nbest: list[str] | None = None,
     ) -> dict[str, Any]:
         session = self._load(session_id)
         if any(turn.turn_id == turn_id for turn in session.turns):
@@ -203,6 +212,9 @@ class ReTraceService:
             confidence.setdefault(span, 0.6)
             text_candidates.setdefault(span, [span, candidate])
             entity_candidate_ids.setdefault(span, []).append(entity_id)
+        detected_spans = detect_suspicious_spans(working_text, confidence=confidence, nbest=nbest)
+        for detected in detected_spans:
+            text_candidates.setdefault(detected.text, [detected.text])
         spans = set(text_candidates) | set(entity_candidate_ids)
         hypotheses = []
         for span in spans:
@@ -210,7 +222,23 @@ class ReTraceService:
                 continue
             candidates = text_candidates.get(span, [span])
             recalled = [profile.entity_id for profile in session.entities.values() if any(value in {profile.name, *profile.aliases} for value in candidates)]
-            hypotheses.append(Hypothesis(span=span, text_candidates=candidates, entity_candidate_ids=list(dict.fromkeys([*entity_candidate_ids.get(span, []), *recalled]))))
+            unique_candidates = list(dict.fromkeys(candidates))
+            probability = 1.0 / len(unique_candidates)
+            decision = "ASK_USER" if risk == "high" else "WAIT"
+            hypotheses.append(Hypothesis(
+                span=span,
+                text_candidates=unique_candidates,
+                entity_candidate_ids=list(dict.fromkeys([*entity_candidate_ids.get(span, []), *recalled])),
+                candidates=[{"text": candidate, "score": probability, "supporting_evidence": [], "contradicting_evidence": []} for candidate in unique_candidates],
+                risk=risk,
+                decision=decision,
+                decision_rationale=["high_risk_requires_confirmation"] if decision == "ASK_USER" else ["competing_candidates"],
+                evidence_packet={
+                    "asr_uncertainty": {"confidence": confidence.get(span), "nbest": nbest or []},
+                    "suspicious_span": next((item.as_dict() for item in detected_spans if item.text == span), None),
+                    "later_raw_evidence": [],
+                },
+            ))
         for hypothesis in hypotheses:
             for entity_id in hypothesis.entity_candidate_ids:
                 profile = session.entities.get(entity_id)
@@ -308,7 +336,7 @@ class ReTraceService:
     def _reassess(self, session: Session, source_index: int, *, use_llm: bool = False) -> list[dict[str, Any]]:
         revisions: list[dict[str, Any]] = []
         for target_index, turn in enumerate(session.turns[:source_index]):
-            evidence_text = " ".join(item.current_text for item in session.turns[target_index + 1 : source_index + 1])
+            evidence_text = " ".join(item.raw_text for item in session.turns[target_index + 1 : source_index + 1])
             for hypothesis in turn.hypotheses:
                 if hypothesis.action != "DEFER":
                     continue
