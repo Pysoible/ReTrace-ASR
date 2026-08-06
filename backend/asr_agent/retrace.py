@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,12 +40,32 @@ class Turn:
 
 
 @dataclass
+class RevisionEvent:
+    event_id: str
+    action: str
+    target_turn_id: str
+    source_turn_id: str
+    span: str
+    before_text: str
+    after_text: str
+    entity_id: str | None
+    score: float
+    evidence: list[str]
+    resolver: str
+    active: bool = True
+    rationale: str = ""
+    reverted_event_id: str | None = None
+    reason: str = ""
+
+
+@dataclass
 class Session:
     session_id: str
     entities: dict[str, EntityProfile] = field(default_factory=dict)
     turns: list[Turn] = field(default_factory=list)
     verified_memory: dict[str, dict[str, str]] = field(default_factory=dict)
     quarantine_memory: dict[str, dict[str, str]] = field(default_factory=dict)
+    revision_events: list[RevisionEvent] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -66,6 +87,7 @@ class Session:
         ]
         session.verified_memory = raw.get("verified_memory", {})
         session.quarantine_memory = raw.get("quarantine_memory", {})
+        session.revision_events = [RevisionEvent(**item) for item in raw.get("revision_events", [])]
         return session
 
 
@@ -81,6 +103,38 @@ class ReTraceService:
 
     def get_session(self, session_id: str) -> dict[str, Any]:
         return self._load(session_id).as_dict()
+
+    def undo_revision(self, session_id: str, event_id: str, *, reason: str = "") -> dict[str, Any]:
+        session = self._load(session_id)
+        event = next((item for item in session.revision_events if item.event_id == event_id), None)
+        if event is None or event.action not in {"REVISE_TEXT", "REVISE_ENTITY"}:
+            raise ValueError(f"unknown revision event: {event_id}")
+        if not event.active:
+            raise ValueError(f"revision event already inactive: {event_id}")
+        turn = next((item for item in session.turns if item.turn_id == event.target_turn_id), None)
+        if turn is None:
+            raise ValueError(f"revision target is missing: {event.target_turn_id}")
+        before = turn.current_text
+        turn.current_text = event.before_text
+        event.active = False
+        undo = RevisionEvent(
+            event_id=uuid.uuid4().hex,
+            action="UNDO_REVISION",
+            target_turn_id=event.target_turn_id,
+            source_turn_id=event.source_turn_id,
+            span=event.span,
+            before_text=before,
+            after_text=turn.current_text,
+            entity_id=event.entity_id,
+            score=1.0,
+            evidence=["manual undo"],
+            resolver="controller",
+            reverted_event_id=event.event_id,
+            reason=reason,
+        )
+        session.revision_events.append(undo)
+        self._save(session)
+        return {"session": session.as_dict(), "event": asdict(undo)}
 
     def reset_session(self, session_id: str) -> dict[str, Any]:
         """Replace an existing session with an empty one (one long audio = one session)."""
@@ -301,21 +355,22 @@ class ReTraceService:
             "source_turn_id": session.turns[source_index].turn_id,
         }
         session.quarantine_memory.pop(profile.entity_id, None)
-        item = {
-            "action": action,
-            "target_turn_id": turn.turn_id,
-            "source_turn_id": session.turns[source_index].turn_id,
-            "span": hypothesis.span,
-            "before_text": before,
-            "after_text": turn.current_text,
-            "entity_id": profile.entity_id,
-            "score": round(score, 3),
-            "evidence": evidence,
-            "resolver": resolver,
-        }
-        if rationale:
-            item["rationale"] = rationale
-        return item
+        event = RevisionEvent(
+            event_id=uuid.uuid4().hex,
+            action=action,
+            target_turn_id=turn.turn_id,
+            source_turn_id=session.turns[source_index].turn_id,
+            span=hypothesis.span,
+            before_text=before,
+            after_text=turn.current_text,
+            entity_id=profile.entity_id,
+            score=round(score, 3),
+            evidence=evidence,
+            resolver=resolver,
+            rationale=rationale,
+        )
+        session.revision_events.append(event)
+        return asdict(event)
 
     def _path(self, session_id: str) -> Path:
         return self.storage_dir / f"{session_id}.json"
