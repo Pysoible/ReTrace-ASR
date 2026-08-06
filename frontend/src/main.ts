@@ -48,7 +48,7 @@ async function submitText(): Promise<void> {
   const sessionId = document.querySelector<HTMLInputElement>('#session')!.value.trim() || 'demo';
   const text = document.querySelector<HTMLTextAreaElement>('#text')!.value.trim();
   if (!text) return;
-  const result = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/turns`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ turn_id: `t${Date.now()}`, text }) });
+  const result = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/turns`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ turn_id: `t${Date.now()}`, text, use_llm: true }) });
   if (!result.ok) { status = `Request failed: ${await result.text()}`; render(); return; }
   const body = await result.json(); session = body.session; selected = body.revisions?.[0] ?? null; status = 'Immutable observation appended.'; render();
 }

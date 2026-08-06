@@ -42,3 +42,15 @@ def test_revision_event_is_persisted_and_undo_restores_display_text(tmp_path):
     assert undone["session"]["turns"][0]["current_text"] == "图博士让我交报告。"
     assert undone["session"]["revision_events"][-1]["action"] == "UNDO_REVISION"
     assert undone["session"]["revision_events"][-1]["reverted_event_id"] == event["event_id"]
+
+
+def test_deepseek_evidence_result_is_constrained_to_known_candidates(tmp_path):
+    def scorer(**_: object) -> dict[str, object]:
+        return {"action": "REVISE_TEXT", "candidate": "杜博士", "entity_id": None, "score": 0.99, "evidence": ["后续提及负责人"], "rationale": "model choice"}
+
+    service = ReTraceService(tmp_path, evidence_scorer=scorer)
+    service.process_turn("s", "t1", "图博士来了", confidence={"图博士": 0.2}, text_candidates={"图博士": ["图博士", "涂博士"]})
+    result = service.process_turn("s", "t2", "负责人到了", use_llm=True)
+
+    assert result["revisions"] == []
+    assert result["session"]["turns"][0]["current_text"] == "图博士来了"

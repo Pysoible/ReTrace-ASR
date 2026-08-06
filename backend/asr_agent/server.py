@@ -25,6 +25,7 @@ class TurnRequest(BaseModel):
     confidence: dict[str, float] = Field(default_factory=dict)
     text_candidates: dict[str, list[str]] = Field(default_factory=dict)
     entity_candidate_ids: dict[str, list[str]] = Field(default_factory=dict)
+    use_llm: bool = False
 
 
 class UndoRequest(BaseModel):
@@ -34,6 +35,7 @@ class UndoRequest(BaseModel):
 class AudioTurnRequest(BaseModel):
     turn_id: str
     audio: str
+    use_llm: bool = True
 
 
 def _safe_filename(name: str) -> str:
@@ -96,6 +98,7 @@ def create_app(workspace: Path | None = None) -> FastAPI:
                 confidence=request.confidence,
                 text_candidates=request.text_candidates,
                 entity_candidate_ids=request.entity_candidate_ids,
+                use_llm=request.use_llm,
                 source="text",
             )
         except ValueError as exc:
@@ -106,6 +109,7 @@ def create_app(workspace: Path | None = None) -> FastAPI:
         *,
         audio_path: str,
         asr: dict[str, Any],
+        use_llm: bool,
         source: str = "qwen-omni",
         mode: str = "audio-session",
     ) -> dict[str, Any]:
@@ -144,6 +148,7 @@ def create_app(workspace: Path | None = None) -> FastAPI:
                     confidence=dict(uncertainty.get("confidence") or {}),
                     text_candidates=dict(uncertainty.get("text_candidates") or {}),
                     entity_candidate_ids=dict(uncertainty.get("entity_candidate_ids") or {}),
+                    use_llm=use_llm and index > 0,
                     source=source,
                     meta={
                         "audio_path": audio_path,
@@ -171,12 +176,14 @@ def create_app(workspace: Path | None = None) -> FastAPI:
         session_id: str,
         *,
         audio_path: str,
+        use_llm: bool,
     ) -> dict[str, Any]:
         asr = transcribe_audio(audio_path)
         return _build_session_from_asr(
             session_id,
             audio_path=audio_path,
             asr=asr,
+            use_llm=use_llm,
         )
 
     @app.post("/api/sessions/{session_id}/audio")
@@ -184,6 +191,7 @@ def create_app(workspace: Path | None = None) -> FastAPI:
         return _run_audio_session(
             session_id,
             audio_path=request.audio,
+            use_llm=request.use_llm,
         )
 
     @app.post("/api/sessions/{session_id}/audio/upload")
@@ -191,6 +199,7 @@ def create_app(workspace: Path | None = None) -> FastAPI:
         session_id: str,
         file: UploadFile = File(...),
         turn_id: str = Form(""),  # unused: chunks become turns automatically
+        use_llm: bool = Form(True),
     ) -> dict[str, Any]:
         del turn_id  # kept for form compatibility with older frontend
         filename = _safe_filename(file.filename or "audio.wav")
@@ -202,6 +211,7 @@ def create_app(workspace: Path | None = None) -> FastAPI:
         return _run_audio_session(
             session_id,
             audio_path=str(dest),
+            use_llm=use_llm,
         )
 
     @app.get("/api/sessions/{session_id}")

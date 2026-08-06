@@ -6,7 +6,7 @@ ReTrace-ASR is an evidence-grounded retrospective agent for conversational ASR. 
 
 1. Qwen-Omni transcribes audio into silence-aware chunks. Each chunk is an ordered `Turn` with immutable `raw_text`.
 2. Low-confidence text or entity alternatives enter `quarantine_memory` as hypotheses, never as facts.
-3. The ReTrace controller evaluates only later-turn evidence and chooses `KEEP`, `REVISE_TEXT`, `REVISE_ENTITY`, `DEFER`, or `CLARIFY`.
+3. The ReTrace controller first evaluates deterministic later-turn evidence. When it remains unresolved, it calls DeepSeek as a constrained evidence judge and validates its result against the known candidate set before choosing `KEEP`, `REVISE_TEXT`, `REVISE_ENTITY`, `DEFER`, or `CLARIFY`.
 4. A successful decision appends a `RevisionEvent` with its evidence, score and source turn. `verified_memory` records only promoted entities.
 5. `UNDO_REVISION` appends a new event and restores the prior display state; no ASR observation or previous audit event is deleted.
 
@@ -19,6 +19,7 @@ uv run uvicorn asr_agent.server:app --reload
 ```
 
 For GPU audio transcription, copy `.env.example` to `.env`, set `ASR_AUDIO_ENABLED=1`, and point `ASR_MODEL_PATH` to a Qwen-Omni checkpoint.
+Set `DEEPSEEK_API_KEY` to enable the controller's fallback evidence-judging action. DeepSeek can never directly overwrite transcript text.
 
 ## APIs
 

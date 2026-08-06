@@ -5,7 +5,7 @@ import json
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass
@@ -92,8 +92,9 @@ class Session:
 
 
 class ReTraceService:
-    def __init__(self, storage_dir: Path) -> None:
+    def __init__(self, storage_dir: Path, evidence_scorer: Callable[..., dict[str, Any]] | None = None) -> None:
         self.storage_dir = storage_dir
+        self.evidence_scorer = evidence_scorer
 
     def upsert_entities(self, session_id: str, profiles: list[EntityProfile]) -> dict[str, Any]:
         session = self._load(session_id)
@@ -151,6 +152,7 @@ class ReTraceService:
         confidence: dict[str, float] | None = None,
         text_candidates: dict[str, list[str]] | None = None,
         entity_candidate_ids: dict[str, list[str]] | None = None,
+        use_llm: bool = False,
         source: str = "text",
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -187,7 +189,7 @@ class ReTraceService:
                 meta=llm_meta,
             )
         )
-        revisions = self._reassess(session, source_index=len(session.turns) - 1)
+        revisions = self._reassess(session, source_index=len(session.turns) - 1, use_llm=use_llm)
         self._save(session)
         return {
             "session": session.as_dict(),
@@ -196,7 +198,7 @@ class ReTraceService:
             "integrations": {"source": source},
         }
 
-    def _reassess(self, session: Session, source_index: int) -> list[dict[str, Any]]:
+    def _reassess(self, session: Session, source_index: int, *, use_llm: bool = False) -> list[dict[str, Any]]:
         evidence_text = session.turns[source_index].current_text
         revisions: list[dict[str, Any]] = []
         for turn in session.turns[:source_index]:
@@ -206,6 +208,10 @@ class ReTraceService:
                 rule_hit = self._rule_resolve(session, turn, hypothesis, evidence_text, source_index)
                 if rule_hit:
                     revisions.append(rule_hit)
+                elif use_llm:
+                    llm_hit = self._llm_resolve(session, turn, hypothesis, evidence_text, source_index)
+                    if llm_hit:
+                        revisions.append(llm_hit)
         return revisions
 
     def _rule_resolve(
@@ -243,6 +249,41 @@ class ReTraceService:
             resolver="rule",
         )
 
+    def _llm_resolve(self, session: Session, turn: Turn, hypothesis: Hypothesis, evidence_text: str, source_index: int) -> dict[str, Any] | None:
+        scorer = self.evidence_scorer
+        if scorer is None:
+            from asr_agent.integrations.deepseek import score_evidence
+
+            scorer = score_evidence
+        candidates = list(dict.fromkeys(hypothesis.text_candidates or [hypothesis.span]))
+        entities = [session.entities[item] for item in hypothesis.entity_candidate_ids if item in session.entities]
+        result = scorer(
+            span=hypothesis.span,
+            text_candidates=candidates,
+            entity_candidates=[asdict(item) for item in entities],
+            prior_text=turn.current_text,
+            evidence_text=evidence_text,
+        )
+        action = str(result.get("action") or "DEFER").upper()
+        candidate = str(result.get("candidate") or hypothesis.span)
+        entity_id = str(result.get("entity_id") or "")
+        if action not in {"KEEP", "REVISE_TEXT", "REVISE_ENTITY", "DEFER", "CLARIFY"}:
+            return None
+        if action in {"KEEP", "DEFER", "CLARIFY"}:
+            if action == "KEEP":
+                hypothesis.action = "KEEP"
+            return None
+        if candidate not in candidates or (entity_id and entity_id not in hypothesis.entity_candidate_ids):
+            return None
+        profile = session.entities.get(entity_id) if entity_id else None
+        if action == "REVISE_ENTITY" and profile is None:
+            return None
+        return self._commit_revision(
+            session, turn, hypothesis, source_index, profile=profile, candidate=candidate,
+            score=float(result.get("score") or 0.0), evidence=[str(item) for item in result.get("evidence") or []],
+            resolver="deepseek", forced_action=action, rationale=str(result.get("rationale") or ""),
+        )
+
     def _commit_revision(
         self,
         session: Session,
@@ -250,7 +291,7 @@ class ReTraceService:
         hypothesis: Hypothesis,
         source_index: int,
         *,
-        profile: EntityProfile,
+        profile: EntityProfile | None,
         candidate: str,
         score: float,
         evidence: list[str],
@@ -262,12 +303,11 @@ class ReTraceService:
         action = forced_action or ("REVISE_TEXT" if candidate != hypothesis.span else "REVISE_ENTITY")
         if action == "REVISE_TEXT" and candidate != hypothesis.span and hypothesis.span in turn.current_text:
             turn.current_text = turn.current_text.replace(hypothesis.span, candidate, 1)
-        hypothesis.entity_id, hypothesis.action = profile.entity_id, action
-        session.verified_memory[profile.entity_id] = {
-            "name": profile.name,
-            "source_turn_id": session.turns[source_index].turn_id,
-        }
-        session.quarantine_memory.pop(profile.entity_id, None)
+        hypothesis.action = action
+        if profile:
+            hypothesis.entity_id = profile.entity_id
+            session.verified_memory[profile.entity_id] = {"name": profile.name, "source_turn_id": session.turns[source_index].turn_id}
+            session.quarantine_memory.pop(profile.entity_id, None)
         event = RevisionEvent(
             event_id=uuid.uuid4().hex,
             action=action,
@@ -276,7 +316,7 @@ class ReTraceService:
             span=hypothesis.span,
             before_text=before,
             after_text=turn.current_text,
-            entity_id=profile.entity_id,
+            entity_id=profile.entity_id if profile else None,
             score=round(score, 3),
             evidence=evidence,
             resolver=resolver,
