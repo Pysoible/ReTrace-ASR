@@ -1,4 +1,16 @@
 from asr_agent.retrace import EntityProfile, ReTraceService
+from asr_agent.uncertainty import detect_suspicious_spans
+
+
+def test_detect_suspicious_span_combines_asr_signals():
+    spans = detect_suspicious_spans(
+        "请图博士审批合同",
+        confidence={"图博士": 0.31},
+        nbest=["请涂博士审批合同"],
+    )
+
+    assert spans[0].text == "图博士"
+    assert {"low_confidence", "nbest_disagreement"} <= set(spans[0].reasons)
 
 
 def test_future_evidence_revises_text_and_promotes_entity(tmp_path):
