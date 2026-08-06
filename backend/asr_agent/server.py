@@ -142,11 +142,13 @@ def create_app(workspace: Path | None = None) -> FastAPI:
         service.reset_session(bound_session)
 
         uncertainties = list(asr.get("uncertainties") or [])
+        nbest_by_chunk = list(asr.get("nbest") or [])
         revisions: list[dict[str, Any]] = []
         for index, text in enumerate(parts):
             turn_id = f"t{index + 1:03d}"
             chunk = chunk_meta[index] if index < len(chunk_meta) else {}
             uncertainty = uncertainties[index] if index < len(uncertainties) else {}
+            nbest = nbest_by_chunk[index] if index < len(nbest_by_chunk) else []
             start = chunk.get("start_sec")
             end = chunk.get("end_sec")
             display = text.strip()
@@ -162,6 +164,7 @@ def create_app(workspace: Path | None = None) -> FastAPI:
                     entity_candidate_ids=dict(uncertainty.get("entity_candidate_ids") or {}),
                     use_llm=use_llm and index > 0,
                     source=source,
+                    nbest=list(nbest) if isinstance(nbest, list) else [],
                     meta={
                         "audio_path": audio_path,
                         "chunk_index": index,

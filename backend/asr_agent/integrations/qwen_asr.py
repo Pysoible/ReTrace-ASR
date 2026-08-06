@@ -151,9 +151,9 @@ def parse_observation(raw: str) -> dict[str, Any]:
     try:
         payload = json.loads(raw)
     except (TypeError, json.JSONDecodeError):
-        return {"text": (raw or "").strip(), "uncertainty": {}}
+        return {"text": (raw or "").strip(), "uncertainty": {}, "nbest": [(raw or "").strip()] if (raw or "").strip() else []}
     if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
-        return {"text": (raw or "").strip(), "uncertainty": {}}
+        return {"text": (raw or "").strip(), "uncertainty": {}, "nbest": [(raw or "").strip()] if (raw or "").strip() else []}
     confidence: dict[str, float] = {}
     candidates: dict[str, list[str]] = {}
     for item in payload.get("uncertain_spans") or []:
@@ -165,7 +165,13 @@ def parse_observation(raw: str) -> dict[str, Any]:
         if span and span in payload["text"] and alternatives and span in alternatives and isinstance(score, (int, float)) and 0 <= score < 0.65:
             confidence[span] = float(score)
             candidates[span] = list(dict.fromkeys(alternatives))
-    return {"text": payload["text"].strip(), "uncertainty": {"confidence": confidence, "text_candidates": candidates}}
+    text = payload["text"].strip()
+    alternatives = [str(value).strip() for value in payload.get("alternatives") or [] if str(value).strip()]
+    return {
+        "text": text,
+        "uncertainty": {"confidence": confidence, "text_candidates": candidates},
+        "nbest": list(dict.fromkeys([text, *alternatives])),
+    }
 
 
 def transcribe_audio(audio: str) -> dict[str, Any]:
@@ -202,7 +208,7 @@ def transcribe_audio(audio: str) -> dict[str, Any]:
 
     try:
         try:
-            raw_parts = _infer_chunks(engine, request_config, chunk_paths, '转写这段中文语音。严格只输出 JSON：{"text":"完整转写","uncertain_spans":[{"span":"原片段","candidates":["原片段","同音候选"],"confidence":0.0}]}。只在确有不确定时给出 uncertain_spans；候选必须包含原片段。')
+            raw_parts = _infer_chunks(engine, request_config, chunk_paths, '转写这段中文语音。严格只输出 JSON：{"text":"完整转写","alternatives":["备选转写"],"uncertain_spans":[{"span":"原片段","candidates":["原片段","同音候选"],"confidence":0.0}]}。alternatives 最多 3 条且包含 text；只在确有不确定时给出 uncertain_spans；候选必须包含原片段。')
         except Exception as exc:
             return {"ok": False, "error": f"Qwen 转写失败: {exc}", "chunks": chunk_meta}
 
@@ -215,6 +221,7 @@ def transcribe_audio(audio: str) -> dict[str, Any]:
             "final_text": final_text,
             "chunks_text": parts,
             "uncertainties": [item["uncertainty"] for item in observations],
+            "nbest": [item["nbest"] for item in observations],
             "backend": "qwen-omni-vllm",
             "duration_sec": chunk_info.get("duration_sec"),
             "chunked": bool(chunk_info.get("chunked")),

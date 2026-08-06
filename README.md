@@ -32,3 +32,11 @@ Set `DEEPSEEK_API_KEY` to enable autonomous DeepSeek reflection. DeepSeek can pr
 - `GET /api/integrations/status` — Qwen adapter readiness.
 
 The Studio UI renders the current subtitle, original text, subsequent evidence, event state and undo operation.
+
+## ICASSP-oriented evaluation
+
+For a turn-level reference set, evaluate the event stream with
+`asr_agent.metrics.evaluate_revisions`. It reports committed-revision count,
+revision precision, over-correction rate, revision coverage, and mean
+resolution latency in turns. These metrics separate final transcript quality
+from the safety and latency of retrospective corrections.
