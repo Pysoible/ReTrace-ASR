@@ -32,10 +32,13 @@ def test_workspace_has_audio_input_panel():
     assert 'type="file"' in source
 
 
-def test_workspace_exposes_reversible_audit_control():
+def test_workspace_exposes_read_only_audit_without_human_controls():
     source = Path("frontend/src/main.ts").read_text(encoding="utf-8").lower()
-    assert "undo revision" in source
-    assert "/undo" in source
+    assert "append-only audit" in source
+    assert "method trace" in source
+    assert "undo revision" not in source
+    assert "/undo" not in source
+    assert "人工复核" not in source
     assert "append-only audit" in source
 
 
@@ -54,3 +57,9 @@ def test_workspace_renders_uncertainty_candidates_and_autonomous_audio_evidence(
     assert "Audio verification" in source
     assert "confirm-candidate" not in source
     assert "/hypotheses/" not in source
+
+
+def test_workspace_visualizes_the_full_autonomous_decision_path():
+    source = Path("frontend/src/main.ts").read_text(encoding="utf-8")
+    for label in ("OBSERVE", "SEMANTIC TRIGGER", "SELECTIVE RELISTEN", "DUAL-EVIDENCE GATE", "AUTONOMOUS DECISION"):
+        assert label in source

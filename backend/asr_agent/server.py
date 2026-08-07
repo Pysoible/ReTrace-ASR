@@ -31,10 +31,6 @@ class TurnRequest(BaseModel):
     speaker: str | None = None
 
 
-class UndoRequest(BaseModel):
-    reason: str = ""
-
-
 class AudioTurnRequest(BaseModel):
     turn_id: str
     audio: str
@@ -226,13 +222,6 @@ def create_app(workspace: Path | None = None) -> FastAPI:
     @app.get("/api/sessions/{session_id}")
     def get_session(session_id: str) -> dict[str, Any]:
         return {"session": service.get_session(session_id)}
-
-    @app.post("/api/sessions/{session_id}/revisions/{event_id}/undo")
-    def undo_revision(session_id: str, event_id: str, request: UndoRequest) -> dict[str, Any]:
-        try:
-            return service.undo_revision(session_id, event_id, reason=request.reason)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     frontend = Path(__file__).parents[2] / "frontend" / "dist"
     if frontend.exists():

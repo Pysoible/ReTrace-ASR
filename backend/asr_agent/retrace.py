@@ -115,42 +115,6 @@ class ReTraceService:
     def get_session(self, session_id: str) -> dict[str, Any]:
         return self._load(session_id).as_dict()
 
-    def undo_revision(self, session_id: str, event_id: str, *, reason: str = "") -> dict[str, Any]:
-        session = self._load(session_id)
-        event = next((item for item in session.revision_events if item.event_id == event_id), None)
-        if event is None or event.action not in {"REVISE_TEXT", "REVISE_ENTITY"}:
-            raise ValueError(f"unknown revision event: {event_id}")
-        if not event.active:
-            raise ValueError(f"revision event already inactive: {event_id}")
-        turn = next((item for item in session.turns if item.turn_id == event.target_turn_id), None)
-        if turn is None:
-            raise ValueError(f"revision target is missing: {event.target_turn_id}")
-        before = turn.current_text
-        event.active = False
-        for hypothesis in turn.hypotheses:
-            if hypothesis.span == event.span:
-                hypothesis.action = "DEFER"
-                hypothesis.entity_id = None
-        self._replay(session)
-        undo = RevisionEvent(
-            event_id=uuid.uuid4().hex,
-            action="UNDO_REVISION",
-            target_turn_id=event.target_turn_id,
-            source_turn_id=event.source_turn_id,
-            span=event.span,
-            before_text=before,
-            after_text=turn.current_text,
-            entity_id=event.entity_id,
-            score=1.0,
-            evidence=["manual undo"],
-            resolver="controller",
-            reverted_event_id=event.event_id,
-            reason=reason,
-        )
-        session.revision_events.append(undo)
-        self._save(session)
-        return {"session": session.as_dict(), "event": asdict(undo)}
-
     @staticmethod
     def _replay(session: Session) -> None:
         """Derive visible text and memory only from immutable raw turns and active events."""

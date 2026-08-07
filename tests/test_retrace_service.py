@@ -127,7 +127,7 @@ def test_tied_evidence_stays_in_quarantine(tmp_path):
     assert set(result["session"]["quarantine_memory"]) == {"a", "b"}
 
 
-def test_revision_event_is_persisted_and_undo_restores_display_text(tmp_path):
+def test_revision_event_is_persisted_without_a_manual_reversal_path(tmp_path):
     reflector = lambda **_: [{"target_turn_id": "t1", "before_text": "图博士", "after_text": "涂博士", "score": .9, "evidence": [{"turn_id": "t2", "quote": "负责人涂博士"}]}]
     service = ReTraceService(tmp_path, reflector=reflector, audio_verifier=lambda **_: {"ok": True, "scores": {"图博士": .05, "涂博士": .95}})
     service.process_turn(
@@ -141,11 +141,10 @@ def test_revision_event_is_persisted_and_undo_restores_display_text(tmp_path):
     assert event["active"] is True
     assert service.get_session("s")["revision_events"][0]["event_id"] == event["event_id"]
 
-    undone = service.undo_revision("s", event["event_id"], reason="manual verification")
-    assert undone["session"]["turns"][0]["raw_text"] == "图博士让我交报告。"
-    assert undone["session"]["turns"][0]["current_text"] == "图博士让我交报告。"
-    assert undone["session"]["revision_events"][-1]["action"] == "UNDO_REVISION"
-    assert undone["session"]["revision_events"][-1]["reverted_event_id"] == event["event_id"]
+    state = service.get_session("s")
+    assert state["turns"][0]["raw_text"] == "图博士让我交报告。"
+    assert state["turns"][0]["current_text"] == "涂博士让我交报告。"
+    assert not hasattr(service, "undo_revision")
 
 
 def test_deepseek_evidence_result_is_constrained_to_known_candidates(tmp_path):
@@ -169,19 +168,6 @@ def test_entity_candidates_are_recalled_from_text_candidates_without_text_only_c
     result = service.process_turn("s", "t3", "实验室负责人已经到了", use_llm=True)
 
     assert result["session"]["turns"][0]["current_text"] == "图博士来了"
-
-
-def test_undo_replays_entity_memory_back_to_quarantine(tmp_path):
-    reflector = lambda **_: [{"target_turn_id": "t1", "before_text": "图博士", "after_text": "涂博士", "score": .9, "evidence": [{"turn_id": "t2", "quote": "负责人涂博士"}]}]
-    service = ReTraceService(tmp_path, reflector=reflector, audio_verifier=lambda **_: {"ok": True, "scores": {"图博士": .05, "涂博士": .95}})
-    service.upsert_entities("s", [EntityProfile("lead", "涂博士", attributes={"role": "负责人"})])
-    service.process_turn("s", "t1", "图博士来了", confidence={"图博士": 0.2}, text_candidates={"图博士": ["图博士", "涂博士"]}, entity_candidate_ids={"图博士": ["lead"]}, meta={"audio_path": "/tmp/source.wav", "start_sec": 0, "end_sec": 1})
-    revised = service.process_turn("s", "t2", "负责人涂博士到了")
-    event_id = revised["revisions"][0]["event_id"]
-
-    undone = service.undo_revision("s", event_id)
-    assert "lead" not in undone["session"]["verified_memory"]
-    assert undone["session"]["quarantine_memory"]["lead"]["status"] == "candidate"
 
 
 def test_semantic_evidence_scorer_cannot_close_a_hypothesis_without_audio(tmp_path):

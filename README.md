@@ -9,7 +9,7 @@ ReTrace-ASR is an evidence-grounded retrospective agent for conversational ASR. 
 3. Each new turn triggers a DeepSeek `REFLECT` action over earlier raw turns. It can discover a previously unnoticed ambiguity; no user-supplied entity list is required.
 4. A proposal must identify the prior span, replacement interpretation, later evidence turn IDs and verbatim evidence quotes. The controller rejects any quote that cannot be located in a later raw turn; already-revised display text is never evidence.
 5. Accepted proposals enter `RELISTEN`; only the dual semantic-and-audio gate can append a `RevisionEvent`. Visible subtitles and memory are replayed from immutable raw turns plus active events.
-6. `UNDO_REVISION` deactivates an event and replays state; it never deletes an ASR observation or audit record.
+6. Revision events are append-only audit records; the autonomous controller does not expose manual confirmation or reversal controls.
 
 ## Run
 
@@ -27,7 +27,6 @@ Set `DEEPSEEK_API_KEY` to enable autonomous DeepSeek reflection. DeepSeek can pr
 - `POST /api/sessions/{id}/turns` — append a raw text ASR observation; later turns autonomously trigger reflection.
 - `POST /api/sessions/{id}/audio/upload` — upload one audio file; its chunks become ordered turns in one session.
 - `GET /api/sessions/{id}` — retrieve raw observations, memory layers and persisted revision events.
-- `POST /api/sessions/{id}/revisions/{event_id}/undo` — append an auditable undo event.
 - `GET /api/integrations/status` — Qwen adapter readiness.
 
 The Studio UI renders the current subtitle, original text, subsequent evidence, event state and undo operation.

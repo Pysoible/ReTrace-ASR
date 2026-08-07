@@ -14,7 +14,7 @@ let status = 'Ready for an immutable ASR observation.';
 function escapeHtml(value: string): string { return value.replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#039;', '"': '&quot;' }[char]!)); }
 
 function activeEvent(turnId: string): RevisionEvent | undefined {
-  return session?.revision_events.find((event) => event.target_turn_id === turnId && event.active && event.action !== 'UNDO_REVISION');
+  return session?.revision_events.find((event) => event.target_turn_id === turnId && event.active);
 }
 
 function renderTurns(): string {
@@ -32,10 +32,11 @@ function renderDecision(): string {
   const pending = session?.turns.flatMap((turn) => (turn.hypotheses ?? []).map((hypothesis) => ({ turn, hypothesis }))).find((item) => item.hypothesis.decision !== 'COMMIT');
   if (!selected && pending) return renderHypothesis(pending.turn, pending.hypothesis);
   if (!selected) return '<p class="empty">选择一条已修订字幕，查看其后续证据、置信分数和可逆审计事件。</p>';
-  const undo = selected.active && selected.action !== 'UNDO_REVISION'
-    ? `<label class="undo-field">撤销理由 <input id="undo-reason" placeholder="可选：人工复核结论"></label><button id="undo" class="btn-danger">Undo revision</button>`
-    : `<p class="empty">此事件已撤销${selected.reason ? `：${escapeHtml(selected.reason)}` : ''}。</p>`;
-  return `<div class="decision method-rail"><span class="status">${escapeHtml(selected.action)}</span><h3>${escapeHtml(selected.before_text)} <i>→</i> ${escapeHtml(selected.after_text)}</h3><p>后续 Turn <b>${escapeHtml(selected.source_turn_id)}</b> 提供了足以重新解释 <b>${escapeHtml(selected.target_turn_id)}</b> 的证据。</p><dl><dt>Evidence</dt><dd>${selected.evidence.map(escapeHtml).join('<br>') || '—'}</dd><dt>Confidence</dt><dd>${selected.score}</dd><dt>Event state</dt><dd>${selected.active ? 'active' : 'reverted'}</dd></dl>${undo}</div>`;
+  return `<div class="decision method-rail"><span class="status">${escapeHtml(selected.action)}</span><h3>${escapeHtml(selected.before_text)} <i>→</i> ${escapeHtml(selected.after_text)}</h3><p>后续 Turn <b>${escapeHtml(selected.source_turn_id)}</b> 提供了足以重新解释 <b>${escapeHtml(selected.target_turn_id)}</b> 的证据。</p><dl><dt>Evidence</dt><dd>${selected.evidence.map(escapeHtml).join('<br>') || '—'}</dd><dt>Confidence</dt><dd>${selected.score}</dd><dt>Event state</dt><dd>${selected.active ? 'active' : 'inactive'}</dd></dl></div>`;
+}
+
+function renderMethodTrace(): string {
+  return `<section class="method-trace-card"><span class="eyebrow">METHOD TRACE</span><ol class="method-trace"><li><b>① OBSERVE</b><span>Preserve the first-pass ASR turn and timestamp.</span></li><li><b>② SEMANTIC TRIGGER</b><span>Verify a later raw conversational quote.</span></li><li><b>③ SELECTIVE RELISTEN</b><span>Re-check only the historical audio interval.</span></li><li><b>④ DUAL-EVIDENCE GATE</b><span>Require semantic and audio support for one closed candidate.</span></li><li><b>⑤ AUTONOMOUS DECISION</b><span>REVISE only on agreement; otherwise WAIT.</span></li></ol></section>`;
 }
 
 function renderHypothesis(turn: Turn, hypothesis: Hypothesis): string {
@@ -50,11 +51,10 @@ function renderHypothesis(turn: Turn, hypothesis: Hypothesis): string {
 function render(): void {
   const turns = session?.turns.length ?? 0;
   const events = session?.revision_events.length ?? 0;
-  root.innerHTML = `<main class="research-notebook"><header><div><span class="eyebrow">RETRACE-ASR · RESEARCH NOTEBOOK</span><h1>Living Transcript</h1><p>Later conversational evidence can revise an earlier subtitle without erasing its raw ASR observation.</p></div><div class="metrics"><div><b>${turns}</b><span>turns</span></div><div><b>${events}</b><span>revisions</span></div><div><b>${Object.keys(session?.quarantine_memory ?? {}).length}</b><span>open questions</span></div></div></header><div class="notebook-grid"><section class="subtitle-stage"><div class="stage-head"><div><span class="eyebrow">LIVE TRANSCRIPT</span><h2>Conversation record</h2></div><span>raw observations remain intact</span></div>${renderTurns()}</section><aside class="explainer"><div class="panel-head"><div><span class="eyebrow">AGENT NOTE</span><h2>Why this changed</h2></div><span>append-only audit</span></div>${renderDecision()}</aside></div><section class="observation"><div><span class="eyebrow">QWEN-OMNI AUDIO INPUT</span><p>Append a new observation; the Agent then reconsiders earlier language against later evidence.</p></div><div class="input-stack"><input id="session" value="${escapeHtml(session?.session_id || 'demo')}" aria-label="Session ID"><input id="audio" type="file" accept="audio/*" aria-label="Audio file"><button id="submit-audio">Transcribe audio</button></div><textarea id="text" placeholder="Or append a text ASR observation" aria-label="ASR observation"></textarea><button id="submit-text">Append observation</button><p class="status-line">${escapeHtml(status)}</p></section></main>`;
+  root.innerHTML = `<main class="research-notebook"><header><div><span class="eyebrow">RETRACE-ASR · RESEARCH NOTEBOOK</span><h1>Living Transcript</h1><p>Later conversational evidence can revise an earlier subtitle without erasing its raw ASR observation.</p></div><div class="metrics"><div><b>${turns}</b><span>turns</span></div><div><b>${events}</b><span>revisions</span></div><div><b>${Object.keys(session?.quarantine_memory ?? {}).length}</b><span>open questions</span></div></div></header><div class="notebook-grid"><section class="subtitle-stage"><div class="stage-head"><div><span class="eyebrow">LIVE TRANSCRIPT</span><h2>Conversation record</h2></div><span>raw observations remain intact</span></div>${renderTurns()}</section><aside class="explainer"><div class="panel-head"><div><span class="eyebrow">AGENT NOTE</span><h2>Why this changed</h2></div><span>append-only audit</span></div>${renderMethodTrace()}${renderDecision()}</aside></div><section class="observation"><div><span class="eyebrow">QWEN-OMNI AUDIO INPUT</span><p>Append a new observation; the Agent then reconsiders earlier language against later evidence.</p></div><div class="input-stack"><input id="session" value="${escapeHtml(session?.session_id || 'demo')}" aria-label="Session ID"><input id="audio" type="file" accept="audio/*" aria-label="Audio file"><button id="submit-audio">Transcribe audio</button></div><textarea id="text" placeholder="Or append a text ASR observation" aria-label="ASR observation"></textarea><button id="submit-text">Append observation</button><p class="status-line">${escapeHtml(status)}</p></section></main>`;
   document.querySelectorAll<HTMLButtonElement>('[data-event]').forEach((button) => button.addEventListener('click', () => { selected = session?.revision_events.find((event) => event.event_id === button.dataset.event) ?? null; render(); }));
   document.querySelector<HTMLButtonElement>('#submit-text')?.addEventListener('click', submitText);
   document.querySelector<HTMLButtonElement>('#submit-audio')?.addEventListener('click', submitAudio);
-  document.querySelector<HTMLButtonElement>('#undo')?.addEventListener('click', undoSelected);
 }
 
 async function submitText(): Promise<void> {
@@ -75,14 +75,6 @@ async function submitAudio(): Promise<void> {
   const result = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/audio/upload`, { method: 'POST', body: form });
   if (!result.ok) { status = `Audio failed: ${await result.text()}`; render(); return; }
   const body = await result.json(); session = body.session; selected = body.revisions?.[0] ?? null; status = `${body.turn_count} immutable turns appended.`; render();
-}
-
-async function undoSelected(): Promise<void> {
-  if (!session || !selected) return;
-  const reason = document.querySelector<HTMLInputElement>('#undo-reason')?.value || '';
-  const result = await fetch(`/api/sessions/${encodeURIComponent(session.session_id)}/revisions/${encodeURIComponent(selected.event_id)}/undo`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason }) });
-  if (!result.ok) { status = `Undo failed: ${await result.text()}`; render(); return; }
-  const body = await result.json(); session = body.session; selected = body.event; status = 'Undo event appended; raw ASR remains intact.'; render();
 }
 
 render();

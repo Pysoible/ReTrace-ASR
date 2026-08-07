@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+from pathlib import Path
 
 from asr_agent.server import create_app
 
@@ -54,3 +55,8 @@ def test_manual_confirmation_endpoint_is_not_exposed(tmp_path):
 
     response = client.post("/api/sessions/s/hypotheses/t1/confirm", json={"span": "图博士", "candidate": "涂博士"})
     assert response.status_code in {404, 405}
+
+
+def test_manual_undo_endpoint_is_not_exposed():
+    source = Path("backend/asr_agent/server.py").read_text(encoding="utf-8")
+    assert '"/api/sessions/{session_id}/revisions/{event_id}/undo"' not in source
