@@ -5,10 +5,10 @@ ReTrace-ASR is an evidence-grounded retrospective agent for conversational ASR. 
 ## Method
 
 1. Qwen-Omni transcribes audio into silence-aware chunks. Each chunk is an ordered `Turn` with immutable `raw_text`.
-2. Before reflection, ReTrace marks suspicious spans from ASR confidence and N-best disagreement. Each span retains competing candidates, an evidence packet and a conservative decision state: `WAIT`, `ASK_USER` or `COMMIT`. Audio re-listening and memory retrieval are exposed as evidence requirements, not claimed as executed tools.
+2. Before reflection, ReTrace marks suspicious spans from ASR confidence and N-best disagreement. Later conversational semantics can only trigger a targeted historical re-listen; a revision is committed only when a closed-set audio verifier independently selects the same candidate. The autonomous action states are `WAIT`, `RELISTEN`, and `REVISE`.
 3. Each new turn triggers a DeepSeek `REFLECT` action over earlier raw turns. It can discover a previously unnoticed ambiguity; no user-supplied entity list is required.
 4. A proposal must identify the prior span, replacement interpretation, later evidence turn IDs and verbatim evidence quotes. The controller rejects any quote that cannot be located in a later raw turn; already-revised display text is never evidence.
-5. Accepted proposals append `RevisionEvent`s. High-risk hypotheses require explicit operator confirmation before any revision. Visible subtitles and memory are replayed from immutable raw turns plus active events.
+5. Accepted proposals enter `RELISTEN`; only the dual semantic-and-audio gate can append a `RevisionEvent`. Visible subtitles and memory are replayed from immutable raw turns plus active events.
 6. `UNDO_REVISION` deactivates an event and replays state; it never deletes an ASR observation or audit record.
 
 ## Run
@@ -25,7 +25,6 @@ Set `DEEPSEEK_API_KEY` to enable autonomous DeepSeek reflection. DeepSeek can pr
 ## APIs
 
 - `POST /api/sessions/{id}/turns` — append a raw text ASR observation; later turns autonomously trigger reflection.
-- `POST /api/sessions/{id}/hypotheses/{turn_id}/confirm` — audibly record an operator's choice of an existing candidate, or retain the original span.
 - `POST /api/sessions/{id}/audio/upload` — upload one audio file; its chunks become ordered turns in one session.
 - `GET /api/sessions/{id}` — retrieve raw observations, memory layers and persisted revision events.
 - `POST /api/sessions/{id}/revisions/{event_id}/undo` — append an auditable undo event.

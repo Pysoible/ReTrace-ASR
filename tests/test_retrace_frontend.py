@@ -47,9 +47,10 @@ def test_workspace_uses_research_notebook_structure_for_transcript_and_evidence(
     assert "method-rail" in source
 
 
-def test_workspace_renders_uncertainty_candidates_and_confirmation_controls():
+def test_workspace_renders_uncertainty_candidates_and_autonomous_audio_evidence():
     source = Path("frontend/src/main.ts").read_text(encoding="utf-8")
     assert "candidate-card" in source
     assert "evidence-packet" in source
-    assert "ASK_USER" in source
-    assert "/hypotheses/" in source
+    assert "Audio verification" in source
+    assert "confirm-candidate" not in source
+    assert "/hypotheses/" not in source

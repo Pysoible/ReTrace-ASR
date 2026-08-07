@@ -11,3 +11,10 @@ node_modules/
 
 retrace_state/
 *.wav
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.fdb_latexmk
+paper/*.fls
+paper/*.log
+paper/*.pdf

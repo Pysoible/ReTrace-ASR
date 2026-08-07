@@ -2,7 +2,7 @@ import './styles.css';
 
 type RevisionEvent = { event_id: string; action: string; target_turn_id: string; source_turn_id: string; before_text: string; after_text: string; evidence: string[]; score: number; active: boolean; reverted_event_id?: string; reason?: string };
 type Candidate = { text: string; score: number };
-type Hypothesis = { span: string; candidates: Candidate[]; decision: string; decision_rationale: string[]; evidence_packet?: { asr_uncertainty?: { confidence?: number; nbest?: string[] }; suspicious_span?: { reasons?: string[] } | null; later_raw_evidence?: string[] } };
+type Hypothesis = { span: string; candidates: Candidate[]; decision: string; decision_rationale: string[]; evidence_packet?: { asr_uncertainty?: { confidence?: number; nbest?: string[] }; suspicious_span?: { reasons?: string[] } | null; later_raw_evidence?: string[]; audio_verification?: { ok?: boolean; scores?: Record<string, number> } } };
 type Turn = { turn_id: string; raw_text: string; current_text: string; hypotheses?: Hypothesis[]; source?: string; meta?: { start_sec?: number; end_sec?: number } };
 type Session = { session_id: string; turns: Turn[]; revision_events: RevisionEvent[]; quarantine_memory: Record<string, unknown> };
 
@@ -41,16 +41,10 @@ function renderDecision(): string {
 function renderHypothesis(turn: Turn, hypothesis: Hypothesis): string {
   const asr = hypothesis.evidence_packet?.asr_uncertainty;
   const reasons = hypothesis.evidence_packet?.suspicious_span?.reasons?.join(' · ') || hypothesis.decision_rationale.join(' · ');
-  const choices = hypothesis.candidates.map((candidate) => {
-    const control = hypothesis.decision === 'ASK_USER'
-      ? `<button class="confirm-candidate" data-turn="${escapeHtml(turn.turn_id)}" data-span="${escapeHtml(hypothesis.span)}" data-candidate="${escapeHtml(candidate.text)}">Confirm</button>`
-      : '';
-    return `<li><span>${escapeHtml(candidate.text)}</span><small>${Math.round(candidate.score * 100)}%</small>${control}</li>`;
-  }).join('');
-  const keep = hypothesis.decision === 'ASK_USER'
-    ? `<button class="confirm-candidate ghost" data-turn="${escapeHtml(turn.turn_id)}" data-span="${escapeHtml(hypothesis.span)}" data-candidate="${escapeHtml(hypothesis.span)}">Keep original</button>`
-    : '';
-  return `<div class="decision method-rail candidate-card"><span class="status action-${escapeHtml(hypothesis.decision)}">${escapeHtml(hypothesis.decision)}</span><h3>Unresolved: ${escapeHtml(hypothesis.span)}</h3><p>${escapeHtml(reasons || 'Awaiting independent evidence.')}</p><ul class="candidate-list">${choices}</ul><dl class="evidence-packet"><dt>ASR confidence</dt><dd>${asr?.confidence ?? '—'}</dd><dt>N-best</dt><dd>${(asr?.nbest ?? []).map(escapeHtml).join('<br>') || '—'}</dd><dt>Later raw evidence</dt><dd>${(hypothesis.evidence_packet?.later_raw_evidence ?? []).map(escapeHtml).join('<br>') || '—'}</dd></dl>${keep}</div>`;
+  const choices = hypothesis.candidates.map((candidate) => `<li><span>${escapeHtml(candidate.text)}</span><small>${Math.round(candidate.score * 100)}%</small></li>`).join('');
+  const audio = hypothesis.evidence_packet?.audio_verification;
+  const audioScores = audio?.scores ? Object.entries(audio.scores).map(([candidate, score]) => `${escapeHtml(candidate)}: ${Math.round(score * 100)}%`).join('<br>') : 'Pending targeted re-listen';
+  return `<div class="decision method-rail candidate-card"><span class="status action-${escapeHtml(hypothesis.decision)}">${escapeHtml(hypothesis.decision)}</span><h3>Unresolved: ${escapeHtml(hypothesis.span)}</h3><p>${escapeHtml(reasons || 'Awaiting independent evidence.')}</p><ul class="candidate-list">${choices}</ul><dl class="evidence-packet"><dt>ASR confidence</dt><dd>${asr?.confidence ?? '—'}</dd><dt>N-best</dt><dd>${(asr?.nbest ?? []).map(escapeHtml).join('<br>') || '—'}</dd><dt>Later raw evidence</dt><dd>${(hypothesis.evidence_packet?.later_raw_evidence ?? []).map(escapeHtml).join('<br>') || '—'}</dd><dt>Audio verification</dt><dd>${audioScores}</dd></dl></div>`;
 }
 
 function render(): void {
@@ -61,17 +55,6 @@ function render(): void {
   document.querySelector<HTMLButtonElement>('#submit-text')?.addEventListener('click', submitText);
   document.querySelector<HTMLButtonElement>('#submit-audio')?.addEventListener('click', submitAudio);
   document.querySelector<HTMLButtonElement>('#undo')?.addEventListener('click', undoSelected);
-  document.querySelectorAll<HTMLButtonElement>('.confirm-candidate').forEach((button) => button.addEventListener('click', () => confirmCandidate(button)));
-}
-
-async function confirmCandidate(button: HTMLButtonElement): Promise<void> {
-  if (!session) return;
-  const turnId = button.dataset.turn || '';
-  const span = button.dataset.span || '';
-  const candidate = button.dataset.candidate || '';
-  const result = await fetch(`/api/sessions/${encodeURIComponent(session.session_id)}/hypotheses/${encodeURIComponent(turnId)}/confirm`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ span, candidate, reason: 'Studio operator confirmation' }) });
-  if (!result.ok) { status = `Confirmation failed: ${await result.text()}`; render(); return; }
-  const body = await result.json(); session = body.session; selected = body.event ?? null; status = candidate === span ? 'Original ASR observation retained.' : 'Confirmation event appended.'; render();
 }
 
 async function submitText(): Promise<void> {

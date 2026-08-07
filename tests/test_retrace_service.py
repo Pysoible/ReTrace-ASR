@@ -27,7 +27,7 @@ def test_high_entropy_hypothesis_waits_without_mutating_subtitle(tmp_path):
     assert service.get_session("s")["turns"][0]["current_text"] == "请图博士审批"
 
 
-def test_high_risk_hypothesis_requests_user_before_commit(tmp_path):
+def test_high_risk_hypothesis_waits_for_automatic_audio_verification(tmp_path):
     service = ReTraceService(tmp_path)
     service.process_turn(
         "s", "t1", "请图博士审批",
@@ -36,24 +36,7 @@ def test_high_risk_hypothesis_requests_user_before_commit(tmp_path):
         risk="high",
     )
 
-    assert service.get_session("s")["turns"][0]["hypotheses"][0]["decision"] == "ASK_USER"
-
-
-def test_reassessment_passes_only_later_raw_text_to_scorer(tmp_path):
-    seen: list[str] = []
-    service = ReTraceService(
-        tmp_path,
-        evidence_scorer=lambda **payload: seen.append(payload["evidence_text"]) or {"action": "DEFER"},
-    )
-    service.process_turn("s", "t1", "图博士来了", confidence={"图博士": 0.2}, text_candidates={"图博士": ["图博士", "涂博士"]})
-    service.process_turn("s", "t2", "负责人到了")
-    session = service._load("s")
-    session.turns[1].current_text = "已修订的伪证据"
-    service._save(session)
-
-    service.process_turn("s", "t3", "实验室确认", use_llm=True)
-
-    assert seen == ["负责人到了 实验室确认"]
+    assert service.get_session("s")["turns"][0]["hypotheses"][0]["decision"] == "WAIT"
 
 
 def test_high_risk_hypothesis_never_auto_commits_from_later_evidence(tmp_path):
@@ -66,10 +49,10 @@ def test_high_risk_hypothesis_never_auto_commits_from_later_evidence(tmp_path):
     result = service.process_turn("s", "t2", "负责人到了")
 
     assert result["revisions"] == []
-    assert result["session"]["turns"][0]["hypotheses"][0]["decision"] == "ASK_USER"
+    assert result["session"]["turns"][0]["hypotheses"][0]["decision"] == "WAIT"
 
 
-def test_high_risk_reflection_requires_confirmation_even_with_a_valid_quote(tmp_path):
+def test_high_risk_reflection_requests_audio_relisten_with_a_valid_quote(tmp_path):
     def reflector(**_: object) -> list[dict[str, object]]:
         return [{
             "target_turn_id": "t1", "before_text": "图博士", "after_text": "涂博士", "score": 0.91,
@@ -81,17 +64,7 @@ def test_high_risk_reflection_requires_confirmation_even_with_a_valid_quote(tmp_
     result = service.process_turn("s", "t2", "负责人涂博士来了")
 
     assert result["revisions"] == []
-    assert result["session"]["turns"][0]["hypotheses"][0]["decision"] == "ASK_USER"
-
-
-def test_keep_original_appends_an_audit_event(tmp_path):
-    service = ReTraceService(tmp_path)
-    service.process_turn("s", "t1", "图博士来了", risk="high", confidence={"图博士": 0.2}, text_candidates={"图博士": ["图博士", "涂博士"]})
-
-    result = service.confirm_hypothesis("s", "t1", "图博士", "图博士", reason="operator checked audio")
-
-    assert result["event"]["action"] == "KEEP_ORIGINAL"
-    assert result["session"]["turns"][0]["current_text"] == "图博士来了"
+    assert result["session"]["turns"][0]["hypotheses"][0]["decision"] == "RELISTEN"
 
 
 def test_llm_revision_requires_a_verbatim_later_raw_quote(tmp_path):
@@ -109,16 +82,39 @@ def test_llm_revision_requires_a_verbatim_later_raw_quote(tmp_path):
     assert result["session"]["turns"][0]["current_text"] == "图博士来了"
 
 
-def test_future_evidence_revises_text_and_promotes_entity(tmp_path):
+def test_semantic_trigger_waits_for_audio_when_historical_audio_is_unavailable(tmp_path):
+    reflector = lambda **_: [{"target_turn_id": "t1", "before_text": "图博士", "after_text": "涂博士", "score": .9, "evidence": [{"turn_id": "t2", "quote": "负责人涂博士"}]}]
+    service = ReTraceService(tmp_path, reflector=reflector)
+    service.process_turn("s", "t1", "图博士来了", confidence={"图博士": .2}, text_candidates={"图博士": ["图博士", "涂博士"]})
+    result = service.process_turn("s", "t2", "负责人涂博士来了")
+
+    assert result["revisions"] == []
+    assert result["session"]["turns"][0]["hypotheses"][0]["decision"] == "RELISTEN"
+
+
+def test_dual_semantic_and_audio_evidence_commits_revision(tmp_path):
+    reflector = lambda **_: [{"target_turn_id": "t1", "before_text": "图博士", "after_text": "涂博士", "score": .9, "evidence": [{"turn_id": "t2", "quote": "负责人涂博士"}]}]
+    service = ReTraceService(
+        tmp_path, reflector=reflector,
+        audio_verifier=lambda **_: {"ok": True, "scores": {"图博士": .05, "涂博士": .95}},
+    )
+    service.process_turn("s", "t1", "图博士来了", confidence={"图博士": .2}, text_candidates={"图博士": ["图博士", "涂博士"]}, meta={"audio_path": "/tmp/source.wav", "start_sec": 0.0, "end_sec": 1.0})
+    result = service.process_turn("s", "t2", "负责人涂博士来了")
+
+    assert result["session"]["turns"][0]["current_text"] == "涂博士来了"
+    assert result["revisions"][0]["resolver"] == "audio-semantic-gate"
+
+
+def test_text_only_entity_evidence_does_not_mutate_transcript(tmp_path):
     service = ReTraceService(tmp_path)
     service.upsert_entities("s", [EntityProfile("lead", "涂博士", attributes={"role": "负责人", "org": "实验室"})])
     service.process_turn("s", "t1", "图博士让我交报告。", confidence={"图博士": 0.2}, text_candidates={"图博士": ["图博士", "涂博士"]}, entity_candidate_ids={"图博士": ["lead"]})
     result = service.process_turn("s", "t2", "实验室负责人下午要汇报。")
     turn = result["session"]["turns"][0]
     assert turn["raw_text"] == "图博士让我交报告。"
-    assert turn["current_text"] == "涂博士让我交报告。"
-    assert result["revisions"][0]["action"] == "REVISE_TEXT"
-    assert result["session"]["verified_memory"]["lead"]["name"] == "涂博士"
+    assert turn["current_text"] == "图博士让我交报告。"
+    assert result["revisions"] == []
+    assert "lead" not in result["session"]["verified_memory"]
 
 
 def test_tied_evidence_stays_in_quarantine(tmp_path):
@@ -132,13 +128,13 @@ def test_tied_evidence_stays_in_quarantine(tmp_path):
 
 
 def test_revision_event_is_persisted_and_undo_restores_display_text(tmp_path):
-    service = ReTraceService(tmp_path)
-    service.upsert_entities("s", [EntityProfile("lead", "涂博士", attributes={"role": "负责人"})])
+    reflector = lambda **_: [{"target_turn_id": "t1", "before_text": "图博士", "after_text": "涂博士", "score": .9, "evidence": [{"turn_id": "t2", "quote": "负责人涂博士"}]}]
+    service = ReTraceService(tmp_path, reflector=reflector, audio_verifier=lambda **_: {"ok": True, "scores": {"图博士": .05, "涂博士": .95}})
     service.process_turn(
         "s", "t1", "图博士让我交报告。", confidence={"图博士": 0.2},
-        text_candidates={"图博士": ["图博士", "涂博士"]}, entity_candidate_ids={"图博士": ["lead"]},
+        text_candidates={"图博士": ["图博士", "涂博士"]}, meta={"audio_path": "/tmp/source.wav", "start_sec": 0, "end_sec": 1},
     )
-    revised = service.process_turn("s", "t2", "负责人下午要汇报。")
+    revised = service.process_turn("s", "t2", "负责人涂博士下午要汇报。")
 
     event = revised["session"]["revision_events"][0]
     assert event["action"] == "REVISE_TEXT"
@@ -164,30 +160,23 @@ def test_deepseek_evidence_result_is_constrained_to_known_candidates(tmp_path):
     assert result["session"]["turns"][0]["current_text"] == "图博士来了"
 
 
-def test_entity_candidates_are_recalled_from_text_candidates_and_later_evidence_is_aggregated(tmp_path):
-    evidence_seen: list[str] = []
-
-    def scorer(**payload: object) -> dict[str, object]:
-        evidence_seen.append(str(payload["evidence_text"]))
-        return {"action": "REVISE_TEXT", "candidate": "涂博士", "entity_id": "lead", "score": 0.9, "evidence": [{"turn_id": "t2", "quote": "下午需要汇报"}, {"turn_id": "t3", "quote": "实验室负责人"}], "rationale": "two later turns"}
-
-    service = ReTraceService(tmp_path, evidence_scorer=scorer)
+def test_entity_candidates_are_recalled_from_text_candidates_without_text_only_commit(tmp_path):
+    service = ReTraceService(tmp_path)
     service.upsert_entities("s", [EntityProfile("lead", "涂博士", attributes={"role": "未出现属性"})])
     first = service.process_turn("s", "t1", "图博士来了", confidence={"图博士": 0.2}, text_candidates={"图博士": ["图博士", "涂博士"]})
     assert first["session"]["turns"][0]["hypotheses"][0]["entity_candidate_ids"] == ["lead"]
     service.process_turn("s", "t2", "下午需要汇报", use_llm=False)
     result = service.process_turn("s", "t3", "实验室负责人已经到了", use_llm=True)
 
-    assert result["session"]["turns"][0]["current_text"] == "涂博士来了"
-    assert "下午需要汇报" in evidence_seen[-1]
-    assert "实验室负责人已经到了" in evidence_seen[-1]
+    assert result["session"]["turns"][0]["current_text"] == "图博士来了"
 
 
 def test_undo_replays_entity_memory_back_to_quarantine(tmp_path):
-    service = ReTraceService(tmp_path)
+    reflector = lambda **_: [{"target_turn_id": "t1", "before_text": "图博士", "after_text": "涂博士", "score": .9, "evidence": [{"turn_id": "t2", "quote": "负责人涂博士"}]}]
+    service = ReTraceService(tmp_path, reflector=reflector, audio_verifier=lambda **_: {"ok": True, "scores": {"图博士": .05, "涂博士": .95}})
     service.upsert_entities("s", [EntityProfile("lead", "涂博士", attributes={"role": "负责人"})])
-    service.process_turn("s", "t1", "图博士来了", confidence={"图博士": 0.2}, text_candidates={"图博士": ["图博士", "涂博士"]})
-    revised = service.process_turn("s", "t2", "负责人到了")
+    service.process_turn("s", "t1", "图博士来了", confidence={"图博士": 0.2}, text_candidates={"图博士": ["图博士", "涂博士"]}, entity_candidate_ids={"图博士": ["lead"]}, meta={"audio_path": "/tmp/source.wav", "start_sec": 0, "end_sec": 1})
+    revised = service.process_turn("s", "t2", "负责人涂博士到了")
     event_id = revised["revisions"][0]["event_id"]
 
     undone = service.undo_revision("s", event_id)
@@ -195,17 +184,11 @@ def test_undo_replays_entity_memory_back_to_quarantine(tmp_path):
     assert undone["session"]["quarantine_memory"]["lead"]["status"] == "candidate"
 
 
-def test_temporary_keep_does_not_close_a_hypothesis_to_later_counterevidence(tmp_path):
-    decisions = iter([
-        {"action": "KEEP", "candidate": "图博士", "score": 0.6, "evidence": [], "rationale": "not enough"},
-        {"action": "REVISE_TEXT", "candidate": "涂博士", "score": 0.92, "evidence": [{"turn_id": "t3", "quote": "负责人涂博士"}], "rationale": "later proof"},
-    ])
-    service = ReTraceService(tmp_path, evidence_scorer=lambda **_: next(decisions))
-    service.process_turn("s", "t1", "图博士来了", confidence={"图博士": 0.2}, text_candidates={"图博士": ["图博士", "涂博士"]})
-    service.process_turn("s", "t2", "有人到了", use_llm=True)
-    result = service.process_turn("s", "t3", "负责人涂博士到了", use_llm=True)
-
-    assert result["session"]["turns"][0]["current_text"] == "涂博士来了"
+def test_semantic_evidence_scorer_cannot_close_a_hypothesis_without_audio(tmp_path):
+    service = ReTraceService(tmp_path, evidence_scorer=lambda **_: {"action": "REVISE_TEXT", "candidate": "涂博士", "score": .99})
+    service.process_turn("s", "t1", "图博士来了", confidence={"图博士": .2}, text_candidates={"图博士": ["图博士", "涂博士"]})
+    result = service.process_turn("s", "t2", "负责人涂博士到了", use_llm=True)
+    assert result["session"]["turns"][0]["current_text"] == "图博士来了"
 
 
 def test_entity_profile_recalls_nearby_asr_name_when_qwen_omits_candidates(tmp_path):

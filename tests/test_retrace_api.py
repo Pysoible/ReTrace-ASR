@@ -21,19 +21,14 @@ def test_integrations_status_endpoint(tmp_path):
     assert "enabled" in body["qwen_asr"]
 
 
-def test_undo_api_appends_event_without_mutating_raw_asr(tmp_path):
+def test_text_only_evidence_does_not_create_an_undoable_revision(tmp_path):
     client = TestClient(create_app(tmp_path))
     client.put("/api/sessions/s/entities", json={"entities": [{"entity_id": "lead", "name": "涂博士", "attributes": {"role": "负责人"}}]})
     client.post("/api/sessions/s/turns", json={"turn_id": "t1", "text": "图博士来了", "confidence": {"图博士": 0.2}, "text_candidates": {"图博士": ["图博士", "涂博士"]}, "entity_candidate_ids": {"图博士": ["lead"]}})
-    revised = client.post("/api/sessions/s/turns", json={"turn_id": "t2", "text": "负责人到了"}).json()
-    event_id = revised["revisions"][0]["event_id"]
-
-    response = client.post(f"/api/sessions/s/revisions/{event_id}/undo", json={"reason": "operator review"})
-    assert response.status_code == 200
-    body = response.json()
-    assert body["session"]["turns"][0]["raw_text"] == "图博士来了"
-    assert body["session"]["turns"][0]["current_text"] == "图博士来了"
-    assert body["event"]["action"] == "UNDO_REVISION"
+    later = client.post("/api/sessions/s/turns", json={"turn_id": "t2", "text": "负责人到了"}).json()
+    assert later["revisions"] == []
+    assert later["session"]["turns"][0]["raw_text"] == "图博士来了"
+    assert later["session"]["turns"][0]["current_text"] == "图博士来了"
 
 
 def test_audio_upload_endpoint_rejects_empty_file(tmp_path):
@@ -46,7 +41,7 @@ def test_audio_upload_endpoint_rejects_empty_file(tmp_path):
     assert response.status_code == 400
 
 
-def test_confirmation_commits_known_candidate_as_auditable_event(tmp_path):
+def test_manual_confirmation_endpoint_is_not_exposed(tmp_path):
     client = TestClient(create_app(tmp_path))
     client.post(
         "/api/sessions/s/turns",
@@ -57,11 +52,5 @@ def test_confirmation_commits_known_candidate_as_auditable_event(tmp_path):
         },
     )
 
-    response = client.post(
-        "/api/sessions/s/hypotheses/t1/confirm",
-        json={"span": "图博士", "candidate": "涂博士", "reason": "operator confirmed"},
-    )
-
-    assert response.status_code == 200
-    assert response.json()["session"]["turns"][0]["current_text"] == "涂博士到了"
-    assert response.json()["event"]["resolver"] == "user-confirmed"
+    response = client.post("/api/sessions/s/hypotheses/t1/confirm", json={"span": "图博士", "candidate": "涂博士"})
+    assert response.status_code in {404, 405}

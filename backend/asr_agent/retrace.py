@@ -100,10 +100,11 @@ class Session:
 
 
 class ReTraceService:
-    def __init__(self, storage_dir: Path, evidence_scorer: Callable[..., dict[str, Any]] | None = None, reflector: Callable[..., list[dict[str, Any]]] | None = None) -> None:
+    def __init__(self, storage_dir: Path, evidence_scorer: Callable[..., dict[str, Any]] | None = None, reflector: Callable[..., list[dict[str, Any]]] | None = None, audio_verifier: Callable[..., dict[str, Any]] | None = None) -> None:
         self.storage_dir = storage_dir
         self.evidence_scorer = evidence_scorer
         self.reflector = reflector
+        self.audio_verifier = audio_verifier
 
     def upsert_entities(self, session_id: str, profiles: list[EntityProfile]) -> dict[str, Any]:
         session = self._load(session_id)
@@ -149,61 +150,6 @@ class ReTraceService:
         session.revision_events.append(undo)
         self._save(session)
         return {"session": session.as_dict(), "event": asdict(undo)}
-
-    def confirm_hypothesis(self, session_id: str, turn_id: str, span: str, candidate: str, *, reason: str = "") -> dict[str, Any]:
-        """Commit a known candidate only after an operator explicitly confirms it."""
-        session = self._load(session_id)
-        turn = next((item for item in session.turns if item.turn_id == turn_id), None)
-        if turn is None:
-            raise ValueError(f"unknown turn: {turn_id}")
-        hypothesis = next((item for item in turn.hypotheses if item.span == span), None)
-        if hypothesis is None or candidate not in hypothesis.text_candidates:
-            raise ValueError("candidate is not available for this hypothesis")
-        if candidate == span:
-            hypothesis.decision = "WAIT"
-            hypothesis.decision_rationale = ["operator_kept_original"]
-            event = RevisionEvent(
-                event_id=uuid.uuid4().hex,
-                action="KEEP_ORIGINAL",
-                target_turn_id=turn_id,
-                source_turn_id=turn_id,
-                span=span,
-                before_text=turn.current_text,
-                after_text=turn.current_text,
-                entity_id=None,
-                score=1.0,
-                evidence=["operator confirmation"],
-                resolver="user-confirmed",
-                rationale=reason,
-            )
-            session.revision_events.append(event)
-            self._save(session)
-            return {"session": session.as_dict(), "event": asdict(event)}
-        before = turn.current_text
-        if span not in before:
-            raise ValueError("hypothesis span is not present in the current subtitle")
-        turn.current_text = before.replace(span, candidate, 1)
-        hypothesis.action = "REVISE_TEXT"
-        hypothesis.decision = "COMMIT"
-        hypothesis.decision_rationale = ["operator_confirmed"]
-        event = RevisionEvent(
-            event_id=uuid.uuid4().hex,
-            action="REVISE_TEXT",
-            target_turn_id=turn_id,
-            source_turn_id=turn_id,
-            span=span,
-            before_text=before,
-            after_text=turn.current_text,
-            entity_id=None,
-            score=1.0,
-            evidence=["operator confirmation"],
-            resolver="user-confirmed",
-            rationale=reason,
-            replacement=candidate,
-        )
-        session.revision_events.append(event)
-        self._save(session)
-        return {"session": session.as_dict(), "event": asdict(event)}
 
     @staticmethod
     def _replay(session: Session) -> None:
@@ -279,7 +225,7 @@ class ReTraceService:
             recalled = [profile.entity_id for profile in session.entities.values() if any(value in {profile.name, *profile.aliases} for value in candidates)]
             unique_candidates = list(dict.fromkeys(candidates))
             probability = 1.0 / len(unique_candidates)
-            decision = "ASK_USER" if risk == "high" else "WAIT"
+            decision = "WAIT"
             hypotheses.append(Hypothesis(
                 span=span,
                 text_candidates=unique_candidates,
@@ -287,7 +233,7 @@ class ReTraceService:
                 candidates=[{"text": candidate, "score": probability, "supporting_evidence": [], "contradicting_evidence": []} for candidate in unique_candidates],
                 risk=risk,
                 decision=decision,
-                decision_rationale=["high_risk_requires_confirmation"] if decision == "ASK_USER" else ["competing_candidates"],
+                decision_rationale=["competing_candidates"],
                 evidence_packet={
                     "asr_uncertainty": {"confidence": confidence.get(span), "nbest": nbest or []},
                     "suspicious_span": next((item.as_dict() for item in detected_spans if item.text == span), None),
@@ -310,7 +256,10 @@ class ReTraceService:
             )
         )
         source_index = len(session.turns) - 1
-        revisions = self._reflect(session, source_index) + self._reassess(session, source_index=source_index, use_llm=use_llm)
+        # Later language can nominate an ambiguity, but only an audio re-listen may
+        # mutate the displayed transcript.  This keeps the agent closed-set and
+        # prevents a fluent text model from hallucinating a historical correction.
+        revisions = self._reflect(session, source_index)
         self._save(session)
         return {
             "session": session.as_dict(),
@@ -343,9 +292,7 @@ class ReTraceService:
             if target is None or not before or not after or before == after or before not in target.current_text or score < 0.7:
                 continue
             hypothesis = next((item for item in target.hypotheses if item.span == before), None)
-            if hypothesis and hypothesis.risk == "high":
-                hypothesis.decision = "ASK_USER"
-                hypothesis.decision_rationale = ["high_risk_requires_confirmation"]
+            if hypothesis is None or after not in hypothesis.text_candidates:
                 continue
             evidence: list[str] = []
             valid = True
@@ -361,18 +308,34 @@ class ReTraceService:
                 evidence.append(f"{evidence_id}:{quote}")
             if not valid or not evidence:
                 continue
-            before_display = target.current_text
-            target.current_text = target.current_text.replace(before, after, 1)
-            event = RevisionEvent(
-                event_id=uuid.uuid4().hex, action="REVISE_TEXT", target_turn_id=target.turn_id,
-                source_turn_id=session.turns[source_index].turn_id, span=before, before_text=before_display,
-                after_text=target.current_text, entity_id=None, score=round(score, 3), evidence=evidence,
-                resolver="deepseek-reflect", rationale=str(proposal.get("rationale") or ""),
-                replacement=after,
-            )
-            session.revision_events.append(event)
-            committed.append(asdict(event))
+            hypothesis.decision = "RELISTEN"
+            hypothesis.decision_rationale = ["verified_future_semantic_evidence"]
+            hypothesis.evidence_packet["later_raw_evidence"] = evidence
+            event = self._relisten_and_commit(session, target, hypothesis, source_index, after, score, evidence, str(proposal.get("rationale") or ""))
+            if event:
+                committed.append(event)
         return committed
+
+    def _relisten_and_commit(self, session: Session, turn: Turn, hypothesis: Hypothesis, source_index: int, candidate: str, semantic_score: float, evidence: list[str], rationale: str) -> dict[str, Any] | None:
+        audio_path = str(turn.meta.get("audio_path") or "")
+        start, end = turn.meta.get("start_sec"), turn.meta.get("end_sec")
+        if not audio_path or start is None or end is None:
+            return None
+        verifier = self.audio_verifier
+        if verifier is None:
+            from asr_agent.integrations.audio_verifier import verify_candidates
+            verifier = verify_candidates
+        verdict = verifier(audio_path=audio_path, start_sec=float(start), end_sec=float(end), candidates=hypothesis.text_candidates)
+        if not verdict.get("ok"):
+            hypothesis.evidence_packet["audio_verification"] = verdict
+            return None
+        scores = {str(key): float(value) for key, value in dict(verdict["scores"]).items()}
+        ranked = sorted(scores, key=scores.get, reverse=True)
+        if not ranked or ranked[0] != candidate or len(ranked) < 2 or scores[candidate] < 0.7 or scores[candidate] - scores[ranked[1]] < 0.1:
+            hypothesis.evidence_packet["audio_verification"] = verdict
+            return None
+        hypothesis.evidence_packet["audio_verification"] = verdict
+        return self._commit_revision(session, turn, hypothesis, source_index, profile=None, candidate=candidate, score=(semantic_score + scores[candidate]) / 2, evidence=[*evidence, f"audio:{audio_path}:{start}-{end}:{candidate}:{scores[candidate]:.3f}"], resolver="audio-semantic-gate", forced_action="REVISE_TEXT", rationale=rationale)
 
     @staticmethod
     def _recall_entity_fallbacks(session: Session, text: str) -> list[tuple[str, str, str]]:
@@ -511,10 +474,6 @@ class ReTraceService:
         forced_action: str | None = None,
         rationale: str = "",
     ) -> dict[str, Any] | None:
-        if hypothesis.risk == "high" and resolver != "user-confirmed":
-            hypothesis.decision = "ASK_USER"
-            hypothesis.decision_rationale = ["high_risk_requires_confirmation"]
-            return None
         before = turn.current_text
         action = forced_action or ("REVISE_TEXT" if candidate != hypothesis.span else "REVISE_ENTITY")
         if action == "REVISE_TEXT" and candidate != hypothesis.span and hypothesis.span in turn.current_text:
