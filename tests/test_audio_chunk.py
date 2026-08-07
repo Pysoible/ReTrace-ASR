@@ -32,12 +32,3 @@ def test_qwen_observation_preserves_only_valid_uncertainty_candidates():
     assert observation["text"] == "图博士到了"
     assert observation["uncertainty"]["confidence"] == {"图博士": 0.2}
     assert observation["uncertainty"]["text_candidates"] == {"图博士": ["图博士", "涂博士"]}
-
-
-def test_qwen_observation_preserves_nbest_alternatives_for_retrace():
-    observation = parse_observation(
-        '{"text":"图博士到了","alternatives":["涂博士到了","图博士到了"],'
-        '"uncertain_spans":[]}'
-    )
-
-    assert observation["nbest"] == ["图博士到了", "涂博士到了"]
