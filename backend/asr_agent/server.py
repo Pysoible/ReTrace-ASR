@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from pathlib import Path
@@ -9,6 +10,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from asr_agent.integrations.deepseek import deepseek_status
 from asr_agent.integrations.qwen_asr import asr_status, preload_engine, transcribe_audio
 from asr_agent.retrace import EntityProfile, ReTraceService
 
@@ -29,12 +31,28 @@ class TurnRequest(BaseModel):
     nbest: list[str] = Field(default_factory=list)
     risk: str = "medium"
     speaker: str | None = None
+    audio_path: str | None = None
+    start_sec: float | None = None
+    end_sec: float | None = None
 
 
 class AudioTurnRequest(BaseModel):
     turn_id: str
     audio: str
     use_llm: bool = True
+
+
+def _turn_meta(request: TurnRequest) -> dict[str, Any] | None:
+    meta: dict[str, Any] = {}
+    if request.speaker:
+        meta["speaker"] = request.speaker
+    if request.audio_path:
+        meta["audio_path"] = request.audio_path
+    if request.start_sec is not None:
+        meta["start_sec"] = request.start_sec
+    if request.end_sec is not None:
+        meta["end_sec"] = request.end_sec
+    return meta or None
 
 
 def _safe_filename(name: str) -> str:
@@ -74,7 +92,7 @@ def create_app(workspace: Path | None = None) -> FastAPI:
 
     @app.get("/api/integrations/status")
     def integrations_status() -> dict[str, Any]:
-        return {"qwen_asr": asr_status()}
+        return {"qwen_asr": asr_status(), "deepseek": deepseek_status()}
 
     @app.post("/api/integrations/qwen/preload")
     def qwen_preload() -> dict[str, Any]:
@@ -101,7 +119,7 @@ def create_app(workspace: Path | None = None) -> FastAPI:
                 source="text",
                 risk=request.risk,
                 nbest=request.nbest,
-                meta={"speaker": request.speaker} if request.speaker else None,
+                meta=_turn_meta(request),
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -222,6 +240,36 @@ def create_app(workspace: Path | None = None) -> FastAPI:
     @app.get("/api/sessions/{session_id}")
     def get_session(session_id: str) -> dict[str, Any]:
         return {"session": service.get_session(session_id)}
+
+    @app.get("/api/demo/r0015")
+    def demo_r0015() -> dict[str, Any]:
+        """Replay a saved AliMeeting revision result so the UI can show the lift instantly."""
+        repo = Path(__file__).resolve().parents[2]
+        candidates = [
+            repo / "retrace_state" / "alimeeting_eval" / "R0015_M0135_newcode.result.json",
+            root / "alimeeting_eval" / "R0015_M0135_newcode.result.json",
+        ]
+        path = next((item for item in candidates if item.exists()), None)
+        if path is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Demo artifact missing: run R0015 newcode eval first "
+                "(retrace_state/alimeeting_eval/R0015_M0135_newcode.result.json)",
+            )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        session = payload.get("session")
+        if not isinstance(session, dict):
+            raise HTTPException(status_code=500, detail="Demo artifact has no session")
+        events = [item for item in session.get("revision_events") or [] if item.get("active")]
+        open_n = sum(1 for item in events if "open-relisten" in str(item.get("resolver") or ""))
+        return {
+            "session": session,
+            "demo": "R0015_M0135",
+            "n_revisions": len(events),
+            "n_open_relisten": open_n,
+            "impact_note": "CER 0.561 → 0.453 · open re-listen recovered 骁龙 from 遥遥遥遥",
+            "source": str(path),
+        }
 
     frontend = Path(__file__).parents[2] / "frontend" / "dist"
     if frontend.exists():

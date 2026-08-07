@@ -37,24 +37,82 @@ def verify_candidates(
     return {"ok": True, "scores": {candidate: value / total for candidate, value in values.items()}, "audio_path": audio_path, "start_sec": start_sec, "end_sec": end_sec}
 
 
-def _qwen_runner(*, audio_path: str, start_sec: float, end_sec: float, candidates: list[str]) -> dict[str, Any]:
-    """Ask Qwen-Omni to compare a closed candidate set over a cropped audio window."""
+def retranscribe_window(
+    audio_path: str,
+    start_sec: float,
+    end_sec: float,
+    *,
+    runner: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Open-vocabulary re-ASR for a historical audio window (degenerate-turn recovery)."""
+    if end_sec <= start_sec:
+        return {"ok": False, "error": "need a valid audio window"}
+    if not Path(audio_path).exists():
+        return {"ok": False, "error": f"audio is unavailable: {audio_path}"}
+    try:
+        payload = (runner or _qwen_retranscribe_runner)(
+            audio_path=audio_path, start_sec=start_sec, end_sec=end_sec
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"audio retranscription failed: {exc}"}
+    text = str((payload or {}).get("text") or "").strip()
+    if not text:
+        return {"ok": False, "error": "empty retranscription"}
+    return {
+        "ok": True,
+        "text": text,
+        "audio_path": audio_path,
+        "start_sec": start_sec,
+        "end_sec": end_sec,
+    }
+
+
+def _crop_audio(audio_path: str, start_sec: float, end_sec: float):
     import soundfile as sf
     from tempfile import NamedTemporaryFile
-
-    from asr_agent.integrations.qwen_asr import _engine, _infer_one
 
     samples, sample_rate = sf.read(audio_path, always_2d=False)
     start, end = max(0, int(start_sec * sample_rate)), min(len(samples), int(end_sec * sample_rate))
     if end <= start:
         raise ValueError("audio window is empty")
-    with NamedTemporaryFile(suffix=".wav") as clipped:
-        sf.write(clipped.name, samples[start:end], sample_rate)
+    clipped = NamedTemporaryFile(suffix=".wav", delete=False)
+    sf.write(clipped.name, samples[start:end], sample_rate)
+    clipped.close()
+    return Path(clipped.name)
+
+
+def _qwen_runner(*, audio_path: str, start_sec: float, end_sec: float, candidates: list[str]) -> dict[str, Any]:
+    """Ask Qwen-Omni to compare a closed candidate set over a cropped audio window."""
+    from asr_agent.integrations.qwen_asr import _engine, _infer_one
+
+    clipped = _crop_audio(audio_path, start_sec, end_sec)
+    try:
         engine, request_config = _engine()
         prompt = (
             "Listen only to this audio and compare the supplied transcript candidates. "
             "Return strict JSON {\"scores\":{candidate:number,...}} with every and only supplied candidate. "
             f"Candidates: {json.dumps(candidates, ensure_ascii=False)}"
         )
-        raw = _infer_one(engine, request_config, Path(clipped.name), prompt)
-    return json.loads(raw)
+        raw = _infer_one(engine, request_config, clipped, prompt)
+    finally:
+        clipped.unlink(missing_ok=True)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(raw[start : end + 1])
+        raise
+
+
+def _qwen_retranscribe_runner(*, audio_path: str, start_sec: float, end_sec: float) -> dict[str, Any]:
+    """Open re-ASR over a cropped window — used when the first-pass transcript is degenerate."""
+    from asr_agent.integrations.qwen_asr import _PLAIN_PROMPT, _engine, _infer_one
+
+    clipped = _crop_audio(audio_path, start_sec, end_sec)
+    try:
+        engine, request_config = _engine()
+        text = _infer_one(engine, request_config, clipped, _PLAIN_PROMPT)
+    finally:
+        clipped.unlink(missing_ok=True)
+    return {"text": text}

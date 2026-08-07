@@ -19,6 +19,8 @@ export ASR_MAX_MODEL_LEN="${ASR_MAX_MODEL_LEN:-4096}"
 export ASR_MAX_NUM_SEQS="${ASR_MAX_NUM_SEQS:-1}"
 export ASR_ENFORCE_EAGER="${ASR_ENFORCE_EAGER:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# Qwen-Omni audio infer is unstable on vLLM V1 in this env; force V0.
+export VLLM_USE_V1="${VLLM_USE_V1:-0}"
 
 PY="${RETRACE_PYTHON:-/home/ma-user/anaconda3/envs/PyTorch-2.1.0/bin/python}"
 export PYTHONPATH="/home/ma-user/ms-swift:${ROOT}/backend${PYTHONPATH:+:$PYTHONPATH}"

@@ -2,12 +2,32 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from asr_agent.uncertainty import detect_suspicious_spans
+
+_TIME_PREFIX = re.compile(r"^\[\d+(?:\.\d+)?-\d+(?:\.\d+)?\]\s*")
+_ASCII_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9\-]{1,19}")
+_CJK_RUN = re.compile(r"[\u4e00-\u9fff]+")
+_ENTITY_BOUNDARY = re.compile(
+    r"(?:^|[，。；、！？\s]|比如|或者|还是|就是|叫做?|名叫|是)"
+    r"(?!比如|或者|还是|就是|叫做?|名叫)"
+    r"([\u4e00-\u9fff]{2}|[A-Za-z][A-Za-z0-9\-]{1,19})"
+)
+_PARTICLE_CHARS = set("的了呢吗吧啊嗯哦呀哈对是就都也与和及在有我你他她它们这那什么一个")
+_FILLER_CHARS = set("嗯啊哦呃哈呀吧嘛呐")
+_COMMON_BIGRAMS = {
+    "一样", "一个", "我们", "可以", "不是", "因为", "所以", "这个", "那个", "什么",
+    "还是", "没有", "已经", "自己", "他们", "大家", "现在", "觉得", "知道", "应该",
+    "如果", "但是", "而且", "或者", "为了", "以及", "然后", "就是", "不是", "还有",
+    "比较", "一些", "这些", "那些", "这么", "那么", "什么", "怎么", "多少", "哪里",
+    "今天", "明天", "昨天", "时候", "问题", "工作", "公司", "员工", "方面", "方案",
+    "以考", "以厂", "一金", "开讨", "家讨", "个话", "个指", "遇方", "如泰", "如说",
+}
 
 
 @dataclass
@@ -100,11 +120,21 @@ class Session:
 
 
 class ReTraceService:
-    def __init__(self, storage_dir: Path, evidence_scorer: Callable[..., dict[str, Any]] | None = None, reflector: Callable[..., list[dict[str, Any]]] | None = None, audio_verifier: Callable[..., dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        storage_dir: Path,
+        evidence_scorer: Callable[..., dict[str, Any]] | None = None,
+        reflector: Callable[..., list[dict[str, Any]]] | None = None,
+        adjudicator: Callable[..., dict[str, Any]] | None = None,
+        audio_verifier: Callable[..., dict[str, Any]] | None = None,
+        audio_retranscriber: Callable[..., dict[str, Any]] | None = None,
+    ) -> None:
         self.storage_dir = storage_dir
         self.evidence_scorer = evidence_scorer
         self.reflector = reflector
+        self.adjudicator = adjudicator
         self.audio_verifier = audio_verifier
+        self.audio_retranscriber = audio_retranscriber
 
     def upsert_entities(self, session_id: str, profiles: list[EntityProfile]) -> dict[str, Any]:
         session = self._load(session_id)
@@ -223,7 +253,7 @@ class ReTraceService:
         # Later language can nominate an ambiguity, but only an audio re-listen may
         # mutate the displayed transcript.  This keeps the agent closed-set and
         # prevents a fluent text model from hallucinating a historical correction.
-        revisions = self._reflect(session, source_index)
+        revisions = self._reflect(session, source_index, use_llm=use_llm)
         self._save(session)
         return {
             "session": session.as_dict(),
@@ -232,59 +262,563 @@ class ReTraceService:
             "integrations": {"source": source},
         }
 
-    def _reflect(self, session: Session, source_index: int) -> list[dict[str, Any]]:
-        if source_index == 0:
-            return []
-        reflector = self.reflector
-        if reflector is None:
-            from asr_agent.integrations.deepseek import reflect_timeline
+    @staticmethod
+    def _strip_time_prefix(text: str) -> str:
+        return _TIME_PREFIX.sub("", text or "").strip()
 
-            reflector = reflect_timeline
-        proposals = reflector(
-            prior_turns=[{"turn_id": turn.turn_id, "raw_text": turn.raw_text} for turn in session.turns[:source_index]],
-            new_turn={"turn_id": session.turns[source_index].turn_id, "raw_text": session.turns[source_index].raw_text},
-        )
-        indexes = {turn.turn_id: index for index, turn in enumerate(session.turns)}
-        committed: list[dict[str, Any]] = []
-        for proposal in proposals or []:
-            target_id = str(proposal.get("target_turn_id") or "")
-            target_index = indexes.get(target_id, source_index)
-            before = str(proposal.get("before_text") or "")
-            after = str(proposal.get("after_text") or "")
-            score = float(proposal.get("score") or 0.0)
-            target = session.turns[target_index] if target_index < source_index else None
-            if target is None or not before or not after or before == after or before not in target.current_text or score < 0.7:
+    @classmethod
+    def _content_tokens(cls, text: str) -> list[str]:
+        """Entity-like tokens: ASCII words plus CJK bigrams/trigrams."""
+        plain = cls._strip_time_prefix(text)
+        out: list[str] = []
+        for match in _ASCII_TOKEN.finditer(plain):
+            out.append(match.group(0))
+        for run in _CJK_RUN.findall(plain):
+            for size in (2, 3):
+                if len(run) < size:
+                    continue
+                for index in range(len(run) - size + 1):
+                    token = run[index : index + size]
+                    if all(char in _PARTICLE_CHARS for char in token):
+                        continue
+                    out.append(token)
+        return list(dict.fromkeys(out))
+
+    @classmethod
+    def _entity_tokens(cls, text: str) -> list[str]:
+        """Boundary-aware tokens for near-form conflicts (avoids 比如→如泰 noise)."""
+        plain = cls._strip_time_prefix(text)
+        out: list[str] = []
+        for match in _ENTITY_BOUNDARY.finditer(plain):
+            token = match.group(1)
+            if not token or all(char in _PARTICLE_CHARS for char in token):
                 continue
-            hypothesis = next((item for item in target.hypotheses if item.span == before), None)
-            if hypothesis is None or after not in hypothesis.text_candidates:
+            out.append(token)
+        # Also keep standalone ASCII brands anywhere.
+        for match in _ASCII_TOKEN.finditer(plain):
+            out.append(match.group(0))
+        return list(dict.fromkeys(out))
+
+    @staticmethod
+    def _similar_conflict(left: str, right: str) -> bool:
+        if not left or not right or left == right:
+            return False
+        a, b = left.lower(), right.lower()
+        if a == b or a in _COMMON_BIGRAMS or b in _COMMON_BIGRAMS:
+            return False
+        if "的" in a or "的" in b:
+            return False
+        # Prefer brand/name-like CJK bigrams; longer grams create noisy mid-word pairs.
+        if not a.isascii() and len(a) != 2:
+            return False
+        if not b.isascii() and len(b) != 2:
+            return False
+        if len(a) == len(b) and len(a) >= 2:
+            if not a.isascii() and len(set(a) & set(b)) < 1:
+                return False
+            return sum(x != y for x, y in zip(a, b)) == 1
+        return False
+
+    @classmethod
+    def _content_chars(cls, text: str) -> list[str]:
+        plain = cls._strip_time_prefix(text)
+        return [ch for ch in plain if ("\u4e00" <= ch <= "\u9fff") or ch.isalnum()]
+
+    @classmethod
+    def _is_degenerate_transcript(cls, text: str, *, duration_sec: float | None = None) -> bool:
+        """Detect collapsed / filler-only ASR that should trigger open re-listen."""
+        chars = cls._content_chars(text)
+        if len(chars) < 2:
+            return True
+        max_run = 1
+        cur = 1
+        for index in range(1, len(chars)):
+            if chars[index] == chars[index - 1]:
+                cur += 1
+                max_run = max(max_run, cur)
+            else:
+                cur = 1
+        run_ratio = max_run / len(chars)
+        filler_ratio = sum(ch in _FILLER_CHARS for ch in chars) / len(chars)
+        unique_ratio = len(set(chars)) / len(chars)
+        if max_run >= 4 and run_ratio >= 0.35:
+            return True
+        if filler_ratio >= 0.55 and len(chars) >= 6:
+            return True
+        if unique_ratio <= 0.2 and len(chars) >= 8:
+            return True
+        if duration_sec is not None and duration_sec >= 4.0:
+            unique_cjk = {ch for ch in chars if "\u4e00" <= ch <= "\u9fff"}
+            if len(unique_cjk) <= 3 and len(chars) <= max(8, int(duration_sec)):
+                return True
+        return False
+
+    @classmethod
+    def _retranscription_is_better(cls, before: str, after: str) -> bool:
+        if not after or after.strip() == before.strip():
+            return False
+        before_chars = cls._content_chars(before)
+        after_chars = cls._content_chars(after)
+        if len(after_chars) < 2:
+            return False
+        before_sig = {ch for ch in before_chars if ch not in _FILLER_CHARS}
+        after_sig = {ch for ch in after_chars if ch not in _FILLER_CHARS}
+        if not after_sig:
+            return False
+        # Recovered non-filler lexical content the first pass missed (e.g. 遥→骁龙).
+        if len(after_sig - before_sig) >= 2:
+            return True
+        if len(after_sig) >= len(before_sig) + 2:
+            return True
+        before_fill = sum(ch in _FILLER_CHARS for ch in before_chars) / max(1, len(before_chars))
+        after_fill = sum(ch in _FILLER_CHARS for ch in after_chars) / max(1, len(after_chars))
+        if len(after_sig) > len(before_sig) and after_fill < before_fill:
+            return True
+        if len(after_sig) >= 4 and len(before_sig) <= 2 and after_fill < 0.55:
+            return True
+        return False
+
+    @staticmethod
+    def _trim_retranscription(text: str) -> str:
+        """Drop trailing filler-only tails that open re-ASR often appends."""
+        parts = re.split(r"([。！？!?])", text.strip())
+        chunks: list[str] = []
+        index = 0
+        while index < len(parts):
+            piece = parts[index]
+            punct = parts[index + 1] if index + 1 < len(parts) else ""
+            chunk = piece + punct
+            if chunk.strip():
+                chunks.append(chunk)
+            index += 2 if punct else 1
+        while chunks:
+            body = re.sub(r"[\s。！？!?，,、]+", "", chunks[-1])
+            if not body or all(ch in _FILLER_CHARS or ch == "对" for ch in body):
+                chunks.pop()
+                continue
+            break
+        return "".join(chunks).strip() or text.strip()
+
+    def _deterministic_proposals(self, session: Session, source_index: int) -> list[dict[str, Any]]:
+        """Nominate revisions without LLM when later (or later-in-turn) evidence appears."""
+        source = session.turns[source_index]
+        source_plain = self._strip_time_prefix(source.raw_text)
+        source_tokens = self._entity_tokens(source.raw_text)
+        proposals: list[dict[str, Any]] = []
+
+        # Path A: earlier deferred hypothesis whose competing candidate now appears verbatim.
+        for turn in session.turns[: source_index + 1]:
+            turn_plain = self._strip_time_prefix(turn.current_text)
+            for hypothesis in turn.hypotheses:
+                if hypothesis.action != "DEFER":
+                    continue
+                if hypothesis.span not in turn_plain:
+                    continue
+                for candidate in hypothesis.text_candidates:
+                    if candidate == hypothesis.span or not candidate:
+                        continue
+                    if turn.turn_id == source.turn_id:
+                        span_at = turn_plain.find(hypothesis.span)
+                        cand_at = turn_plain.find(candidate, span_at + len(hypothesis.span)) if span_at >= 0 else -1
+                        if cand_at < 0:
+                            continue
+                        quote = candidate
+                    else:
+                        if candidate not in source_plain:
+                            continue
+                        quote = candidate
+                    proposals.append(
+                        {
+                            "target_turn_id": turn.turn_id,
+                            "before_text": hypothesis.span,
+                            "after_text": candidate,
+                            "evidence": [{"turn_id": source.turn_id, "quote": quote}],
+                            "score": 0.88,
+                            "rationale": "later verbatim candidate evidence for an open hypothesis",
+                        }
+                    )
+
+        # Path B/C: near-form conflicts.
+        # B: earlier form A, later/same-turn later form B -> try A->B (retrospective)
+        # C: earlier form A, current form B -> try B->A (earlier canonical corrects later drift)
+        conflict_budget = 8
+        conflict_proposals: list[dict[str, Any]] = []
+        for turn_index, turn in enumerate(session.turns[:source_index]):
+            turn_plain = self._strip_time_prefix(turn.current_text)
+            earlier_tokens = self._entity_tokens(turn.raw_text)
+            for before in earlier_tokens:
+                if before not in turn_plain:
+                    continue
+                for after in source_tokens:
+                    if not self._similar_conflict(before, after) or after not in source_plain:
+                        continue
+                    # B: revise earlier mention using later evidence
+                    conflict_proposals.append(
+                        {
+                            "target_turn_id": turn.turn_id,
+                            "before_text": before,
+                            "after_text": after,
+                            "evidence": [{"turn_id": source.turn_id, "quote": after}],
+                            "score": 0.84,
+                            "rationale": "near-form conflict across conversational evidence",
+                            "allow_earlier_evidence": False,
+                        }
+                    )
+                    # C: revise current mention using earlier canonical form
+                    conflict_proposals.append(
+                        {
+                            "target_turn_id": source.turn_id,
+                            "before_text": after,
+                            "after_text": before,
+                            "evidence": [{"turn_id": turn.turn_id, "quote": before}],
+                            "score": 0.86,
+                            "rationale": "earlier canonical form corrects later near-form drift",
+                            "allow_earlier_evidence": True,
+                        }
+                    )
+
+        # Same-turn ordered conflicts on the new turn only.
+        turn_plain = source_plain
+        earlier_tokens = source_tokens
+        for i, before in enumerate(earlier_tokens):
+            before_at = turn_plain.find(before)
+            if before_at < 0:
+                continue
+            for after in earlier_tokens[i + 1 :]:
+                if not self._similar_conflict(before, after):
+                    continue
+                after_at = turn_plain.find(after, before_at + len(before))
+                if after_at < 0:
+                    continue
+                conflict_proposals.append(
+                    {
+                        "target_turn_id": source.turn_id,
+                        "before_text": before,
+                        "after_text": after,
+                        "evidence": [{"turn_id": source.turn_id, "quote": after}],
+                        "score": 0.84,
+                        "rationale": "near-form conflict across conversational evidence",
+                        "allow_earlier_evidence": False,
+                    }
+                )
+                conflict_proposals.append(
+                    {
+                        "target_turn_id": source.turn_id,
+                        "before_text": after,
+                        "after_text": before,
+                        "evidence": [{"turn_id": source.turn_id, "quote": before}],
+                        "score": 0.87,
+                        "rationale": "earlier canonical form corrects later near-form drift",
+                        "allow_earlier_evidence": True,
+                        "require_quote_before_span": True,
+                    }
+                )
+
+        # Prefer shared-prefix brand-like pairs and keep a small budget.
+        def _priority(item: dict[str, Any]) -> tuple[int, int]:
+            before, after = str(item["before_text"]), str(item["after_text"])
+            shared_prefix = 1 if before and after and before[0] == after[0] else 0
+            return (-shared_prefix, -int(float(item.get("score") or 0) * 100))
+
+        conflict_proposals.sort(key=_priority)
+        proposals.extend(conflict_proposals[:conflict_budget])
+        return proposals
+
+    def _recover_degenerate_turn(self, session: Session, source_index: int) -> dict[str, Any] | None:
+        """Open re-ASR when the current turn transcript collapsed (e.g. 遥遥遥遥)."""
+        turn = session.turns[source_index]
+        audio_path = str(turn.meta.get("audio_path") or "")
+        start = turn.meta.get("start_sec")
+        end = turn.meta.get("end_sec")
+        if not audio_path or start is None or end is None:
+            return None
+        start_f, end_f = float(start), float(end)
+        duration = end_f - start_f
+        plain = self._strip_time_prefix(turn.current_text)
+        if not self._is_degenerate_transcript(plain, duration_sec=duration):
+            return None
+        # Slightly widen the window; first-pass chunk edges often clip recoverable speech.
+        pad = 1.5
+        window_start = max(0.0, start_f - pad)
+        window_end = end_f + pad
+        retranscriber = self.audio_retranscriber
+        if retranscriber is None:
+            from asr_agent.integrations.audio_verifier import retranscribe_window
+
+            retranscriber = retranscribe_window
+        verdict = retranscriber(audio_path=audio_path, start_sec=window_start, end_sec=window_end)
+        if not verdict.get("ok"):
+            turn.meta["degenerate_relisten"] = verdict
+            return None
+        new_text = self._trim_retranscription(str(verdict.get("text") or "").strip())
+        turn.meta["degenerate_relisten"] = {
+            "ok": True,
+            "before": plain,
+            "after": new_text,
+            "start_sec": window_start,
+            "end_sec": window_end,
+        }
+        if not self._retranscription_is_better(plain, new_text):
+            return None
+        prefix_match = _TIME_PREFIX.match(turn.current_text or "")
+        prefix = prefix_match.group(0) if prefix_match else ""
+        hypothesis = self._ensure_closed_set_hypothesis(turn, plain, new_text)
+        hypothesis.decision = "RELISTEN"
+        hypothesis.decision_rationale = ["degenerate_transcript_open_relisten"]
+        hypothesis.evidence_packet["audio_retranscription"] = verdict
+        before = turn.current_text
+        turn.current_text = f"{prefix}{new_text}"
+        hypothesis.action = "REVISE_TEXT"
+        hypothesis.decision = "COMMIT"
+        event = RevisionEvent(
+            event_id=uuid.uuid4().hex,
+            action="REVISE_TEXT",
+            target_turn_id=turn.turn_id,
+            source_turn_id=turn.turn_id,
+            span=plain,
+            before_text=before,
+            after_text=turn.current_text,
+            entity_id=None,
+            score=0.9,
+            evidence=[f"audio-retranscribe:{audio_path}:{window_start}-{window_end}"],
+            resolver="audio-open-relisten",
+            rationale="degenerate first-pass transcript recovered by open audio re-listen",
+            replacement=new_text,
+        )
+        session.revision_events.append(event)
+        return asdict(event)
+
+    def _sparse_llm_triggers(self, session: Session, source_index: int) -> list[str]:
+        """TAMA-style gates: call DeepSeek only when local heuristics need help."""
+        if source_index <= 0:
+            return []
+        reasons: list[str] = []
+        source_plain = self._strip_time_prefix(session.turns[source_index].raw_text)
+        if _ASCII_TOKEN.search(source_plain or ""):
+            reasons.append("cross_script_brand")
+        for turn in session.turns[:source_index]:
+            turn_plain = self._strip_time_prefix(turn.current_text)
+            for hyp in turn.hypotheses:
+                if hyp.action != "DEFER" or hyp.span not in turn_plain:
+                    continue
+                # Only uncertainty-originated hangs (not nomination-only leftovers).
+                asr_u = (hyp.evidence_packet or {}).get("asr_uncertainty") or {}
+                if asr_u.get("confidence") is None and "competing_candidates" not in (hyp.decision_rationale or []):
+                    continue
+                for cand in hyp.text_candidates:
+                    if cand != hyp.span and cand and cand in source_plain:
+                        reasons.append("deferred_with_later_candidate")
+                        break
+                else:
+                    continue
+                break
+        return reasons
+
+    def _reflect(self, session: Session, source_index: int, *, use_llm: bool = False) -> list[dict[str, Any]]:
+        if source_index < 0:
+            return []
+        committed: list[dict[str, Any]] = []
+        llm_meta: dict[str, Any] = {"mode": "tama_sparse", "calls": 0, "triggers": []}
+        recovered = self._recover_degenerate_turn(session, source_index)
+        if recovered:
+            committed.append(recovered)
+        # Local-first: deterministic Path A/B/C (+ open re-listen) before any DeepSeek.
+        proposals = self._deterministic_proposals(session, source_index)
+        if use_llm and source_index > 0:
+            triggers = self._sparse_llm_triggers(session, source_index)
+            llm_meta["triggers"] = triggers
+            if triggers:
+                reflector = self.reflector
+                if reflector is None:
+                    from asr_agent.integrations.deepseek import reflect_timeline
+
+                    reflector = reflect_timeline
+                prior = [
+                    {"turn_id": turn.turn_id, "raw_text": self._strip_time_prefix(turn.raw_text)}
+                    for turn in session.turns[max(0, source_index - 8) : source_index]
+                ]
+                new_turn = {
+                    "turn_id": session.turns[source_index].turn_id,
+                    "raw_text": self._strip_time_prefix(session.turns[source_index].raw_text),
+                }
+                try:
+                    llm_proposals = reflector(prior_turns=prior, new_turn=new_turn) or []
+                    llm_meta["calls"] += 1
+                except Exception:
+                    llm_proposals = []
+                proposals.extend(llm_proposals)
+
+        indexes = {turn.turn_id: index for index, turn in enumerate(session.turns)}
+        seen: set[tuple[str, str, str]] = set()
+        for proposal in proposals:
+            if not isinstance(proposal, dict):
+                continue
+            target_id = str(proposal.get("target_turn_id") or "")
+            target_index = indexes.get(target_id, -1)
+            before = str(proposal.get("before_text") or "").strip()
+            after = str(proposal.get("after_text") or "").strip()
+            score = float(proposal.get("score") or 0.0)
+            key = (target_id, before, after)
+            if key in seen:
+                continue
+            seen.add(key)
+            if target_index < 0 or target_index > source_index:
+                continue
+            target = session.turns[target_index]
+            target_plain = self._strip_time_prefix(target.current_text)
+            if (
+                not before
+                or not after
+                or before == after
+                or before not in target_plain
+                or score < 0.7
+                or not self._is_discoverable_span_pair(before, after)
+            ):
                 continue
             evidence: list[str] = []
             valid = True
+            allow_earlier_evidence = bool(proposal.get("allow_earlier_evidence"))
+            require_quote_before_span = bool(proposal.get("require_quote_before_span"))
             for item in proposal.get("evidence") or []:
                 if not isinstance(item, dict):
                     valid = False
                     break
                 evidence_id, quote = str(item.get("turn_id") or ""), str(item.get("quote") or "")
                 evidence_index = indexes.get(evidence_id, -1)
-                if not quote or evidence_index <= target_index or evidence_index > source_index or quote not in session.turns[evidence_index].raw_text:
+                if not quote or evidence_index < 0 or evidence_index > source_index or after not in quote:
                     valid = False
                     break
+                evidence_plain = self._strip_time_prefix(session.turns[evidence_index].raw_text)
+                if quote not in evidence_plain:
+                    valid = False
+                    break
+                if evidence_index < target_index and not allow_earlier_evidence:
+                    valid = False
+                    break
+                if evidence_index == target_index:
+                    before_at = target_plain.find(before)
+                    if require_quote_before_span:
+                        quote_at = evidence_plain.find(quote)
+                        if before_at < 0 or quote_at < 0 or quote_at >= before_at:
+                            valid = False
+                            break
+                    else:
+                        quote_at = evidence_plain.find(quote, before_at + len(before)) if before_at >= 0 else -1
+                        if quote_at < 0:
+                            valid = False
+                            break
                 evidence.append(f"{evidence_id}:{quote}")
             if not valid or not evidence:
                 continue
+            hypothesis = self._ensure_closed_set_hypothesis(target, before, after)
             hypothesis.decision = "RELISTEN"
-            hypothesis.decision_rationale = ["verified_future_semantic_evidence"]
+            hypothesis.decision_rationale = ["verified_future_semantic_evidence", "agent_discovered_span"]
             hypothesis.evidence_packet["later_raw_evidence"] = evidence
-            event = self._relisten_and_commit(session, target, hypothesis, source_index, after, score, evidence, str(proposal.get("rationale") or ""))
+            event = self._relisten_and_commit(
+                session,
+                target,
+                hypothesis,
+                source_index,
+                after,
+                score,
+                evidence,
+                str(proposal.get("rationale") or ""),
+                allow_llm_confirm=use_llm,
+            )
             if event:
+                if event.get("resolver") == "audio-llm-confirm":
+                    llm_meta["calls"] += 1
                 committed.append(event)
+
+        # TAMA-style: only reassess deferred ASR-uncertainty hangs when later text may help.
+        if use_llm and source_index > 0 and "deferred_with_later_candidate" in llm_meta["triggers"]:
+            before_n = len(committed)
+            for event in self._reassess(session, source_index, use_llm=True):
+                committed.append(event)
+            if len(committed) > before_n:
+                llm_meta["calls"] += len(committed) - before_n
+
+        if session.turns:
+            session.turns[source_index].meta["llm"] = llm_meta
         return committed
 
-    def _relisten_and_commit(self, session: Session, turn: Turn, hypothesis: Hypothesis, source_index: int, candidate: str, semantic_score: float, evidence: list[str], rationale: str) -> dict[str, Any] | None:
-        audio_path = str(turn.meta.get("audio_path") or "")
-        start, end = turn.meta.get("start_sec"), turn.meta.get("end_sec")
-        if not audio_path or start is None or end is None:
+    @staticmethod
+    def _is_discoverable_span_pair(before: str, after: str) -> bool:
+        """Keep agent-discovered edits short and lexical, not whole-sentence rewrites."""
+        if not (1 <= len(before) <= 8 and 1 <= len(after) <= 8):
+            return False
+        return all(ch.isalnum() or ("\u4e00" <= ch <= "\u9fff") for ch in before + after)
+
+    @staticmethod
+    def _ensure_closed_set_hypothesis(turn: Turn, before: str, after: str) -> Hypothesis:
+        """Open or extend a closed-set hypothesis from later evidence (no dataset labels needed)."""
+        hypothesis = next((item for item in turn.hypotheses if item.span == before), None)
+        candidates = [before, after]
+        if hypothesis is None:
+            hypothesis = Hypothesis(
+                span=before,
+                text_candidates=candidates,
+                entity_candidate_ids=[],
+                candidates=[
+                    {"text": candidate, "score": 0.5, "supporting_evidence": [], "contradicting_evidence": []}
+                    for candidate in candidates
+                ],
+                risk="medium",
+                decision="WAIT",
+                decision_rationale=["later_evidence_nomination"],
+                evidence_packet={"asr_uncertainty": {"confidence": None, "nbest": []}, "suspicious_span": None},
+            )
+            turn.hypotheses.append(hypothesis)
+            return hypothesis
+        merged = list(dict.fromkeys([*hypothesis.text_candidates, before, after]))
+        hypothesis.text_candidates = merged
+        existing = {str(item.get("text")) for item in hypothesis.candidates if isinstance(item, dict)}
+        for candidate in merged:
+            if candidate not in existing:
+                hypothesis.candidates.append(
+                    {"text": candidate, "score": 1.0 / len(merged), "supporting_evidence": [], "contradicting_evidence": []}
+                )
+        return hypothesis
+
+    @classmethod
+    def _local_audio_window(cls, turn: Turn, span: str, *, pad_sec: float = 1.5) -> tuple[float, float] | None:
+        start = turn.meta.get("start_sec")
+        end = turn.meta.get("end_sec")
+        if start is None or end is None:
             return None
+        start_f, end_f = float(start), float(end)
+        plain = cls._strip_time_prefix(turn.raw_text or turn.current_text)
+        if not plain or span not in plain or end_f <= start_f:
+            return start_f, end_f
+        idx = plain.find(span)
+        dur = end_f - start_f
+        frac_s = idx / len(plain)
+        frac_e = (idx + max(len(span), 1)) / len(plain)
+        local_s = max(start_f, start_f + frac_s * dur - pad_sec)
+        local_e = min(end_f, start_f + frac_e * dur + pad_sec)
+        if local_e - local_s < 0.4:
+            mid = 0.5 * (local_s + local_e)
+            local_s, local_e = max(start_f, mid - 0.2), min(end_f, mid + 0.2)
+        return local_s, local_e
+
+    def _relisten_and_commit(
+        self,
+        session: Session,
+        turn: Turn,
+        hypothesis: Hypothesis,
+        source_index: int,
+        candidate: str,
+        semantic_score: float,
+        evidence: list[str],
+        rationale: str,
+        *,
+        allow_llm_confirm: bool = False,
+    ) -> dict[str, Any] | None:
+        audio_path = str(turn.meta.get("audio_path") or "")
+        window = self._local_audio_window(turn, hypothesis.span)
+        if not audio_path or window is None:
+            return None
+        start, end = window
         verifier = self.audio_verifier
         if verifier is None:
             from asr_agent.integrations.audio_verifier import verify_candidates
@@ -295,11 +829,55 @@ class ReTraceService:
             return None
         scores = {str(key): float(value) for key, value in dict(verdict["scores"]).items()}
         ranked = sorted(scores, key=scores.get, reverse=True)
-        if not ranked or ranked[0] != candidate or len(ranked) < 2 or scores[candidate] < 0.7 or scores[candidate] - scores[ranked[1]] < 0.1:
-            hypothesis.evidence_packet["audio_verification"] = verdict
-            return None
+        strong = (
+            ranked
+            and ranked[0] == candidate
+            and len(ranked) >= 2
+            and scores[candidate] >= 0.7
+            and scores[candidate] - scores[ranked[1]] >= 0.1
+        )
+        resolver = "audio-semantic-gate"
+        if not strong:
+            # TAMA-style: when audio is top but margin/threshold is weak, ask LLM once.
+            weak_top = ranked and ranked[0] == candidate and scores.get(candidate, 0.0) >= 0.55
+            if not (allow_llm_confirm and weak_top and evidence):
+                hypothesis.evidence_packet["audio_verification"] = verdict
+                return None
+            adjudicator = self.adjudicator
+            if adjudicator is None:
+                from asr_agent.integrations.deepseek import adjudicate_conflict
+
+                adjudicator = adjudicate_conflict
+            try:
+                decision = adjudicator(
+                    hyp=hypothesis.span,
+                    candidates=list(hypothesis.text_candidates),
+                    evidence=list(evidence),
+                    context=turn.current_text,
+                    heuristic={"audio_scores": scores, "semantic_score": semantic_score},
+                )
+            except Exception:
+                decision = {"action": "KEEP"}
+            if str(decision.get("action") or "").upper() != "CORRECT" or str(decision.get("canonical") or "") != candidate:
+                hypothesis.evidence_packet["audio_verification"] = verdict
+                hypothesis.evidence_packet["llm_adjudication"] = decision
+                return None
+            hypothesis.evidence_packet["llm_adjudication"] = decision
+            resolver = "audio-llm-confirm"
         hypothesis.evidence_packet["audio_verification"] = verdict
-        return self._commit_revision(session, turn, hypothesis, source_index, profile=None, candidate=candidate, score=(semantic_score + scores[candidate]) / 2, evidence=[*evidence, f"audio:{audio_path}:{start}-{end}:{candidate}:{scores[candidate]:.3f}"], resolver="audio-semantic-gate", forced_action="REVISE_TEXT", rationale=rationale)
+        return self._commit_revision(
+            session,
+            turn,
+            hypothesis,
+            source_index,
+            profile=None,
+            candidate=candidate,
+            score=(semantic_score + scores[candidate]) / 2,
+            evidence=[*evidence, f"audio:{audio_path}:{start}-{end}:{candidate}:{scores[candidate]:.3f}"],
+            resolver=resolver,
+            forced_action="REVISE_TEXT",
+            rationale=rationale,
+        )
 
     @staticmethod
     def _recall_entity_fallbacks(session: Session, text: str) -> list[tuple[str, str, str]]:
