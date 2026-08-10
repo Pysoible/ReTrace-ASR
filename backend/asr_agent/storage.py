@@ -109,8 +109,8 @@ class SessionRepository:
                 suffix=".tmp",
                 delete=False,
             ) as temporary:
-                json.dump(session.as_dict(), temporary, ensure_ascii=False, indent=2)
                 temporary_path = Path(temporary.name)
+                json.dump(session.as_dict(), temporary, ensure_ascii=False, indent=2)
             temporary_path.replace(path)
         finally:
             if temporary_path is not None and temporary_path.exists():

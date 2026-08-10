@@ -49,6 +49,21 @@ def test_update_does_not_write_or_increment_when_mutation_raises(tmp_path):
     assert unchanged.turns == []
 
 
+def test_failed_serialization_preserves_session_and_removes_temporary_file(tmp_path):
+    repo = SessionRepository(tmp_path)
+    repo.create(Session("s", turns=[Turn("t1", "甲", "甲")], version=4))
+    original_json = (tmp_path / "s.json").read_text(encoding="utf-8")
+
+    with pytest.raises(TypeError):
+        repo.update("s", lambda current: current.turns[0].meta.update(bad=object()))
+
+    stored = repo.load("s")
+    assert stored.version == 4
+    assert stored.turns[0].meta == {}
+    assert (tmp_path / "s.json").read_text(encoding="utf-8") == original_json
+    assert list(tmp_path.glob(".s.*.tmp")) == []
+
+
 def test_returned_objects_are_detached_from_persisted_data(tmp_path):
     repo = SessionRepository(tmp_path)
     created = repo.create(Session("s"))
