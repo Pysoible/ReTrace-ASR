@@ -1,10 +1,38 @@
+import json
+
+import pytest
+
 from asr_agent.models import (
     EvidenceRef,
+    EntityProfile,
     MemoryBelief,
     RevisionEvent,
     Session,
     WorkingHypothesis,
 )
+from asr_agent.retrace import (
+    EntityProfile as LegacyEntityProfile,
+    ReTraceService,
+    Session as LegacySession,
+)
+
+
+def _revision_event_dict(**overrides):
+    value = {
+        "event_id": "e1",
+        "action": "REVISE_TEXT",
+        "target_turn_id": "t1",
+        "source_turn_id": "t2",
+        "span": "泰信",
+        "before_text": "泰信",
+        "after_text": "泰康",
+        "entity_id": None,
+        "score": 0.9,
+        "evidence": ["t2:泰康"],
+        "resolver": "test",
+    }
+    value.update(overrides)
+    return value
 
 
 def test_legacy_session_loads_with_versioned_memory_defaults():
@@ -19,7 +47,33 @@ def test_legacy_session_loads_with_versioned_memory_defaults():
     assert session.version == 0
     assert session.memory_scope == "default"
     assert session.open_hypotheses == {}
-    assert Session.from_dict(session.as_dict()).as_dict() == session.as_dict()
+    serialized = json.loads(json.dumps(session.as_dict(), ensure_ascii=False))
+    assert Session.from_dict(serialized).as_dict() == session.as_dict()
+
+
+def test_session_preserves_legacy_positional_entities_argument():
+    entities = {"lead": EntityProfile("lead", "泰康")}
+
+    session = Session("s", entities)
+
+    assert session.entities == entities
+    assert session.version == 0
+
+
+def test_retrace_keeps_legacy_model_imports():
+    assert LegacyEntityProfile is EntityProfile
+    assert LegacySession is Session
+
+
+def test_service_saves_and_reloads_json_session(tmp_path):
+    service = ReTraceService(tmp_path)
+    service.upsert_entities("s1", [LegacyEntityProfile("lead", "泰康")])
+
+    saved_json = json.loads((tmp_path / "s1.json").read_text())
+    reloaded = ReTraceService(tmp_path).get_session("s1")
+
+    assert saved_json == reloaded
+    assert reloaded["entities"]["lead"]["name"] == "泰康"
 
 
 def test_working_hypothesis_keeps_competing_interpretations():
@@ -67,17 +121,7 @@ def test_versioned_session_deserializes_nested_models():
             },
         },
         "revision_events": [{
-            "event_id": "e1",
-            "action": "REVISE_TEXT",
-            "target_turn_id": "t1",
-            "source_turn_id": "t2",
-            "span": "泰信",
-            "before_text": "泰信",
-            "after_text": "泰康",
-            "entity_id": None,
-            "score": 0.9,
-            "evidence": ["t2:泰康"],
-            "resolver": "test",
+            **_revision_event_dict(),
             "session_version": 3,
             "supersedes_event_id": "e0",
         }],
@@ -90,4 +134,27 @@ def test_versioned_session_deserializes_nested_models():
     assert isinstance(session.revision_events[0], RevisionEvent)
     assert session.revision_events[0].session_version == 3
     assert session.revision_events[0].supersedes_event_id == "e0"
-    assert Session.from_dict(session.as_dict()).as_dict() == session.as_dict()
+    serialized = json.loads(json.dumps(session.as_dict(), ensure_ascii=False))
+    assert Session.from_dict(serialized).as_dict() == session.as_dict()
+
+
+def test_evidence_ref_converts_non_null_score_to_float():
+    evidence = EvidenceRef.from_dict({
+        "turn_id": "t1",
+        "kind": "text",
+        "value": "泰康",
+        "score": "0.9",
+    })
+
+    assert evidence.score == 0.9
+    assert isinstance(evidence.score, float)
+
+
+def test_revision_event_rejects_non_boolean_active():
+    with pytest.raises(ValueError, match="active"):
+        RevisionEvent.from_dict(_revision_event_dict(active="false"))
+
+
+def test_revision_event_handles_boolean_and_legacy_active_values():
+    assert RevisionEvent.from_dict(_revision_event_dict(active=False)).active is False
+    assert RevisionEvent.from_dict(_revision_event_dict()).active is True

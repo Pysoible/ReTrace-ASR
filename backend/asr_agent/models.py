@@ -5,6 +5,12 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
+def _strict_bool(value: Any, *, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a boolean")
+    return value
+
+
 @dataclass
 class EntityProfile:
     entity_id: str
@@ -93,11 +99,12 @@ class EvidenceRef:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "EvidenceRef":
+        score = value.get("score")
         return cls(
             turn_id=str(value["turn_id"]),
             kind=str(value["kind"]),
             value=str(value["value"]),
-            score=value.get("score"),
+            score=float(score) if score is not None else None,
         )
 
 
@@ -213,7 +220,7 @@ class RevisionEvent:
             score=float(value["score"]),
             evidence=list(value.get("evidence", [])),
             resolver=str(value["resolver"]),
-            active=bool(value.get("active", True)),
+            active=_strict_bool(value.get("active", True), field_name="active"),
             rationale=str(value.get("rationale", "")),
             reverted_event_id=value.get("reverted_event_id"),
             reason=str(value.get("reason", "")),
@@ -226,17 +233,17 @@ class RevisionEvent:
 @dataclass
 class Session:
     session_id: str
-    version: int = 0
-    memory_scope: str = "default"
-    analysis_status: str = "idle"
     entities: dict[str, EntityProfile] = field(default_factory=dict)
     turns: list[Turn] = field(default_factory=list)
-    working_beliefs: dict[str, MemoryBelief] = field(default_factory=dict)
-    open_hypotheses: dict[str, WorkingHypothesis] = field(default_factory=dict)
-    dependency_index: dict[str, list[str]] = field(default_factory=dict)
     verified_memory: dict[str, dict[str, str]] = field(default_factory=dict)
     quarantine_memory: dict[str, dict[str, str]] = field(default_factory=dict)
     revision_events: list[RevisionEvent] = field(default_factory=list)
+    version: int = 0
+    memory_scope: str = "default"
+    analysis_status: str = "idle"
+    working_beliefs: dict[str, MemoryBelief] = field(default_factory=dict)
+    open_hypotheses: dict[str, WorkingHypothesis] = field(default_factory=dict)
+    dependency_index: dict[str, list[str]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
