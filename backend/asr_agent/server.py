@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
 import re
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from asr_agent.integrations.deepseek import deepseek_status
 from asr_agent.integrations.qwen_asr import asr_status, preload_engine, transcribe_audio
+from asr_agent.realtime import RealtimeAnalysisCoordinator
 from asr_agent.retrace import EntityProfile, ReTraceService
 
 _AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac", ".pcm"}
@@ -77,13 +78,25 @@ def _audio_session_id(audio_path: str, requested: str | None = None) -> str:
     return f"audio_{safe[:96]}"
 
 
-def create_app(workspace: Path | None = None) -> FastAPI:
+def create_app(
+    workspace: Path | None = None,
+    *,
+    service: ReTraceService | None = None,
+    coordinator: RealtimeAnalysisCoordinator | None = None,
+) -> FastAPI:
     root = workspace or Path.cwd() / "retrace_state"
-    service = ReTraceService(root / "sessions")
+    service = service or ReTraceService(root / "sessions")
+    coordinator = coordinator or RealtimeAnalysisCoordinator(service)
     upload_dir = root / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
-    app = FastAPI(title="ReTrace-ASR")
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        yield
+        coordinator.close()
+
+    app = FastAPI(title="ReTrace-ASR", lifespan=lifespan)
     app.state.service = service
+    app.state.coordinator = coordinator
     app.state.upload_dir = upload_dir
 
     @app.get("/api/health")
@@ -105,10 +118,10 @@ def create_app(workspace: Path | None = None) -> FastAPI:
     def upsert_entities(session_id: str, request: EntityRequest) -> dict[str, Any]:
         return {"session": service.upsert_entities(session_id, [EntityProfile.from_dict(item) for item in request.entities])}
 
-    @app.post("/api/sessions/{session_id}/turns")
+    @app.post("/api/sessions/{session_id}/turns", status_code=202)
     def process_turn(session_id: str, request: TurnRequest) -> dict[str, Any]:
         try:
-            return service.process_turn(
+            observed = service.observe_turn(
                 session_id,
                 request.turn_id,
                 request.text,
@@ -121,6 +134,8 @@ def create_app(workspace: Path | None = None) -> FastAPI:
                 nbest=request.nbest,
                 meta=_turn_meta(request),
             )
+            coordinator.submit(session_id, request.turn_id)
+            return observed
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -240,36 +255,6 @@ def create_app(workspace: Path | None = None) -> FastAPI:
     @app.get("/api/sessions/{session_id}")
     def get_session(session_id: str) -> dict[str, Any]:
         return {"session": service.get_session(session_id)}
-
-    @app.get("/api/demo/r0015")
-    def demo_r0015() -> dict[str, Any]:
-        """Replay a saved AliMeeting revision result so the UI can show the lift instantly."""
-        repo = Path(__file__).resolve().parents[2]
-        candidates = [
-            repo / "retrace_state" / "alimeeting_eval" / "R0015_M0135_newcode.result.json",
-            root / "alimeeting_eval" / "R0015_M0135_newcode.result.json",
-        ]
-        path = next((item for item in candidates if item.exists()), None)
-        if path is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Demo artifact missing: run R0015 newcode eval first "
-                "(retrace_state/alimeeting_eval/R0015_M0135_newcode.result.json)",
-            )
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        session = payload.get("session")
-        if not isinstance(session, dict):
-            raise HTTPException(status_code=500, detail="Demo artifact has no session")
-        events = [item for item in session.get("revision_events") or [] if item.get("active")]
-        open_n = sum(1 for item in events if "open-relisten" in str(item.get("resolver") or ""))
-        return {
-            "session": session,
-            "demo": "R0015_M0135",
-            "n_revisions": len(events),
-            "n_open_relisten": open_n,
-            "impact_note": "CER 0.561 → 0.453 · open re-listen recovered 骁龙 from 遥遥遥遥",
-            "source": str(path),
-        }
 
     frontend = Path(__file__).parents[2] / "frontend" / "dist"
     if frontend.exists():

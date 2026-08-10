@@ -1,17 +1,26 @@
 # ReTrace-ASR
 
-ReTrace-ASR is an evidence-grounded retrospective agent for conversational ASR. It begins with only immutable Qwen-Omni observations; as later turns arrive, the agent autonomously reinterprets earlier turns and records every justified revision.
+ReTrace-ASR 是一个 Agent-first 的实时 ASR 回溯修订原型。它保存不可修改的首遍 ASR，结合短期与长期 Memory 判断新信息与旧解释的关系，并在上下文和历史音频共同支持时自动修订或回滚字幕。
 
-## Method
+## 核心流程
 
-1. Qwen-Omni transcribes audio into silence-aware chunks. Each chunk is an ordered `Turn` with immutable `raw_text`.
-2. Before reflection, ReTrace marks suspicious spans from ASR confidence and N-best disagreement. Later conversational semantics can only trigger a targeted historical re-listen; a revision is committed only when a closed-set audio verifier independently selects the same candidate. The autonomous action states are `WAIT`, `RELISTEN`, and `REVISE`.
-3. Each new turn triggers a DeepSeek `REFLECT` action over earlier raw turns. It can discover a previously unnoticed ambiguity; no user-supplied entity list is required.
-4. A proposal must identify the prior span, replacement interpretation, later evidence turn IDs and verbatim evidence quotes. The controller rejects any quote that cannot be located in a later raw turn; already-revised display text is never evidence.
-5. Accepted proposals enter `RELISTEN`; only the dual semantic-and-audio gate can append a `RevisionEvent`. Visible subtitles and memory are replayed from immutable raw turns plus active events.
-6. Revision events are append-only audit records; the autonomous controller does not expose manual confirmation or reversal controls.
+1. `OBSERVE`：立即持久化 `raw_text`，文本接口返回 `202 queued`。
+2. `MEMORY RETRIEVE`：读取近期 Turn、未决假设、依赖 Turn 和长期稳定事实。
+3. `CONTEXT JUDGE`：Agent 输出 `CONSISTENT | NOVEL | CONFLICT | UNCERTAIN`；只有冲突或不确定时才能提出闭集候选。
+4. `TARGETED RELISTEN`：仅验证 Agent 指定的历史音频窗口和候选，不做全局 N-gram 扫描。
+5. `EVENT REPLAY`：以不可修改的 raw Turn 和只追加事件重建当前字幕。新版证据可以触发 `ROLLBACK`，无需用户确认。
 
-## Run
+Memory 分为两层：会话内短期 Memory 保存近期上下文、工作事实和未决假设；长期 Memory 只接收达到置信门槛且拥有独立来源或音频验证的事实。长期存储故障时，服务自动降级到短期 Memory。
+
+## 当前环境边界
+
+仓库当前不附带数据集或本地 ASR 模型。所有核心测试使用注入式 Context Judge、音频验证器和合成会话，因此可离线运行，但不能据此宣称真实 CER 提升或门槛已经完成数据标定。
+
+`backend/asr_agent/calibration.py` 中的门槛是显式 bootstrap 配置，目标偏向提高错误发现与修正召回率，并允许少量误改。接入开发集后应重新标定 `suspect`、`relisten`、`revise`、`long_memory` 和音频 margin，再报告 revision recall、F2/F3、overcorrection 与 rollback 指标。
+
+未配置 DeepSeek 时，系统只读取 ASR 显式置信度/N-best 信号，不自行猜测错误 span；未配置历史音频或音频验证失败时，动作固定为 `DEFER`，不会只凭文本改写字幕。
+
+## 运行
 
 ```bash
 uv sync --group dev
@@ -19,22 +28,21 @@ cd frontend && npm install && npm run build && cd ..
 uv run uvicorn asr_agent.server:app --reload
 ```
 
-For GPU audio transcription, copy `.env.example` to `.env`, set `ASR_AUDIO_ENABLED=1`, and point `ASR_MODEL_PATH` to a Qwen-Omni checkpoint.
-Set `DEEPSEEK_API_KEY` to enable autonomous DeepSeek reflection. DeepSeek can propose a new interpretation but can never directly overwrite transcript text: the controller requires later quoted evidence before it records a revision.
+可选配置：
 
-## APIs
+- `DEEPSEEK_API_KEY`：启用结构化 Context Judge。
+- `ASR_AUDIO_ENABLED=1` 与 `ASR_MODEL_PATH`：启用本地 Qwen 音频转写。
 
-- `POST /api/sessions/{id}/turns` — append a raw text ASR observation; later turns autonomously trigger reflection.
-- `POST /api/sessions/{id}/audio/upload` — upload one audio file; its chunks become ordered turns in one session.
-- `GET /api/sessions/{id}` — retrieve raw observations, memory layers and persisted revision events.
-- `GET /api/integrations/status` — Qwen adapter readiness.
+## API
 
-The Studio UI renders the current subtitle, original text, subsequent evidence, event state and undo operation.
+- `POST /api/sessions/{id}/turns`：提交不可修改的文本观察，立即返回 `202`。
+- `GET /api/sessions/{id}`：读取版本、分析状态、两层 Memory、未决假设和修订账本。
+- `POST /api/sessions/{id}/audio/upload`：模型可用时上传音频并按 chunk 建立 Turn。
+- `GET /api/integrations/status`：检查 Qwen 与 DeepSeek 是否就绪。
 
-## ICASSP-oriented evaluation
+## 验证
 
-For a turn-level reference set, evaluate the event stream with
-`asr_agent.metrics.evaluate_revisions`. It reports committed-revision count,
-revision precision, over-correction rate, revision coverage, and mean
-resolution latency in turns. These metrics separate final transcript quality
-from the safety and latency of retrospective corrections.
+```bash
+.venv/bin/pytest -q
+cd frontend && npm run build
+```

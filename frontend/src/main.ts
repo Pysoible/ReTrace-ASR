@@ -15,40 +15,38 @@ type RevisionEvent = {
   span?: string;
   replacement?: string;
   reverted_event_id?: string;
+  supersedes_event_id?: string;
   reason?: string;
 };
-type Candidate = { text: string; score: number };
-type Hypothesis = {
-  span: string;
-  candidates: Candidate[];
-  decision: string;
-  decision_rationale: string[];
-  evidence_packet?: {
-    asr_uncertainty?: { confidence?: number; nbest?: string[] };
-    suspicious_span?: { reasons?: string[] } | null;
-    later_raw_evidence?: string[];
-    audio_verification?: { ok?: boolean; scores?: Record<string, number> };
-    audio_retranscription?: { ok?: boolean; text?: string };
-  };
+type WorkingHypothesis = {
+  hypothesis_id: string;
+  target_turn_ids: string[];
+  current_interpretation: string;
+  proposed_interpretation: string;
+  alternatives: string[];
+  score: number;
+  status: string;
 };
 type Turn = {
   turn_id: string;
   raw_text: string;
   current_text: string;
-  hypotheses?: Hypothesis[];
   source?: string;
   meta?: { start_sec?: number; end_sec?: number; degenerate_relisten?: Record<string, unknown> };
 };
 type Session = {
   session_id: string;
+  version: number;
+  analysis_status: string;
   turns: Turn[];
   revision_events: RevisionEvent[];
+  open_hypotheses: Record<string, WorkingHypothesis>;
   quarantine_memory: Record<string, unknown>;
 };
 type Impact = {
   revised_turns: number;
-  open_relisten: number;
-  semantic_gate: number;
+  rollbacks: number;
+  deferred: number;
   recovered_chars: number;
   highlight?: string;
 };
@@ -56,7 +54,7 @@ type Impact = {
 const root = document.querySelector<HTMLDivElement>('#app')!;
 let session: Session | null = null;
 let selected: RevisionEvent | null = null;
-let status = '上传音频，或一键回放 AliMeeting 修订样例，直观看到 ReTrace 的提升。';
+let status = '等待新的 ASR observation。';
 let busy = false;
 let impactNote = '';
 
@@ -69,7 +67,9 @@ function stripTime(text: string): string {
 }
 
 function activeEvents(): RevisionEvent[] {
-  return (session?.revision_events ?? []).filter((event) => event.active);
+  const events = session?.revision_events ?? [];
+  const superseded = new Set(events.filter((event) => event.active).map((event) => event.supersedes_event_id).filter(Boolean));
+  return events.filter((event) => event.active && !superseded.has(event.event_id));
 }
 
 function activeEvent(turnId: string): RevisionEvent | undefined {
@@ -84,14 +84,14 @@ function computeImpact(current: Session | null): Impact {
     const after = stripTime(event.after_text || event.replacement || '');
     recovered += Math.max(0, after.length - before.length);
   }
-  const open = events.filter((event) => (event.resolver || '').includes('open-relisten')).length;
-  const semantic = events.filter((event) => (event.resolver || '').includes('semantic')).length;
+  const rollbacks = events.filter((event) => event.action === 'ROLLBACK').length;
+  const deferred = Object.values(current?.open_hypotheses ?? {}).filter((item) => item.status === 'active').length;
   const joined = (current?.turns ?? []).map((turn) => stripTime(turn.current_text)).join('');
   const highlight = joined.includes('骁龙') ? '骁龙 recovered' : joined.includes('麒麟') ? '麒麟 recovered' : undefined;
   return {
     revised_turns: new Set(events.map((event) => event.target_turn_id)).size,
-    open_relisten: open,
-    semantic_gate: semantic,
+    rollbacks,
+    deferred,
     recovered_chars: recovered,
     highlight,
   };
@@ -99,8 +99,8 @@ function computeImpact(current: Session | null): Impact {
 
 function resolverLabel(resolver?: string): string {
   if (!resolver) return 'REVISION';
-  if (resolver.includes('open-relisten')) return 'OPEN RELISTEN';
-  if (resolver.includes('semantic')) return 'AUDIO GATE';
+  if (resolver.includes('rollback')) return 'ROLLBACK';
+  if (resolver.includes('agent-context-audio')) return 'CONTEXT + AUDIO';
   return resolver.toUpperCase();
 }
 
@@ -109,7 +109,7 @@ function renderTurnBody(turn: Turn, event?: RevisionEvent): string {
   const cur = stripTime(turn.current_text);
   if (!event) return `<p class="turn-text">${escapeHtml(turn.current_text)}</p>`;
 
-  const isOpen = (event.resolver || '').includes('open-relisten') || raw !== cur;
+  const isOpen = raw !== cur;
   if (isOpen) {
     const rawShow = raw.trim() ? escapeHtml(raw) : '<i class="empty-asr">∅ empty / collapsed ASR</i>';
     return `<div class="diff-stack">
@@ -138,7 +138,7 @@ function renderTurns(): string {
   const current = session;
   if (!current?.turns.length) {
     return `<div class="transcript-paper">
-      <p class="empty">还没有会话。点击右侧 <b>Replay R0015</b> 立刻看「遥遥遥遥 → 骁龙」的修订效果，或上传自己的音频。</p>
+      <p class="empty">还没有会话。</p>
     </div>`;
   }
   return `<div class="transcript-paper">${current.turns
@@ -173,15 +173,15 @@ function renderImpact(): string {
   if (!session?.turns.length) {
     return `<div class="impact-strip idle">
       <div><b>—</b><span>revised turns</span></div>
-      <div><b>—</b><span>open re-listen</span></div>
+      <div><b>—</b><span>rollbacks</span></div>
       <div><b>—</b><span>chars recovered</span></div>
       <div class="impact-note"><span>DEMO</span><p>Load R0015 to feel the lift</p></div>
     </div>`;
   }
   return `<div class="impact-strip ${impact.revised_turns ? 'hot' : ''}">
     <div><b>${impact.revised_turns}</b><span>revised turns</span></div>
-    <div><b>${impact.open_relisten}</b><span>open re-listen</span></div>
-    <div><b>${impact.semantic_gate}</b><span>audio gate</span></div>
+    <div><b>${impact.rollbacks}</b><span>rollbacks</span></div>
+    <div><b>${impact.deferred}</b><span>deferred</span></div>
     <div><b>+${impact.recovered_chars}</b><span>chars recovered</span></div>
     <div class="impact-note">
       <span>LIFT</span>
@@ -191,12 +191,10 @@ function renderImpact(): string {
 }
 
 function renderDecision(): string {
-  const pending = session?.turns
-    .flatMap((turn) => (turn.hypotheses ?? []).map((hypothesis) => ({ turn, hypothesis })))
-    .find((item) => item.hypothesis.decision !== 'COMMIT');
-  if (!selected && pending) return renderHypothesis(pending.turn, pending.hypothesis);
+  const pending = Object.values(session?.open_hypotheses ?? {}).find((item) => item.status === 'active');
+  if (!selected && pending) return renderHypothesis(pending);
   if (!selected) {
-    return `<p class="empty">点一条 <b>REVISED</b> 字幕，查看开放重听 / 音频门控的证据链。</p>`;
+    return `<p class="empty">点一条 <b>REVISED</b> 字幕查看证据链。</p>`;
   }
   return `<div class="decision method-rail">
     <span class="status">${escapeHtml(resolverLabel(selected.resolver))}</span>
@@ -217,36 +215,23 @@ function renderMethodTrace(): string {
     <span class="eyebrow">METHOD TRACE</span>
     <ol class="method-trace">
       <li><b>① OBSERVE</b><span>保留首遍 ASR 与时间戳，永不覆盖 raw。</span></li>
-      <li><b>② DETECT COLLAPSE</b><span>识别「遥遥遥遥 / 嗯嗯嗯」等退化转写。</span></li>
-      <li><b>③ OPEN RELISTEN</b><span>对历史音频窗做开放重听并写回。</span></li>
-      <li><b>④ SEMANTIC + AUDIO GATE</b><span>近形/回声冲突再走 closed-set 音频验证。</span></li>
-      <li><b>⑤ AUDIT</b><span>每次修订可追溯、可回放。</span></li>
+      <li><b>② MEMORY RETRIEVE</b><span>检索近期对话、未决假设与长期稳定事实。</span></li>
+      <li><b>③ CONTEXT JUDGE</b><span>区分一致、新信息、冲突与不确定。</span></li>
+      <li><b>④ TARGETED RELISTEN</b><span>只对冲突焦点做 closed-set 历史音频验证。</span></li>
+      <li><b>⑤ EVENT REPLAY</b><span>从 raw 与只追加事件重建当前字幕。</span></li>
     </ol>
   </section>`;
 }
 
-function renderHypothesis(turn: Turn, hypothesis: Hypothesis): string {
-  const asr = hypothesis.evidence_packet?.asr_uncertainty;
-  const reasons =
-    hypothesis.evidence_packet?.suspicious_span?.reasons?.join(' · ') || hypothesis.decision_rationale.join(' · ');
-  const choices = hypothesis.candidates
-    .map((candidate) => `<li><span>${escapeHtml(candidate.text)}</span><small>${Math.round(candidate.score * 100)}%</small></li>`)
-    .join('');
-  const audio = hypothesis.evidence_packet?.audio_verification;
-  const audioScores = audio?.scores
-    ? Object.entries(audio.scores)
-        .map(([candidate, score]) => `${escapeHtml(candidate)}: ${Math.round(score * 100)}%`)
-        .join('<br>')
-    : 'Pending targeted re-listen';
+function renderHypothesis(hypothesis: WorkingHypothesis): string {
+  const choices = hypothesis.alternatives.map((candidate) => `<li><span>${escapeHtml(candidate)}</span></li>`).join('');
   return `<div class="decision method-rail candidate-card">
-    <span class="status action-${escapeHtml(hypothesis.decision)}">${escapeHtml(hypothesis.decision)}</span>
-    <h3>Unresolved: ${escapeHtml(hypothesis.span)}</h3>
-    <p>${escapeHtml(reasons || 'Awaiting independent evidence.')}</p>
+    <span class="status action-${escapeHtml(hypothesis.status)}">${escapeHtml(hypothesis.status.toUpperCase())}</span>
+    <h3>${escapeHtml(hypothesis.current_interpretation)} <i>↔</i> ${escapeHtml(hypothesis.proposed_interpretation)}</h3>
     <ul class="candidate-list">${choices}</ul>
     <dl class="evidence-packet">
-      <dt>ASR confidence</dt><dd>${asr?.confidence ?? '—'}</dd>
-      <dt>Later raw evidence</dt><dd>${(hypothesis.evidence_packet?.later_raw_evidence ?? []).map(escapeHtml).join('<br>') || '—'}</dd>
-      <dt>Audio verification</dt><dd>${audioScores}</dd>
+      <dt>Target turns</dt><dd>${hypothesis.target_turn_ids.map(escapeHtml).join(', ')}</dd>
+      <dt>Evidence score</dt><dd>${Math.round(hypothesis.score * 100)}%</dd>
     </dl>
   </div>`;
 }
@@ -260,12 +245,12 @@ function render(): void {
       <div>
         <span class="eyebrow">RETRACE-ASR · LIVING TRANSCRIPT</span>
         <h1>Hear it twice.</h1>
-        <p>首遍 ASR 可以崩坏；ReTrace 用开放重听与双证据门控把「遥遥遥遥」救回「骁龙」——修订看得见、证据点得开。</p>
+        <p>最新上下文可以强化新信息，也可以推翻旧解释；raw 始终保留，修订由上下文与音频共同决定。</p>
       </div>
       <div class="metrics">
         <div><b>${turns}</b><span>turns</span></div>
         <div><b class="${events ? 'pulse' : ''}">${events}</b><span>revisions</span></div>
-        <div><b>${impact.recovered_chars ? `+${impact.recovered_chars}` : '0'}</b><span>chars up</span></div>
+        <div><b>${escapeHtml(session?.analysis_status || 'idle')}</b><span>agent</span></div>
       </div>
     </header>
     ${renderImpact()}
@@ -284,16 +269,12 @@ function render(): void {
         </div>
         ${renderMethodTrace()}
         ${renderDecision()}
-        <div class="demo-actions">
-          <button id="demo-r0015" class="demo-btn" ${busy ? 'disabled' : ''}>Replay R0015 lift</button>
-          <p class="demo-caption">一键加载 AliMeeting 样例：3 处开放重听，含 遥→骁龙。</p>
-        </div>
       </aside>
     </div>
     <section class="observation">
       <div>
         <span class="eyebrow">QWEN-OMNI AUDIO INPUT</span>
-        <p>上传新音频跑完整链路；Agent 会自动重听退化 turn 并写回修订。</p>
+        <p>上传音频建立实时会话，Agent 会持续更新分析状态与修订账本。</p>
       </div>
       <div class="input-stack">
         <input id="session" value="${escapeHtml(session?.session_id || 'demo')}" aria-label="Session ID">
@@ -315,35 +296,6 @@ function render(): void {
   );
   document.querySelector<HTMLButtonElement>('#submit-text')?.addEventListener('click', submitText);
   document.querySelector<HTMLButtonElement>('#submit-audio')?.addEventListener('click', submitAudio);
-  document.querySelector<HTMLButtonElement>('#demo-r0015')?.addEventListener('click', loadDemo);
-}
-
-async function loadDemo(): Promise<void> {
-  busy = true;
-  status = 'Loading AliMeeting R0015 revision replay…';
-  render();
-  try {
-    const result = await fetch('/api/demo/r0015');
-    if (!result.ok) {
-      status = `Demo failed: ${await result.text()}`;
-      busy = false;
-      render();
-      return;
-    }
-    const body = await result.json();
-    session = body.session;
-    const events = activeEvents();
-    selected = events.find((event) => stripTime(event.before_text).includes('遥')) ?? events[0] ?? null;
-    const impact = computeImpact(session);
-    impactNote = body.impact_note || `CER 0.561 → 0.453 · ${impact.revised_turns} revised turns · 骁龙 recovered`;
-    status = `Demo ready · ${events.length} revisions on ${session?.turns.length ?? 0} turns.`;
-  } catch (error) {
-    status = `Demo failed: ${error instanceof Error ? error.message : String(error)}`;
-  }
-  busy = false;
-  render();
-  const revised = document.querySelector('.subtitle-line.revised');
-  revised?.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 async function submitText(): Promise<void> {
@@ -366,11 +318,26 @@ async function submitText(): Promise<void> {
   }
   const body = await result.json();
   session = body.session;
-  selected = body.revisions?.[0] ?? null;
+  status = 'Observation queued · analyzing context…';
+  session = await waitForAnalysis(sessionId);
+  const events = activeEvents();
+  selected = events[events.length - 1] ?? null;
   impactNote = selected ? `Live revision via ${selected.resolver || 'agent'}` : '';
-  status = selected ? 'Observation appended · revision committed.' : 'Immutable observation appended.';
+  status = session.analysis_status === 'deferred' ? 'Analysis deferred pending stronger evidence.' : 'Context analysis complete.';
   busy = false;
   render();
+}
+
+async function waitForAnalysis(sessionId: string): Promise<Session> {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+    const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`);
+    if (!response.ok) throw new Error(await response.text());
+    const body = await response.json();
+    const current = body.session as Session;
+    if (current.analysis_status !== 'queued' && current.analysis_status !== 'analyzing') return current;
+  }
+  throw new Error('analysis timeout');
 }
 
 async function submitAudio(): Promise<void> {
@@ -378,7 +345,7 @@ async function submitAudio(): Promise<void> {
   const file = document.querySelector<HTMLInputElement>('#audio')!.files?.[0];
   if (!file) return;
   busy = true;
-  status = 'Transcribing + ReTrace revising (may take a few minutes)…';
+  status = 'Transcribing and analyzing context (may take a few minutes)…';
   impactNote = '';
   render();
   const form = new FormData();

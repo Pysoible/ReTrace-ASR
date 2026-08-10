@@ -12,7 +12,19 @@ def evaluate_revisions(
     ambiguous_turn_count: int,
 ) -> dict[str, float | int]:
     """Score only committed text revisions against turn-level references."""
-    revisions = [event for event in events if event.get("action") == "REVISE_TEXT" and event.get("active", True)]
+    superseded = {
+        str(event["supersedes_event_id"])
+        for event in events
+        if event.get("active", True) and event.get("supersedes_event_id")
+    }
+    revision_actions = {"REVISE_TEXT", "REVISE_CURRENT", "REVISE_HISTORY"}
+    revisions = [
+        event
+        for event in events
+        if event.get("action") in revision_actions
+        and event.get("active", True)
+        and str(event.get("event_id", "")) not in superseded
+    ]
     correct = sum(
         1
         for event in revisions
@@ -25,10 +37,23 @@ def evaluate_revisions(
         if str(event.get("source_turn_id")) in positions and str(event.get("target_turn_id")) in positions
     ]
     total = len(revisions)
+    precision = correct / total if total else 0.0
+    recall = correct / ambiguous_turn_count if ambiguous_turn_count else 0.0
+
+    def f_beta(beta: float) -> float:
+        denominator = beta * beta * precision + recall
+        return (1 + beta * beta) * precision * recall / denominator if denominator else 0.0
+
     return {
         "committed_revisions": total,
         "correct_revisions": correct,
-        "revision_precision": correct / total if total else 0.0,
+        "automatic_rollbacks": sum(
+            1 for event in events if event.get("action") == "ROLLBACK" and event.get("active", True)
+        ),
+        "revision_precision": precision,
+        "revision_recall": recall,
+        "revision_f2": f_beta(2.0),
+        "revision_f3": f_beta(3.0),
         "overcorrection_rate": (total - correct) / total if total else 0.0,
         "revision_coverage": total / ambiguous_turn_count if ambiguous_turn_count else 0.0,
         "mean_resolution_latency_turns": sum(latencies) / len(latencies) if latencies else 0.0,

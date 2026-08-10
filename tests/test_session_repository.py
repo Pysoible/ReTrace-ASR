@@ -110,8 +110,8 @@ def test_service_writes_increment_version_but_reads_do_not(tmp_path):
     first = service.process_turn("s", "t1", "甲")["session"]
     read = service.get_session("s")
 
-    assert first["version"] == 1
-    assert read["version"] == 1
+    assert first["version"] == 2
+    assert read["version"] == 2
 
 
 def test_duplicate_turn_failure_does_not_increment_version(tmp_path):
@@ -121,7 +121,7 @@ def test_duplicate_turn_failure_does_not_increment_version(tmp_path):
     with pytest.raises(ValueError, match="duplicate turn_id: t1"):
         service.process_turn("s", "t1", "乙")
 
-    assert service.get_session("s")["version"] == 1
+    assert service.get_session("s")["version"] == 2
 
 
 def test_concurrent_service_turns_are_not_lost(tmp_path):
@@ -137,7 +137,7 @@ def test_concurrent_service_turns_are_not_lost(tmp_path):
 
     session = service.get_session("s")
     assert {turn["turn_id"] for turn in session["turns"]} == {"t1", "t2"}
-    assert session["version"] == 2
+    assert session["version"] == 4
 
 
 def test_repository_instances_share_atomic_updates_for_the_same_root(tmp_path):
