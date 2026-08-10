@@ -12,63 +12,10 @@ def _strict_bool(value: Any, *, field_name: str) -> bool:
 
 
 @dataclass
-class EntityProfile:
-    entity_id: str
-    name: str
-    aliases: list[str] = field(default_factory=list)
-    attributes: dict[str, str] = field(default_factory=dict)
-
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "EntityProfile":
-        return cls(
-            entity_id=str(value["entity_id"]),
-            name=str(value["name"]),
-            aliases=list(value.get("aliases", [])),
-            attributes=dict(value.get("attributes", {})),
-        )
-
-
-@dataclass
-class Hypothesis:
-    span: str
-    text_candidates: list[str]
-    entity_candidate_ids: list[str]
-    entity_id: str | None = None
-    action: str = "DEFER"
-    candidates: list[dict[str, Any]] = field(default_factory=list)
-    risk: str = "medium"
-    decision: str = "WAIT"
-    decision_rationale: list[str] = field(default_factory=list)
-    evidence_packet: dict[str, Any] = field(default_factory=dict)
-
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "Hypothesis":
-        return cls(
-            span=str(value["span"]),
-            text_candidates=list(value.get("text_candidates", [])),
-            entity_candidate_ids=list(value.get("entity_candidate_ids", [])),
-            entity_id=value.get("entity_id"),
-            action=str(value.get("action", "DEFER")),
-            candidates=list(value.get("candidates", [])),
-            risk=str(value.get("risk", "medium")),
-            decision=str(value.get("decision", "WAIT")),
-            decision_rationale=list(value.get("decision_rationale", [])),
-            evidence_packet=dict(value.get("evidence_packet", {})),
-        )
-
-
-@dataclass
 class Turn:
     turn_id: str
     raw_text: str
     current_text: str
-    hypotheses: list[Hypothesis] = field(default_factory=list)
     source: str = "text"
     meta: dict[str, Any] = field(default_factory=dict)
 
@@ -81,7 +28,6 @@ class Turn:
             turn_id=str(value["turn_id"]),
             raw_text=str(value["raw_text"]),
             current_text=str(value["current_text"]),
-            hypotheses=[Hypothesis.from_dict(item) for item in value.get("hypotheses", [])],
             source=str(value.get("source", "text")),
             meta=dict(value.get("meta") or {}),
         )
@@ -158,6 +104,8 @@ class MemoryBelief:
     source_turn_ids: list[str] = field(default_factory=list)
     source_session_ids: list[str] = field(default_factory=list)
     evidence_kinds: list[str] = field(default_factory=list)
+    created_version: int = 0
+    updated_version: int = 0
     supersedes: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -178,6 +126,8 @@ class MemoryBelief:
             source_turn_ids=list(value.get("source_turn_ids", [])),
             source_session_ids=list(value.get("source_session_ids", [])),
             evidence_kinds=list(value.get("evidence_kinds", [])),
+            created_version=int(value.get("created_version", 0)),
+            updated_version=int(value.get("updated_version", 0)),
             supersedes=value.get("supersedes"),
         )
 
@@ -233,10 +183,7 @@ class RevisionEvent:
 @dataclass
 class Session:
     session_id: str
-    entities: dict[str, EntityProfile] = field(default_factory=dict)
     turns: list[Turn] = field(default_factory=list)
-    verified_memory: dict[str, dict[str, str]] = field(default_factory=dict)
-    quarantine_memory: dict[str, dict[str, str]] = field(default_factory=dict)
     revision_events: list[RevisionEvent] = field(default_factory=list)
     version: int = 0
     memory_scope: str = "default"
@@ -255,12 +202,9 @@ class Session:
             version=int(raw.get("version", 0)),
             memory_scope=str(raw.get("memory_scope", "default")),
             analysis_status=str(raw.get("analysis_status", "idle")),
-            entities={key: EntityProfile.from_dict(value) for key, value in raw.get("entities", {}).items()},
             turns=[Turn.from_dict(value) for value in raw.get("turns", [])],
             working_beliefs={key: MemoryBelief.from_dict(value) for key, value in raw.get("working_beliefs", {}).items()},
             open_hypotheses={key: WorkingHypothesis.from_dict(value) for key, value in raw.get("open_hypotheses", {}).items()},
             dependency_index={key: list(value) for key, value in raw.get("dependency_index", {}).items()},
-            verified_memory=dict(raw.get("verified_memory", {})),
-            quarantine_memory=dict(raw.get("quarantine_memory", {})),
             revision_events=[RevisionEvent.from_dict(value) for value in raw.get("revision_events", [])],
         )

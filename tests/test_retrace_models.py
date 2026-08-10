@@ -4,17 +4,12 @@ import pytest
 
 from asr_agent.models import (
     EvidenceRef,
-    EntityProfile,
     MemoryBelief,
     RevisionEvent,
     Session,
     WorkingHypothesis,
 )
-from asr_agent.retrace import (
-    EntityProfile as LegacyEntityProfile,
-    ReTraceService,
-    Session as LegacySession,
-)
+from asr_agent.retrace import ReTraceService, Session as ExportedSession
 
 
 def _revision_event_dict(**overrides):
@@ -51,29 +46,19 @@ def test_legacy_session_loads_with_versioned_memory_defaults():
     assert Session.from_dict(serialized).as_dict() == session.as_dict()
 
 
-def test_session_preserves_legacy_positional_entities_argument():
-    entities = {"lead": EntityProfile("lead", "泰康")}
-
-    session = Session("s", entities)
-
-    assert session.entities == entities
-    assert session.version == 0
-
-
-def test_retrace_keeps_legacy_model_imports():
-    assert LegacyEntityProfile is EntityProfile
-    assert LegacySession is Session
+def test_retrace_exports_current_session_model():
+    assert ExportedSession is Session
 
 
 def test_service_saves_and_reloads_json_session(tmp_path):
     service = ReTraceService(tmp_path)
-    service.upsert_entities("s1", [LegacyEntityProfile("lead", "泰康")])
+    service.process_turn("s1", "t1", "泰康")
 
     saved_json = json.loads((tmp_path / "s1.json").read_text())
     reloaded = ReTraceService(tmp_path).get_session("s1")
 
     assert saved_json == reloaded
-    assert reloaded["entities"]["lead"]["name"] == "泰康"
+    assert reloaded["turns"][0]["raw_text"] == "泰康"
 
 
 def test_working_hypothesis_keeps_competing_interpretations():
@@ -103,6 +88,8 @@ def test_versioned_session_deserializes_nested_models():
                 "value": "泰康",
                 "aliases": ["泰信"],
                 "source_turn_ids": ["t1"],
+                "created_version": 2,
+                "updated_version": 3,
             },
         },
         "open_hypotheses": {
@@ -128,6 +115,8 @@ def test_versioned_session_deserializes_nested_models():
     })
 
     assert isinstance(session.working_beliefs["b1"], MemoryBelief)
+    assert session.working_beliefs["b1"].created_version == 2
+    assert session.working_beliefs["b1"].updated_version == 3
     assert isinstance(session.open_hypotheses["h1"], WorkingHypothesis)
     assert isinstance(session.open_hypotheses["h1"].supporting_evidence[0], EvidenceRef)
     assert isinstance(session.open_hypotheses["h1"].contradicting_evidence[0], EvidenceRef)

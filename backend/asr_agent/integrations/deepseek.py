@@ -14,9 +14,12 @@ from asr_agent.models import Session, Turn
 _CONTEXT_JUDGE_SYSTEM = (
     "你是实时 ASR Context Judge。先判断最新观察与短期、长期 Memory 的关系，只能输出 "
     "CONSISTENT、NOVEL、CONFLICT、UNCERTAIN。不要预先分词，不要扫描所有二元词，不要发明专有名词。"
+    "用 beliefs 输出有原文 Turn 证据的结构化新事实：subject、predicate、value、aliases、confidence、"
+    "valid_from、valid_to、evidence_turn_ids。"
     "仅在 CONFLICT 或 UNCERTAIN 且存在具体证据时给出 focus；每个 focus 必须包含 "
     "target_turn_id、目标当前文本中原样存在的最短 span、proposed_text、包含两者的 closed-set alternatives、"
-    "evidence_turn_ids 和 rationale。只输出 JSON 对象。"
+    "evidence_turn_ids、rationale 和 relationship。relationship 只能是 MUTUALLY_EXCLUSIVE、COEXIST、"
+    "TEMPORAL_CHANGE。只输出 JSON 对象。"
 )
 
 
@@ -71,6 +74,7 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
     payload = {
         "current_turn": current_turn.as_dict(),
         "recent_turns": [turn.as_dict() for turn in memory.recent_turns],
+        "dependent_turns": [turn.as_dict() for turn in memory.dependent_turns],
         "working_beliefs": [item.as_dict() for item in memory.working_beliefs],
         "open_hypotheses": [item.as_dict() for item in memory.open_hypotheses],
         "long_term_beliefs": [item.as_dict() for item in memory.long_term_beliefs],

@@ -3,18 +3,17 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Callable
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from asr_agent.context_judge import (
+    BeliefProposal,
     ContextJudgment,
     normalize_judgment,
 )
 from asr_agent.ledger import RevisionLedger
 from asr_agent.memory import LongTermMemoryRepository, MemoryConsolidator, MemoryRetriever
 from asr_agent.models import (
-    EntityProfile,
     EvidenceRef,
-    Hypothesis,
     MemoryBelief,
     RevisionEvent,
     Session,
@@ -39,36 +38,30 @@ class ReTraceService:
         audio_verifier: Callable[..., dict[str, Any]] | None = None,
         resolver: EvidenceResolver | None = None,
         memory_dir: Path | None = None,
-        **legacy_adapters: Any,
     ) -> None:
-        # Unknown legacy adapters are intentionally ignored: they cannot re-enable
-        # the removed heuristic nomination pipeline.
-        del legacy_adapters
         root = Path(storage_dir)
         self.repository = SessionRepository(root)
         self.ledger = RevisionLedger()
         self.long_term_memory = LongTermMemoryRepository(memory_dir or root / ".memory")
         self.memory_retriever = MemoryRetriever(self.long_term_memory)
-        self.memory_consolidator = MemoryConsolidator(self.long_term_memory)
         if context_judge is None:
             from asr_agent.integrations.deepseek import judge_context
 
             context_judge = judge_context
         self.context_judge = context_judge
         self.resolver = resolver or EvidenceResolver(audio_verifier=audio_verifier)
+        self.memory_consolidator = MemoryConsolidator(
+            self.long_term_memory,
+            confidence_threshold=self.resolver.policy.thresholds.long_memory,
+        )
 
     def get_session(self, session_id: str) -> dict[str, Any]:
-        return self.repository.load(session_id).as_dict()
+        session = self.repository.load(session_id)
+        self.ledger.replay(session)
+        return session.as_dict()
 
     def reset_session(self, session_id: str, *, memory_scope: str = "default") -> dict[str, Any]:
         return self.repository.create(Session(session_id, memory_scope=memory_scope)).as_dict()
-
-    def upsert_entities(self, session_id: str, profiles: list[EntityProfile]) -> dict[str, Any]:
-        def mutate(session: Session) -> None:
-            for profile in profiles:
-                session.entities[profile.entity_id] = profile
-
-        return self.repository.update(session_id, mutate).as_dict()
 
     def observe_turn(
         self,
@@ -78,12 +71,10 @@ class ReTraceService:
         *,
         confidence: dict[str, float] | None = None,
         text_candidates: dict[str, list[str]] | None = None,
-        entity_candidate_ids: dict[str, list[str]] | None = None,
         nbest: list[str] | None = None,
         source: str = "text",
         meta: dict[str, Any] | None = None,
         memory_scope: str | None = None,
-        **_: Any,
     ) -> dict[str, Any]:
         raw_text = str(text)
         if not raw_text.strip():
@@ -98,7 +89,6 @@ class ReTraceService:
             turn_meta["asr_signals"] = {
                 "confidence": dict(confidence or {}),
                 "text_candidates": dict(text_candidates or {}),
-                "entity_candidate_ids": dict(entity_candidate_ids or {}),
                 "nbest": list(nbest or []),
             }
             session.turns.append(Turn(turn_id, raw_text, raw_text, source=source, meta=turn_meta))
@@ -107,12 +97,31 @@ class ReTraceService:
         session = self.repository.update(session_id, mutate)
         return {"status": "queued", "observed_version": session.version, "session": session.as_dict()}
 
-    def analyze_turn(self, session_id: str, turn_id: str, *, max_retries: int = 3) -> dict[str, Any]:
+    def analyze_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        observed_version: int | None = None,
+        max_retries: int = 3,
+    ) -> dict[str, Any]:
         for attempt in range(max_retries):
             snapshot = self.repository.load(session_id)
+            self.ledger.replay(snapshot)
             trigger = next((turn for turn in snapshot.turns if turn.turn_id == turn_id), None)
             if trigger is None:
                 raise ValueError(f"unknown turn_id: {turn_id}")
+            if observed_version is not None and observed_version > snapshot.version:
+                raise VersionConflict(f"observed version {observed_version} is newer than session {snapshot.version}")
+            if observed_version is not None and trigger.meta.get("analyzed_observed_version") == observed_version:
+                return {
+                    "status": snapshot.analysis_status,
+                    "decisions": [],
+                    "revisions": [],
+                    "judgment": dict(trigger.meta.get("context_judgment") or {}),
+                    "revalidated": snapshot.version != observed_version,
+                    "session": snapshot.as_dict(),
+                }
             snapshot.analysis_status = "analyzing"
             memory = self.memory_retriever.retrieve(snapshot, trigger)
             try:
@@ -121,9 +130,23 @@ class ReTraceService:
             except Exception as exc:
                 judgment = ContextJudgment("UNCERTAIN", rationale=f"context judge unavailable: {exc}")
 
+            self._apply_beliefs(snapshot, judgment.beliefs)
             events: list[RevisionEvent] = []
+            audit_events: list[RevisionEvent] = []
             deferred = judgment.outcome == "UNCERTAIN" and not judgment.focus
-            for focus in judgment.focus:
+            if not judgment.focus:
+                action = {"NOVEL": "ACCEPT_NEW", "CONSISTENT": "KEEP_OLD"}.get(judgment.outcome, "DEFER")
+                audit_events.append(
+                    self._decision_event(
+                        snapshot,
+                        trigger,
+                        action=action,
+                        score=judgment.confidence,
+                        rationale=judgment.rationale,
+                        observed_version=observed_version,
+                    )
+                )
+            for focus_index, focus in enumerate(judgment.focus):
                 hypothesis_id = f"hyp-{uuid4().hex}"
                 hypothesis = WorkingHypothesis(
                     hypothesis_id=hypothesis_id,
@@ -169,7 +192,7 @@ class ReTraceService:
                     else:
                         after_text = target.current_text.replace(resolution.span, resolution.replacement, 1)
                         events.append(RevisionEvent(
-                            event_id=f"revision-{uuid4().hex}",
+                            event_id=self._event_id(session_id, turn_id, observed_version, resolution.action, focus_index),
                             action=resolution.action,
                             target_turn_id=target.turn_id,
                             source_turn_id=trigger.turn_id,
@@ -186,16 +209,64 @@ class ReTraceService:
                     self._record_verified_belief(snapshot, focus, trigger)
                 elif resolution.action == "KEEP_OLD":
                     hypothesis.status = "rejected"
+                    events.append(
+                        self._decision_event(
+                            snapshot,
+                            trigger,
+                            action="KEEP_OLD",
+                            score=resolution.score,
+                            rationale=resolution.rationale,
+                            target_turn_id=resolution.target_turn_id,
+                            span=resolution.span,
+                            observed_version=observed_version,
+                            discriminator=str(focus_index),
+                        )
+                    )
+                elif resolution.action in {"COEXIST", "ACCEPT_NEW"}:
+                    hypothesis.status = "resolved"
+                    events.append(
+                        self._decision_event(
+                            snapshot,
+                            trigger,
+                            action=resolution.action,
+                            score=resolution.score,
+                            rationale=resolution.rationale,
+                            target_turn_id=resolution.target_turn_id,
+                            span=resolution.span,
+                            evidence=resolution.evidence,
+                            observed_version=observed_version,
+                            discriminator=str(focus_index),
+                        )
+                    )
                 else:
                     deferred = True
+                    events.append(
+                        self._decision_event(
+                            snapshot,
+                            trigger,
+                            action="DEFER",
+                            score=resolution.score,
+                            rationale=resolution.rationale,
+                            target_turn_id=resolution.target_turn_id,
+                            span=resolution.span,
+                            observed_version=observed_version,
+                            discriminator=str(focus_index),
+                        )
+                    )
                 snapshot.open_hypotheses[hypothesis_id] = hypothesis
                 snapshot.dependency_index.setdefault(focus.target_turn_id, [])
                 for evidence_turn_id in focus.evidence_turn_ids:
                     if evidence_turn_id not in snapshot.dependency_index[focus.target_turn_id]:
                         snapshot.dependency_index[focus.target_turn_id].append(evidence_turn_id)
 
-            self.ledger.append_many(snapshot, events, event_version=snapshot.version + 1)
+            self.ledger.append_many(snapshot, [*audit_events, *events], event_version=snapshot.version + 1)
             snapshot.analysis_status = "deferred" if deferred else "idle"
+            trigger.meta["analyzed_observed_version"] = observed_version
+            trigger.meta["context_judgment"] = {
+                "outcome": judgment.outcome,
+                "confidence": judgment.confidence,
+                "rationale": judgment.rationale,
+            }
             try:
                 committed = self.repository.commit(snapshot, expected_version=snapshot.version)
             except VersionConflict:
@@ -205,19 +276,123 @@ class ReTraceService:
             self.memory_consolidator.consolidate(committed.memory_scope, list(committed.working_beliefs.values()))
             return {
                 "status": committed.analysis_status,
-                "revisions": [event.as_dict() for event in events],
+                "decisions": [event.as_dict() for event in [*audit_events, *events]],
+                "revisions": [
+                    event.as_dict()
+                    for event in events
+                    if event.action in {"REVISE_CURRENT", "REVISE_HISTORY", "ROLLBACK"}
+                ],
                 "judgment": {
                     "outcome": judgment.outcome,
                     "confidence": judgment.confidence,
                     "rationale": judgment.rationale,
                 },
+                "revalidated": observed_version is not None and committed.version - 1 != observed_version,
                 "session": committed.as_dict(),
             }
         raise VersionConflict("analysis could not commit after retries")
 
-    def process_turn(self, session_id: str, turn_id: str, text: str, **kwargs: Any) -> dict[str, Any]:
-        self.observe_turn(session_id, turn_id, text, **kwargs)
-        return self.analyze_turn(session_id, turn_id)
+    def process_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        text: str,
+        *,
+        confidence: dict[str, float] | None = None,
+        text_candidates: dict[str, list[str]] | None = None,
+        nbest: list[str] | None = None,
+        source: str = "text",
+        meta: dict[str, Any] | None = None,
+        memory_scope: str | None = None,
+    ) -> dict[str, Any]:
+        observed = self.observe_turn(
+            session_id,
+            turn_id,
+            text,
+            confidence=confidence,
+            text_candidates=text_candidates,
+            nbest=nbest,
+            source=source,
+            meta=meta,
+            memory_scope=memory_scope,
+        )
+        return self.analyze_turn(session_id, turn_id, observed_version=observed["observed_version"])
+
+    def _apply_beliefs(self, session: Session, proposals: list[BeliefProposal]) -> None:
+        by_key = {
+            (item.subject, item.predicate, item.value): item
+            for item in session.working_beliefs.values()
+            if item.status != "superseded"
+        }
+        for proposal in proposals:
+            key = (proposal.subject, proposal.predicate, proposal.value)
+            belief = by_key.get(key)
+            if belief is None:
+                belief = MemoryBelief(
+                    belief_id=f"belief-{uuid4().hex}",
+                    subject=proposal.subject,
+                    predicate=proposal.predicate,
+                    value=proposal.value,
+                    aliases=list(proposal.aliases),
+                    confidence=proposal.confidence,
+                    valid_from=proposal.valid_from,
+                    valid_to=proposal.valid_to,
+                    source_turn_ids=list(proposal.evidence_turn_ids),
+                    source_session_ids=[session.session_id],
+                    evidence_kinds=["context"],
+                    created_version=session.version + 1,
+                    updated_version=session.version + 1,
+                )
+                session.working_beliefs[belief.belief_id] = belief
+                by_key[key] = belief
+            else:
+                belief.confidence = max(belief.confidence, proposal.confidence)
+                belief.aliases = list(dict.fromkeys([*belief.aliases, *proposal.aliases]))
+                belief.source_turn_ids = list(dict.fromkeys([*belief.source_turn_ids, *proposal.evidence_turn_ids]))
+                belief.updated_version = session.version + 1
+            session.dependency_index[belief.belief_id] = list(belief.source_turn_ids)
+
+    @staticmethod
+    def _event_id(
+        session_id: str,
+        turn_id: str,
+        observed_version: int | None,
+        action: str,
+        discriminator: str | int = "",
+    ) -> str:
+        key = f"{session_id}:{turn_id}:{observed_version}:{action}:{discriminator}"
+        return f"decision-{uuid5(NAMESPACE_URL, key).hex}"
+
+    def _decision_event(
+        self,
+        session: Session,
+        source_turn: Turn,
+        *,
+        action: str,
+        score: float,
+        rationale: str,
+        target_turn_id: str | None = None,
+        span: str = "",
+        evidence: list[str] | None = None,
+        observed_version: int | None = None,
+        discriminator: str = "",
+    ) -> RevisionEvent:
+        target_id = target_turn_id or source_turn.turn_id
+        target = next(turn for turn in session.turns if turn.turn_id == target_id)
+        return RevisionEvent(
+            event_id=self._event_id(session.session_id, source_turn.turn_id, observed_version, action, discriminator),
+            action=action,
+            target_turn_id=target_id,
+            source_turn_id=source_turn.turn_id,
+            span=span,
+            before_text=target.current_text,
+            after_text=target.current_text,
+            entity_id=None,
+            score=score,
+            evidence=list(evidence or []),
+            resolver="context-judge",
+            rationale=rationale,
+        )
 
     @staticmethod
     def _memory_support(beliefs: list[MemoryBelief], proposed_text: str) -> float:
@@ -238,13 +413,13 @@ class ReTraceService:
             source_turn_ids=list(dict.fromkeys([focus.target_turn_id, source_turn.turn_id])),
             source_session_ids=[session.session_id],
             evidence_kinds=["context", "audio_verified"],
+            created_version=session.version + 1,
+            updated_version=session.version + 1,
         )
 
 
 __all__ = [
-    "EntityProfile",
     "EvidenceRef",
-    "Hypothesis",
     "MemoryBelief",
     "ReTraceService",
     "RevisionEvent",

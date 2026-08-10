@@ -26,6 +26,52 @@ class PolicyThresholds:
 BOOTSTRAP_THRESHOLDS = PolicyThresholds()
 
 
+@dataclass(frozen=True)
+class CalibrationPoint:
+    probability: float
+    should_revise: bool
+
+
+@dataclass(frozen=True)
+class SelectedThreshold:
+    threshold: float
+    precision: float
+    recall: float
+    f_beta: float
+    overcorrection: float
+    source: str = "development"
+
+
+def select_revision_threshold(
+    points: list[CalibrationPoint],
+    *,
+    beta: float = 2.0,
+    max_overcorrection: float = 0.10,
+) -> SelectedThreshold:
+    """Select a recall-weighted threshold on development data only."""
+    if not points:
+        raise ValueError("development calibration points are required")
+    if beta <= 0 or not 0 <= max_overcorrection <= 1:
+        raise ValueError("invalid threshold selection parameters")
+    positives = sum(point.should_revise for point in points)
+    candidates = sorted({min(1.0, max(0.0, point.probability)) for point in points}, reverse=True)
+    feasible: list[SelectedThreshold] = []
+    for threshold in candidates:
+        predicted = [point for point in points if point.probability >= threshold]
+        true_positive = sum(point.should_revise for point in predicted)
+        false_positive = len(predicted) - true_positive
+        precision = true_positive / len(predicted) if predicted else 0.0
+        recall = true_positive / positives if positives else 0.0
+        overcorrection = false_positive / len(predicted) if predicted else 0.0
+        denominator = beta * beta * precision + recall
+        score = (1 + beta * beta) * precision * recall / denominator if denominator else 0.0
+        if overcorrection <= max_overcorrection:
+            feasible.append(SelectedThreshold(threshold, precision, recall, score, overcorrection))
+    if not feasible:
+        raise ValueError("no threshold satisfies the overcorrection constraint")
+    return max(feasible, key=lambda item: (item.f_beta, item.recall, item.threshold))
+
+
 @dataclass
 class LinearLogitCalibrator:
     intercept: float = -2.0

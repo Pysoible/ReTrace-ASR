@@ -39,7 +39,6 @@ def test_audio_upload_endpoint_rejects_empty_file(tmp_path):
     client = TestClient(create_app(tmp_path))
     response = client.post(
         "/api/sessions/s/audio/upload",
-        data={"turn_id": "t1", "two_pass": "true", "use_llm": "false", "correct_with_llm": "false"},
         files={"file": ("empty.wav", b"", "audio/wav")},
     )
     assert response.status_code == 400

@@ -1,7 +1,7 @@
 import pytest
 
-from asr_agent.calibration import DecisionPolicy, EvidenceFeatures
-from asr_agent.context_judge import ContextJudgment, FocusProposal, normalize_judgment
+from asr_agent.calibration import CalibrationPoint, DecisionPolicy, EvidenceFeatures, select_revision_threshold
+from asr_agent.context_judge import BeliefProposal, ContextJudgment, FocusProposal, normalize_judgment
 from asr_agent.models import Session, Turn
 from asr_agent.resolver import EvidenceResolver
 
@@ -43,3 +43,65 @@ def test_resolver_accepts_only_the_proposed_closed_set_winner():
     assert result.action == "REVISE_HISTORY"
     assert result.replacement == "涂博士"
     assert result.audio_verified is True
+
+
+def test_context_judgment_carries_grounded_working_beliefs():
+    session = Session("s", turns=[Turn("t1", "负责人是涂博士", "负责人是涂博士")])
+    judgment = ContextJudgment(
+        "NOVEL",
+        0.9,
+        beliefs=[BeliefProposal("实验室", "负责人", "涂博士", confidence=0.88, evidence_turn_ids=["t1"])],
+    )
+
+    normalized = normalize_judgment(judgment, session)
+
+    assert normalized.beliefs[0].value == "涂博士"
+
+
+def test_context_judgment_rejects_ungrounded_belief_evidence():
+    session = Session("s", turns=[Turn("t1", "测试", "测试")])
+    judgment = ContextJudgment(
+        "NOVEL",
+        beliefs=[BeliefProposal("甲", "状态", "完成", evidence_turn_ids=["missing"])],
+    )
+
+    with pytest.raises(ValueError, match="belief references"):
+        normalize_judgment(judgment, session)
+
+
+def test_resolver_preserves_coexisting_interpretations_without_audio():
+    target = Turn("t1", "小王负责甲组", "小王负责甲组")
+    source = Turn("t2", "另一个小王负责乙组", "另一个小王负责乙组")
+    session = Session("s", turns=[target, source])
+    focus = FocusProposal(
+        "t1",
+        "小王",
+        "另一个小王",
+        ["小王", "另一个小王"],
+        ["t2"],
+        relationship="COEXIST",
+    )
+
+    result = EvidenceResolver(audio_verifier=lambda **_: (_ for _ in ()).throw(AssertionError())).resolve(
+        session, source, focus, context_confidence=0.9
+    )
+
+    assert result.action == "COEXIST"
+
+
+def test_development_threshold_selection_prefers_recall_under_error_cap():
+    selected = select_revision_threshold(
+        [
+            CalibrationPoint(0.95, True),
+            CalibrationPoint(0.80, True),
+            CalibrationPoint(0.70, True),
+            CalibrationPoint(0.65, False),
+            CalibrationPoint(0.20, False),
+        ],
+        beta=2.0,
+        max_overcorrection=0.30,
+    )
+
+    assert selected.threshold == 0.70
+    assert selected.recall == 1.0
+    assert selected.source == "development"

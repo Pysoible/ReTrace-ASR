@@ -43,3 +43,21 @@ def test_different_sessions_can_analyze_concurrently():
         coordinator.drain()
     finally:
         coordinator.close()
+
+
+def test_coordinator_passes_observed_version_for_revalidation():
+    received: list[int] = []
+
+    class Service:
+        def analyze_turn(self, session_id: str, turn_id: str, *, observed_version: int):
+            del session_id, turn_id
+            received.append(observed_version)
+
+    coordinator = RealtimeAnalysisCoordinator(Service(), max_workers=1)
+    try:
+        coordinator.submit("s", "t1", observed_version=7)
+        coordinator.drain()
+    finally:
+        coordinator.close()
+
+    assert received == [7]

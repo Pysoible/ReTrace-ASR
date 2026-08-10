@@ -6,20 +6,16 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from asr_agent.integrations.deepseek import deepseek_status
 from asr_agent.integrations.qwen_asr import asr_status, preload_engine, transcribe_audio
 from asr_agent.realtime import RealtimeAnalysisCoordinator
-from asr_agent.retrace import EntityProfile, ReTraceService
+from asr_agent.retrace import ReTraceService
 
 _AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac", ".pcm"}
-
-
-class EntityRequest(BaseModel):
-    entities: list[dict[str, Any]]
 
 
 class TurnRequest(BaseModel):
@@ -27,10 +23,7 @@ class TurnRequest(BaseModel):
     text: str
     confidence: dict[str, float] = Field(default_factory=dict)
     text_candidates: dict[str, list[str]] = Field(default_factory=dict)
-    entity_candidate_ids: dict[str, list[str]] = Field(default_factory=dict)
-    use_llm: bool = False
     nbest: list[str] = Field(default_factory=list)
-    risk: str = "medium"
     speaker: str | None = None
     audio_path: str | None = None
     start_sec: float | None = None
@@ -38,9 +31,7 @@ class TurnRequest(BaseModel):
 
 
 class AudioTurnRequest(BaseModel):
-    turn_id: str
     audio: str
-    use_llm: bool = True
 
 
 def _turn_meta(request: TurnRequest) -> dict[str, Any] | None:
@@ -114,10 +105,6 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    @app.put("/api/sessions/{session_id}/entities")
-    def upsert_entities(session_id: str, request: EntityRequest) -> dict[str, Any]:
-        return {"session": service.upsert_entities(session_id, [EntityProfile.from_dict(item) for item in request.entities])}
-
     @app.post("/api/sessions/{session_id}/turns", status_code=202)
     def process_turn(session_id: str, request: TurnRequest) -> dict[str, Any]:
         try:
@@ -127,14 +114,11 @@ def create_app(
                 request.text,
                 confidence=request.confidence,
                 text_candidates=request.text_candidates,
-                entity_candidate_ids=request.entity_candidate_ids,
-                use_llm=request.use_llm,
                 source="text",
-                risk=request.risk,
                 nbest=request.nbest,
                 meta=_turn_meta(request),
             )
-            coordinator.submit(session_id, request.turn_id)
+            coordinator.submit(session_id, request.turn_id, observed_version=observed["observed_version"])
             return observed
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -144,7 +128,6 @@ def create_app(
         *,
         audio_path: str,
         asr: dict[str, Any],
-        use_llm: bool,
         source: str = "qwen-omni",
         mode: str = "audio-session",
     ) -> dict[str, Any]:
@@ -184,8 +167,6 @@ def create_app(
                     display,
                     confidence=dict(uncertainty.get("confidence") or {}),
                     text_candidates=dict(uncertainty.get("text_candidates") or {}),
-                    entity_candidate_ids=dict(uncertainty.get("entity_candidate_ids") or {}),
-                    use_llm=use_llm and index > 0,
                     source=source,
                     nbest=list(nbest) if isinstance(nbest, list) else [],
                     meta={
@@ -214,14 +195,12 @@ def create_app(
         session_id: str,
         *,
         audio_path: str,
-        use_llm: bool,
     ) -> dict[str, Any]:
         asr = transcribe_audio(audio_path)
         return _build_session_from_asr(
             session_id,
             audio_path=audio_path,
             asr=asr,
-            use_llm=use_llm,
         )
 
     @app.post("/api/sessions/{session_id}/audio")
@@ -229,17 +208,13 @@ def create_app(
         return _run_audio_session(
             session_id,
             audio_path=request.audio,
-            use_llm=request.use_llm,
         )
 
     @app.post("/api/sessions/{session_id}/audio/upload")
     async def process_audio_upload(
         session_id: str,
         file: UploadFile = File(...),
-        turn_id: str = Form(""),  # unused: chunks become turns automatically
-        use_llm: bool = Form(True),
     ) -> dict[str, Any]:
-        del turn_id  # kept for form compatibility with older frontend
         filename = _safe_filename(file.filename or "audio.wav")
         dest = upload_dir / f"{uuid.uuid4().hex}_{filename}"
         content = await file.read()
@@ -249,7 +224,6 @@ def create_app(
         return _run_audio_session(
             session_id,
             audio_path=str(dest),
-            use_llm=use_llm,
         )
 
     @app.get("/api/sessions/{session_id}")

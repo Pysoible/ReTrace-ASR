@@ -43,6 +43,24 @@ class EvidenceResolver:
         target = next((turn for turn in session.turns if turn.turn_id == focus.target_turn_id), None)
         if target is None or (focus.span not in target.raw_text and focus.span not in target.current_text):
             return Resolution("DEFER", focus.target_turn_id, focus.span, rationale="invalid target span")
+        if focus.relationship == "COEXIST":
+            return Resolution(
+                "COEXIST",
+                target.turn_id,
+                focus.span,
+                score=context_confidence,
+                evidence=[f"context:{turn_id}" for turn_id in focus.evidence_turn_ids],
+                rationale=focus.rationale or "the interpretations can refer to different entities",
+            )
+        if focus.relationship == "TEMPORAL_CHANGE":
+            return Resolution(
+                "ACCEPT_NEW",
+                target.turn_id,
+                focus.span,
+                score=context_confidence,
+                evidence=[f"context:{turn_id}" for turn_id in focus.evidence_turn_ids],
+                rationale=focus.rationale or "the fact changed over time",
+            )
         meta = target.meta or {}
         audio_path = meta.get("audio_path")
         start_sec, end_sec = meta.get("start_sec"), meta.get("end_sec")

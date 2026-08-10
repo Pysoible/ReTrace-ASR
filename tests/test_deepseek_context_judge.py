@@ -12,12 +12,20 @@ def test_deepseek_context_judge_returns_validated_focus(monkeypatch):
             "outcome": "CONFLICT",
             "confidence": 0.93,
             "rationale": "后文自称更明确",
+            "beliefs": [{
+                "subject": "实验室",
+                "predicate": "负责人",
+                "value": "涂博士",
+                "confidence": 0.9,
+                "evidence_turn_ids": ["t2"],
+            }],
             "focus": [{
                 "target_turn_id": "t1",
                 "span": "图博士",
                 "proposed_text": "涂博士",
                 "alternatives": ["图博士", "涂博士"],
                 "evidence_turn_ids": ["t2"],
+                "relationship": "MUTUALLY_EXCLUSIVE",
             }],
         },
     )
@@ -27,6 +35,7 @@ def test_deepseek_context_judge_returns_validated_focus(monkeypatch):
 
     assert result.outcome == "CONFLICT"
     assert result.focus[0].proposed_text == "涂博士"
+    assert result.beliefs[0].subject == "实验室"
 
 
 def test_deepseek_context_judge_safely_defers_malformed_output(monkeypatch):

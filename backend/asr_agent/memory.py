@@ -19,6 +19,7 @@ _MEMORY_LOCKS_GUARD = Lock()
 @dataclass
 class MemoryPacket:
     recent_turns: list[Turn] = field(default_factory=list)
+    dependent_turns: list[Turn] = field(default_factory=list)
     working_beliefs: list[MemoryBelief] = field(default_factory=list)
     open_hypotheses: list[WorkingHypothesis] = field(default_factory=list)
     long_term_beliefs: list[MemoryBelief] = field(default_factory=list)
@@ -83,17 +84,50 @@ class MemoryRetriever:
         self.long_term_limit = long_term_limit
 
     def retrieve(self, session: Session, current_turn: Turn) -> MemoryPacket:
-        del current_turn
+        related_ids = set(session.dependency_index.get(current_turn.turn_id, []))
+        related_ids.update(
+            target_id
+            for target_id, evidence_ids in session.dependency_index.items()
+            if current_turn.turn_id in evidence_ids
+        )
+        recent_ids = {turn.turn_id for turn in session.turns[-self.recent_limit :]}
+        dependent = [turn for turn in session.turns if turn.turn_id in related_ids and turn.turn_id not in recent_ids]
         try:
-            durable = [item for item in self.repository.load(session.memory_scope) if item.status == "stable"]
+            stable = [item for item in self.repository.load(session.memory_scope) if item.status == "stable"]
+            durable = self._relevant_long_term(stable, session, current_turn)
         except (OSError, ValueError, json.JSONDecodeError):
             durable = []
         return MemoryPacket(
             recent_turns=session.turns[-self.recent_limit :],
+            dependent_turns=dependent,
             working_beliefs=list(session.working_beliefs.values()),
             open_hypotheses=[item for item in session.open_hypotheses.values() if item.status == "active"],
             long_term_beliefs=durable[: self.long_term_limit],
         )
+
+    @staticmethod
+    def _relevant_long_term(
+        beliefs: list[MemoryBelief],
+        session: Session,
+        current_turn: Turn,
+    ) -> list[MemoryBelief]:
+        text = current_turn.raw_text
+        working_keys = {(item.subject, item.predicate) for item in session.working_beliefs.values()}
+        hypothesis_terms = {
+            term
+            for item in session.open_hypotheses.values()
+            if item.status == "active"
+            for term in [item.current_interpretation, item.proposed_interpretation, *item.alternatives]
+        }
+
+        def score(item: MemoryBelief) -> tuple[float, float]:
+            terms = [item.value, *item.aliases]
+            lexical = 1.0 if any(term and (term in text or term in hypothesis_terms) for term in terms) else 0.0
+            structural = 0.65 if (item.subject, item.predicate) in working_keys else 0.0
+            return max(lexical, structural), item.confidence
+
+        scored = [(score(item), item) for item in beliefs]
+        return [item for relevance, item in sorted(scored, key=lambda pair: pair[0], reverse=True) if relevance[0] > 0]
 
 
 class MemoryConsolidator:
@@ -124,6 +158,7 @@ class MemoryConsolidator:
                     merged.source_session_ids = list(dict.fromkeys([*merged.source_session_ids, *candidate.source_session_ids]))
                     merged.evidence_kinds = list(dict.fromkeys([*merged.evidence_kinds, *candidate.evidence_kinds]))
                     merged.confidence = max(merged.confidence, candidate.confidence)
+                    merged.updated_version = max(merged.updated_version, candidate.updated_version)
                 independently_supported = len(set(merged.source_session_ids)) >= 2
                 audio_verified = "audio_verified" in merged.evidence_kinds
                 if merged.confidence < self.confidence_threshold or not (independently_supported or audio_verified):

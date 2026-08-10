@@ -2,13 +2,15 @@
 
 ReTrace-ASR 是一个 Agent-first 的实时 ASR 回溯修订原型。它保存不可修改的首遍 ASR，结合短期与长期 Memory 判断新信息与旧解释的关系，并在上下文和历史音频共同支持时自动修订或回滚字幕。
 
+协议实现范围、未完成的实验部分和研究贡献边界见 `docs/protocol-compliance-and-research-positioning.md`。
+
 ## 核心流程
 
 1. `OBSERVE`：立即持久化 `raw_text`，文本接口返回 `202 queued`。
 2. `MEMORY RETRIEVE`：读取近期 Turn、未决假设、依赖 Turn 和长期稳定事实。
-3. `CONTEXT JUDGE`：Agent 输出 `CONSISTENT | NOVEL | CONFLICT | UNCERTAIN`；只有冲突或不确定时才能提出闭集候选。
+3. `CONTEXT JUDGE`：Agent 输出 `CONSISTENT | NOVEL | CONFLICT | UNCERTAIN` 和带 Turn 证据的结构化信念；冲突进一步区分互斥、共存与现实事实变化。
 4. `TARGETED RELISTEN`：仅验证 Agent 指定的历史音频窗口和候选，不做全局 N-gram 扫描。
-5. `EVENT REPLAY`：以不可修改的 raw Turn 和只追加事件重建当前字幕。新版证据可以触发 `ROLLBACK`，无需用户确认。
+5. `EVENT REPLAY`：以不可修改的 raw Turn 和只追加事件重建当前字幕。`ACCEPT_NEW | KEEP_OLD | REVISE_CURRENT | REVISE_HISTORY | COEXIST | DEFER | ROLLBACK` 均可审计，无需用户确认。
 
 Memory 分为两层：会话内短期 Memory 保存近期上下文、工作事实和未决假设；长期 Memory 只接收达到置信门槛且拥有独立来源或音频验证的事实。长期存储故障时，服务自动降级到短期 Memory。
 

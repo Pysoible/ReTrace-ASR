@@ -41,7 +41,6 @@ type Session = {
   turns: Turn[];
   revision_events: RevisionEvent[];
   open_hypotheses: Record<string, WorkingHypothesis>;
-  quarantine_memory: Record<string, unknown>;
 };
 type Impact = {
   revised_turns: number;
@@ -69,7 +68,8 @@ function stripTime(text: string): string {
 function activeEvents(): RevisionEvent[] {
   const events = session?.revision_events ?? [];
   const superseded = new Set(events.filter((event) => event.active).map((event) => event.supersedes_event_id).filter(Boolean));
-  return events.filter((event) => event.active && !superseded.has(event.event_id));
+  const transcriptActions = new Set(['REVISE_CURRENT', 'REVISE_HISTORY', 'REVISE_TEXT', 'REVISE_ENTITY', 'ROLLBACK']);
+  return events.filter((event) => event.active && !superseded.has(event.event_id) && transcriptActions.has(event.action));
 }
 
 function activeEvent(turnId: string): RevisionEvent | undefined {
@@ -308,7 +308,7 @@ async function submitText(): Promise<void> {
   const result = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/turns`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ turn_id: `t${Date.now()}`, text, use_llm: true }),
+    body: JSON.stringify({ turn_id: `t${Date.now()}`, text }),
   });
   if (!result.ok) {
     status = `Request failed: ${await result.text()}`;
