@@ -1,166 +1,166 @@
-# Agent-First Real-Time Memory Revision Design
+# Agent 优先的实时 Memory 回溯修订设计
 
-## Objective
+## 目标
 
-ReTrace-ASR will become a fully autonomous, real-time retrospective ASR agent. Each new ASR turn is interpreted against short-term conversational memory and long-term cross-session memory. The agent decides whether the turn is consistent, novel, conflicting, or uncertain before invoking tokenization, entity extraction, candidate generation, or audio re-listening.
+ReTrace-ASR 将成为一个全自动、实时运行的回溯式 ASR Agent。每当新的 ASR Turn 到达，Agent 都会结合短期会话 Memory 和跨会话长期 Memory 进行解释。Agent 先判断当前 Turn 是与上下文一致、引入合理新信息、与已有信息冲突，还是证据不足；只有需要时，才调用分词、实体提取、候选生成或音频复听工具。
 
-The core research contribution is temporal belief revision: later evidence may make a new interpretation more plausible than the current one and trigger a reversible correction to one or more earlier turns. The system prioritizes correction recall and accepts a small amount of over-correction, while preserving every raw ASR observation and supporting automatic rollback.
+本项目的核心研究创新是时间化信念修订：后续证据可能使新的解释比当前解释更合理，并触发对一个或多个历史 Turn 的可逆修订。系统优先提高错误发现与修订召回率，允许少量过度修订，同时保留所有原始 ASR 观察，并支持自动回滚。
 
-## Design Principles
+## 设计原则
 
-1. Raw ASR observations are immutable.
-2. Memory is versioned evidence, not a static term dictionary.
-3. New information does not automatically beat old information, and old memory does not automatically override new information.
-4. The agent nominates conflicts and interpretations; calibrated evidence gates execute revisions.
-5. Segmentation, named-entity recognition, and surface-form comparison run only when requested for a suspicious turn.
-6. Every accepted revision is an append-only event that can be superseded or rolled back.
-7. The real-time ASR path remains available when the agent, long-term memory, or an integration fails.
-8. The system is fully automatic and never requires user confirmation.
+1. 原始 ASR 观察不可修改。
+2. Memory 是带版本和证据的信念状态，不是静态术语词典。
+3. 新信息不会自动胜过旧信息，旧 Memory 也不会自动覆盖新信息。
+4. Agent 负责提出冲突和竞争解释；经过标定的证据门控负责执行修订。
+5. 分词、命名实体识别和表层文本比较只在 Agent 判断当前 Turn 可疑后按需运行。
+6. 每次接受的修订都是只追加事件，可以被后续事件替代或回滚。
+7. 当 Agent、长期 Memory 或外部集成不可用时，实时 ASR 主链路仍然可用。
+8. 系统完全自动运行，不要求用户确认。
 
-## Architecture
+## 总体架构
 
-The system is divided into six components with explicit interfaces.
+系统分为六个职责清晰、接口明确的组件。
 
-### ASR Observer
+### ASR Observer（ASR 观察器）
 
-The observer emits an immutable turn containing raw text, timestamps, speaker information when available, acoustic confidence, N-best candidates, and an addressable audio window. It immediately publishes the raw text to the real-time transcript.
+观察器生成不可修改的 Turn，其中包含原始文本、时间戳、可用时的说话人信息、声学置信度、N-best 候选以及可寻址的音频窗口。原始文本生成后立即发布到实时字幕。
 
-### Memory Retriever
+### Memory Retriever（Memory 检索器）
 
-The retriever selects the recent conversational window, unresolved hypotheses, dependency-linked historical turns, and semantically relevant long-term beliefs. It must not place the complete conversation or complete long-term store into the agent context.
+检索器选择最近的会话窗口、尚未解决的假设、通过依赖关系关联的历史 Turn，以及语义相关的长期信念。它不能把完整会话或完整长期 Memory 全部放入 Agent 上下文。
 
-### Context Judge Agent
+### Context Judge Agent（上下文判断 Agent）
 
-The judge receives the current observation and retrieved memory. Before any full-sentence token scan, it assigns one of four outcomes:
+判断 Agent 接收当前观察和检索出的 Memory。在进行任何全句词元扫描之前，它必须给出以下四种结果之一：
 
-- `CONSISTENT`: the observation is coherent with available evidence.
-- `NOVEL`: the observation introduces plausible new information.
-- `CONFLICT`: the new and current interpretations cannot all be true as represented.
-- `UNCERTAIN`: the available evidence cannot distinguish the interpretations.
+- `CONSISTENT`：当前观察与已有证据一致。
+- `NOVEL`：当前观察引入了合理的新信息。
+- `CONFLICT`：按照当前表示，新旧解释不能同时成立。
+- `UNCERTAIN`：现有证据不足以区分竞争解释。
 
-Only `CONFLICT` and `UNCERTAIN` cause the agent to identify suspicious spans and request targeted tools.
+只有 `CONFLICT` 和 `UNCERTAIN` 会触发 Agent 定位可疑片段并请求针对性工具。
 
-### Evidence Resolver
+### Evidence Resolver（证据解析器）
 
-The resolver constructs and compares explicit alternatives, including:
+证据解析器显式构建并比较以下竞争解释：
 
-- the old interpretation is correct and the current ASR is wrong;
-- the new interpretation is correct and a historical ASR turn is wrong;
-- both expressions are valid and refer to different entities;
-- both expressions are valid at different times because the underlying fact changed.
+- 旧解释正确，当前 ASR 错误；
+- 新解释正确，某个历史 ASR Turn 错误；
+- 两种表达都正确，但指向不同实体；
+- 两种表达在不同时间都正确，因为现实事实发生了变化。
 
-It gathers targeted acoustic, contextual, short-term memory, and long-term memory evidence. The agent returns structured features and evidence references; it does not directly mutate transcript text.
+它只针对相关片段收集声学证据、上下文证据、短期 Memory 证据和长期 Memory 证据。Agent 返回结构化特征及证据引用，不能直接修改字幕文本。
 
-### Revision Ledger
+### Revision Ledger（修订账本）
 
-The ledger records `ACCEPT_NEW`, `KEEP_OLD`, `REVISE_CURRENT`, `REVISE_HISTORY`, `COEXIST`, `DEFER`, and `ROLLBACK` events. Current transcript text is replayed from immutable observations and active events. Events carry the session version, affected turns, replacement span, evidence references, resolver output, and superseded event IDs.
+修订账本记录 `ACCEPT_NEW`、`KEEP_OLD`、`REVISE_CURRENT`、`REVISE_HISTORY`、`COEXIST`、`DEFER` 和 `ROLLBACK` 事件。当前字幕由不可修改的原始观察和仍然有效的事件回放得到。事件需要保存会话版本、受影响 Turn、替换片段、证据引用、解析器输出以及被替代的事件 ID。
 
-### Memory Consolidator
+### Memory Consolidator（Memory 巩固器）
 
-The consolidator updates short-term memory after each turn and asynchronously promotes stable beliefs into long-term memory. Promotion is automatic but uses a stronger evidence gate than a session-local transcript revision. Long-term updates never block real-time ASR publication.
+巩固器在每个 Turn 后更新短期 Memory，并异步地把稳定信念提升到长期 Memory。提升过程完全自动，但其证据门槛高于会话内字幕修订。长期 Memory 更新不能阻塞实时 ASR 发布。
 
-## Memory Model
+## Memory 模型
 
-### Short-Term Memory
+### 短期 Memory
 
-Short-term memory is scoped to one live session and contains:
+短期 Memory 只属于当前实时会话，包含：
 
-- `RecentContext`: recent immutable observations and current rendered text;
-- `WorkingBeliefs`: current entities, events, relations, topics, and temporal claims;
-- `OpenHypotheses`: competing interpretations that remain active;
-- `DependencyIndex`: links from beliefs and revisions to their supporting turns and audio windows.
+- `RecentContext`：最近的不可修改观察和当前显示文本；
+- `WorkingBeliefs`：当前的实体、事件、关系、主题和时间性主张；
+- `OpenHypotheses`：仍然有效的竞争解释；
+- `DependencyIndex`：从信念和修订指向其支持 Turn 与音频窗口的依赖关系。
 
-An open hypothesis contains an ID, affected turn IDs, the proposed interpretation, alternatives, supporting and contradicting evidence, audio windows, calibrated score, status, creation version, and last evaluated version.
+每个开放假设包含：假设 ID、受影响的 Turn ID、建议解释、替代解释、支持证据、反对证据、音频窗口、标定后的分数、状态、创建时的会话版本以及最后评估时的会话版本。
 
-### Long-Term Memory
+### 长期 Memory
 
-Long-term memory stores stable cross-session knowledge rather than complete transcripts. It contains versioned entities, aliases, relations, facts, temporal validity, confidence, independent support counts, source sessions, and supersession links.
+长期 Memory 保存稳定的跨会话知识，而不是完整字幕。它包含带版本的实体、别名、关系、事实、时间有效性、可信度、独立支持次数、来源会话和版本替代关系。
 
-When new evidence contradicts a long-term belief, the system distinguishes ASR error, aliasing, multiple entities, and real-world change. A new version may supersede the old version, but the old record remains auditable. Updating long-term memory does not automatically rewrite every historical transcript; each transcript revision requires its own evidence decision.
+当新证据与长期信念冲突时，系统必须区分 ASR 错误、实体别名、多个不同实体以及现实信息变化。新版本可以替代旧版本，但旧记录必须保留以供审计。长期 Memory 更新不会自动批量改写历史字幕；每一处字幕修订都需要独立的证据决策。
 
-## Real-Time Decision Flow
+## 实时决策流程
 
-1. Publish and persist the immutable ASR observation.
-2. Retrieve recent context, unresolved hypotheses, dependency-linked turns, and relevant long-term beliefs.
-3. Ask the Context Judge for `CONSISTENT`, `NOVEL`, `CONFLICT`, or `UNCERTAIN`.
-4. Accept consistent or plausible novel information into short-term memory without full-sentence candidate extraction.
-5. For conflicts or uncertainty, construct old-correct, new-correct, coexistence, and temporal-change hypotheses.
-6. Request only the tools needed for the affected spans: tokenization, entity analysis, current audio re-listening, historical audio re-listening, closed-set ASR verification, or additional memory retrieval.
-7. Calibrate evidence scores and apply the action policy.
-8. Append a revision, defer, coexistence, or rollback event.
-9. Recompute only beliefs, turns, and hypotheses linked by the dependency index.
-10. Consolidate sufficiently stable beliefs into long-term memory asynchronously.
+1. 发布并持久化不可修改的 ASR 观察。
+2. 检索最近上下文、未解决假设、依赖关联 Turn 和相关长期信念。
+3. 请求 Context Judge 输出 `CONSISTENT`、`NOVEL`、`CONFLICT` 或 `UNCERTAIN`。
+4. 对一致或合理的新信息直接更新短期 Memory，不进行全句候选提取。
+5. 对冲突或不确定情况构建“旧信息正确”“新信息正确”“二者共存”和“事实随时间变化”假设。
+6. 只请求受影响片段真正需要的工具：分词、实体分析、当前音频复听、历史音频复听、闭集 ASR 验证或补充 Memory 检索。
+7. 对证据分数进行标定并应用动作策略。
+8. 追加修订、延迟判断、共存或回滚事件。
+9. 只重算由依赖索引关联的信念、Turn 和假设。
+10. 异步地把足够稳定的信念巩固到长期 Memory。
 
-## Threshold Policy
+## 门槛策略
 
-Business logic does not contain a single hand-written correction threshold. A held-out development set calibrates evidence features into comparable hypothesis probabilities. Policy uses four separately calibrated gates:
+业务逻辑中不保存单一的手写纠错门槛。系统使用独立开发集，将证据特征标定为可比较的假设概率。策略分别使用四个经过标定的门槛：
 
-- `T_suspect` favors recall and starts deeper analysis;
-- `T_relisten` favors recall and permits additional targeted audio work;
-- `T_revise` permits a reversible session-local transcript revision;
-- `T_long_memory` requires the strongest evidence before cross-session promotion or supersession.
+- `T_suspect` 偏向召回率，用于启动深入分析；
+- `T_relisten` 偏向召回率，允许执行更多针对性音频复听；
+- `T_revise` 用于批准可逆的会话内字幕修订；
+- `T_long_memory` 要求最强证据，用于跨会话信念的提升或替代。
 
-A revision also requires a calibrated margin between the best and second-best hypotheses. Thresholds are selected on the development set using recall-weighted `F2` or `F3` together with the observed over-correction rate. The untouched test set is never used for threshold selection.
+字幕修订还必须满足最佳假设与第二名假设之间的最小标定差距。门槛只在开发集上结合偏重召回率的 `F2` 或 `F3` 与实际过度修订率进行选择。测试集不能用于选择门槛。
 
-Before enough representative data exists, thresholds are explicitly marked as bootstrap configuration. They are not presented as learned values or research conclusions.
+在具有代表性的数据量不足时，所有门槛都必须被明确标记为启动阶段配置，不能被描述为学习得到的参数或研究结论。
 
-## Scheduling and Consistency
+## 实时调度与一致性
 
-The runtime has a fast path and a slow path.
+运行时分为快链路和慢链路。
 
-The fast path publishes raw ASR immediately, writes the observation, and updates the recent-turn index. The slow path performs agent judgment, retrieval, targeted re-listening, calibration, revision, and consolidation without blocking subsequent turns.
+快链路立即发布原始 ASR、写入观察并更新最近 Turn 索引。慢链路异步执行 Agent 判断、Memory 检索、针对性复听、概率标定、字幕修订和 Memory 巩固，不阻塞后续 Turn。
 
-Every slow-path task carries the session version from which it was derived. If the session advances before completion, its decision cannot be committed directly. The system revalidates it against the latest affected state. Tasks concerning the same hypothesis are coalesced, and only dependency-linked state is recomputed.
+每个慢链路任务都携带其创建时的会话版本。如果任务完成前会话已经更新，其决策不能直接提交，必须基于受影响状态的最新版本重新验证。指向同一假设的任务应当合并，并且只重算存在依赖关系的状态。
 
-## Failure Handling
+## 异常处理
 
-- Agent timeout or malformed output appends or retains `DEFER` and schedules reconsideration on later evidence.
-- Long-term memory failure degrades to short-term memory without blocking ASR.
-- Audio re-listening failure preserves alternatives and does not authorize a text-only rewrite.
-- A stale asynchronous decision is not committed; reusable evidence may be attached to the next evaluation.
-- Event IDs and expected session versions make writes idempotent.
-- Later contradictory evidence creates `ROLLBACK` or a superseding revision instead of deleting history.
-- Service restart reconstructs visible text, working state, and active dependencies from immutable observations and events.
+- Agent 超时或输出格式错误时，追加或保留 `DEFER`，并在后续证据到来时重新判断。
+- 长期 Memory 不可用时，系统降级为只使用短期 Memory，但不能阻塞 ASR。
+- 音频复听失败时保留竞争解释，不能仅凭语言模型授权文本改写。
+- 过期的异步决策不能提交；其中仍有价值的证据可以附加到下一轮评估。
+- 事件 ID 与预期会话版本共同保证写入幂等。
+- 后续矛盾证据通过 `ROLLBACK` 或替代修订处理，不能删除历史记录。
+- 服务重启后，系统从不可修改观察和事件中重建当前字幕、工作状态和有效依赖关系。
 
-## Removal of Global N-Gram Nomination
+## 移除全局 N-gram 候选提名
 
-The current `_COMMON_BIGRAMS`, generic CJK blocking sets, and global sliding n-gram scan must leave the primary decision path. They are artifacts of nominating entity-like spans before understanding whether a sentence is suspicious. The new flow makes the Context Judge responsible for deciding whether analysis is necessary.
+当前 `_COMMON_BIGRAMS`、通用中文片段屏蔽集合以及全局滑动 N-gram 扫描必须退出主决策链。这些机制源于“尚未理解一句话是否可疑，就先提名可能的实体片段”的流程。新流程由 Context Judge 决定是否需要进一步分析。
 
-Small lexical lists may remain only as optional, versioned features inside a targeted tool. They cannot independently nominate a revision, suppress a memory conflict, or authorize a transcript change.
+少量词法列表可以作为针对性工具中的可选、带版本特征继续存在，但它们不能独立提名修订、压制 Memory 冲突或授权字幕修改。
 
-## Evaluation Dataset
+## 评测数据集
 
-Evaluation uses continuous multi-turn speech with synchronized audio, raw ASR output, reference transcription, speaker and turn order, and annotations linking later disambiguating evidence to affected historical turns.
+评测使用连续多 Turn 语音，并保留同步音频、原始 ASR 输出、参考转写、说话人、Turn 顺序，以及“哪条后续消歧证据影响了哪个历史 Turn”的标注。
 
-The dataset includes correct observations, immediate errors, future-resolved errors, distinct entities with similar names, real-world temporal changes, automatic rollback cases, helpful long-term memories, and stale or incorrect long-term memories.
+数据集必须覆盖：正确观察、可立即发现的错误、由后续信息消除的历史错误、名称相似但实际不同的实体、现实事实随时间变化、自动回滚、长期 Memory 带来正确帮助，以及过时或错误长期 Memory 造成的风险。
 
-Train, development, and test partitions are separated by conversation, speaker, and core entity. An entity used for calibration cannot reappear as the decisive entity in the test partition.
+训练集、开发集和测试集按照会话、说话人和核心实体进行隔离。用于门槛标定的实体不能作为测试集中的关键判别实体再次出现。
 
-## Baselines and Ablations
+## 基线与消融实验
 
-Evaluation compares:
+评测比较以下系统：
 
-1. Raw ASR.
-2. Static dictionary correction.
-3. The existing deterministic n-gram and surface-similarity pipeline.
-4. The Context Judge without memory.
-5. The agent with short-term memory only.
-6. The agent with short-term and long-term memory.
-7. The complete agent without audio re-listening.
-8. The complete real-time ReTrace agent.
+1. 原始 ASR。
+2. 静态词典纠错。
+3. 当前确定性 N-gram 与表层相似度流程。
+4. 不使用 Memory 的 Context Judge。
+5. 只使用短期 Memory 的 Agent。
+6. 同时使用短期和长期 Memory 的 Agent。
+7. 关闭音频复听的完整 Agent。
+8. 完整的实时 ReTrace Agent。
 
-These ablations isolate the contributions of contextual judgment, short-term memory, long-term memory, and acoustic verification.
+这些消融实验分别衡量上下文判断、短期 Memory、长期 Memory 和声学验证的贡献。
 
-## Metrics and Success Criteria
+## 指标与成功标准
 
-Reported metrics include final CER/WER, error-detection recall, revision precision and recall, `F2/F3`, over-correction rate, historical revision success rate, evidence-to-revision latency, rollback success rate, long-term memory contamination rate, agent calls per turn, re-listened audio seconds, and end-to-end latency.
+报告指标包括：最终 CER/WER、错误发现召回率、修订准确率与召回率、`F2/F3`、过度修订率、历史错误修订成功率、从消歧证据出现到完成修订的延迟、回滚成功率、长期 Memory 污染率、每 Turn 的 Agent 调用次数、复听音频秒数以及端到端延迟。
 
-Results include recall-versus-over-correction curves, confidence intervals, and paired significance tests. The design succeeds when the complete system reduces final test-set error relative to raw ASR and the deterministic baseline, and obtains higher historical revision recall at a matched over-correction operating point. This comparison, rather than performance on a small hand-written example set, validates the memory-driven retrospective mechanism.
+实验结果必须包含召回率与过度修订率曲线、置信区间和配对显著性检验。当完整系统相对原始 ASR 和确定性规则基线降低测试集最终错误率，并且在相同过度修订水平下获得更高的历史修订召回率时，视为设计目标达成。验证依据必须是该比较结果，而不是少量手写样本上的表现。
 
-## Engineering Verification
+## 工程验证
 
-Unit tests cover observation immutability, hypothesis transitions, dependency selection, score-policy boundaries, memory versioning, event replay, supersession, and rollback. Integration tests cover short-term and long-term retrieval, closed-set audio verification, asynchronous version conflicts, idempotency, and restart recovery. End-to-end tests stream multi-turn sessions and verify that later evidence can revise historical text, reverse a mistaken revision, and update long-term memory without user input.
+单元测试覆盖观察不可变性、假设状态转换、依赖选择、分数策略边界、Memory 版本管理、事件回放、版本替代和回滚。集成测试覆盖短期与长期 Memory 检索、闭集音频验证、异步版本冲突、幂等性和重启恢复。端到端测试通过流式输入多 Turn 会话，验证后续证据能够修订历史文本、撤销错误修订，并在无需用户参与的情况下更新长期 Memory。
 
-## Implementation Scope
+## 实现范围
 
-The first implementation replaces the nomination and decision core while preserving the existing FastAPI boundary, ASR integration adapters, immutable raw-turn principle, audio-window verification capability, and append-only audit behavior. The large `retrace.py` module should be split along the six component boundaries above as part of this work. Frontend changes are limited to consuming the new event and memory states needed to observe real-time revisions; redesigning the product interface is outside this scope.
+第一阶段实现将替换当前的候选提名与决策核心，同时保留现有 FastAPI 接口边界、ASR 集成适配器、原始 Turn 不可修改原则、音频窗口验证能力以及只追加审计行为。当前体积较大的 `retrace.py` 应在此次工作中按照上述六个组件进行拆分。前端修改仅限于消费新的事件和 Memory 状态，以展示实时修订；产品界面整体重设计不在本次范围内。
