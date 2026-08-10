@@ -4,10 +4,11 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
+from asr_agent.models import EntityProfile, Hypothesis, RevisionEvent, Session, Turn
 from asr_agent.uncertainty import detect_suspicious_spans
 
 _TIME_PREFIX = re.compile(r"^\[\d+(?:\.\d+)?-\d+(?:\.\d+)?\]\s*")
@@ -51,96 +52,6 @@ _BRAND_SURFACE_ALIASES: dict[str, tuple[str, ...]] = {
     "iphone": ("爱疯",),
     "cpu": ("西皮尤",),
 }
-
-
-@dataclass
-class EntityProfile:
-    entity_id: str
-    name: str
-    aliases: list[str] = field(default_factory=list)
-    attributes: dict[str, str] = field(default_factory=dict)
-
-    @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "EntityProfile":
-        return cls(str(value["entity_id"]), str(value["name"]), list(value.get("aliases", [])), dict(value.get("attributes", {})))
-
-
-@dataclass
-class Hypothesis:
-    span: str
-    text_candidates: list[str]
-    entity_candidate_ids: list[str]
-    entity_id: str | None = None
-    action: str = "DEFER"
-    candidates: list[dict[str, Any]] = field(default_factory=list)
-    risk: str = "medium"
-    decision: str = "WAIT"
-    decision_rationale: list[str] = field(default_factory=list)
-    evidence_packet: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class Turn:
-    turn_id: str
-    raw_text: str
-    current_text: str
-    hypotheses: list[Hypothesis] = field(default_factory=list)
-    source: str = "text"
-    meta: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class RevisionEvent:
-    event_id: str
-    action: str
-    target_turn_id: str
-    source_turn_id: str
-    span: str
-    before_text: str
-    after_text: str
-    entity_id: str | None
-    score: float
-    evidence: list[str]
-    resolver: str
-    active: bool = True
-    rationale: str = ""
-    reverted_event_id: str | None = None
-    reason: str = ""
-    replacement: str = ""
-
-
-@dataclass
-class Session:
-    session_id: str
-    entities: dict[str, EntityProfile] = field(default_factory=dict)
-    turns: list[Turn] = field(default_factory=list)
-    verified_memory: dict[str, dict[str, str]] = field(default_factory=dict)
-    quarantine_memory: dict[str, dict[str, str]] = field(default_factory=dict)
-    revision_events: list[RevisionEvent] = field(default_factory=list)
-
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "Session":
-        session = cls(session_id=raw["session_id"])
-        session.entities = {key: EntityProfile.from_dict(value) for key, value in raw.get("entities", {}).items()}
-        session.turns = [
-            Turn(
-                turn_id=item["turn_id"],
-                raw_text=item["raw_text"],
-                current_text=item["current_text"],
-                hypotheses=[Hypothesis(**hypothesis) for hypothesis in item.get("hypotheses", [])],
-                source=item.get("source", "text"),
-                meta=dict(item.get("meta") or {}),
-            )
-            for item in raw.get("turns", [])
-        ]
-        session.verified_memory = raw.get("verified_memory", {})
-        session.quarantine_memory = raw.get("quarantine_memory", {})
-        session.revision_events = [RevisionEvent(**item) for item in raw.get("revision_events", [])]
-        return session
-
 
 class ReTraceService:
     def __init__(
