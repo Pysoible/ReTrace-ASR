@@ -1,5 +1,6 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
+from time import sleep
 
 import pytest
 
@@ -122,3 +123,40 @@ def test_concurrent_service_turns_are_not_lost(tmp_path):
     session = service.get_session("s")
     assert {turn["turn_id"] for turn in session["turns"]} == {"t1", "t2"}
     assert session["version"] == 2
+
+
+def test_repository_instances_share_atomic_updates_for_the_same_root(tmp_path):
+    first_repo = SessionRepository(tmp_path)
+    second_repo = SessionRepository(tmp_path)
+    first_repo.create(Session("s"))
+
+    def append_after_delay(repo, turn):
+        def mutate(current):
+            sleep(0.05)
+            current.turns.append(turn)
+
+        return repo.update("s", mutate)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(append_after_delay, first_repo, Turn("t1", "甲", "甲")),
+            executor.submit(append_after_delay, second_repo, Turn("t2", "乙", "乙")),
+        ]
+        for future in futures:
+            future.result()
+
+    session = first_repo.load("s")
+    assert {turn.turn_id for turn in session.turns} == {"t1", "t2"}
+    assert session.version == 2
+
+
+def test_stale_commit_is_rejected_across_repository_instances(tmp_path):
+    first_repo = SessionRepository(tmp_path)
+    second_repo = SessionRepository(tmp_path)
+    first_repo.create(Session("s"))
+    stale = first_repo.load("s")
+
+    second_repo.update("s", lambda current: current.turns.append(Turn("t1", "甲", "甲")))
+
+    with pytest.raises(VersionConflict, match="expected version 0, got 1"):
+        first_repo.commit(stale, expected_version=0)

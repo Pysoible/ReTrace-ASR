@@ -3,11 +3,21 @@ from __future__ import annotations
 
 import json
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock, RLock
-from typing import Callable
+from typing import Callable, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Unix and macOS provide fcntl.
+    fcntl = None
 
 from asr_agent.models import Session
+
+
+_LOCK_REGISTRY: dict[tuple[Path, str], RLock] = {}
+_LOCK_REGISTRY_GUARD = Lock()
 
 
 class VersionConflict(RuntimeError):
@@ -16,27 +26,24 @@ class VersionConflict(RuntimeError):
 
 class SessionRepository:
     def __init__(self, root: Path) -> None:
-        self.root = Path(root)
+        self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
-        self._locks: dict[str, RLock] = {}
-        self._locks_lock = Lock()
+        self._lock_root = self.root / ".locks"
+        self._lock_root.mkdir(parents=True, exist_ok=True)
 
     def load(self, session_id: str) -> Session:
-        lock = self._lock_for(session_id)
-        with lock:
+        with self.exclusive(session_id):
             return self._copy(self._load_unlocked(session_id))
 
     def create(self, session: Session) -> Session:
         session_id = self._validate_session_id(session.session_id)
-        lock = self._lock_for(session_id)
-        with lock:
+        with self.exclusive(session_id):
             stored = self._copy(session)
             self._write_unlocked(stored)
             return self._copy(stored)
 
     def update(self, session_id: str, mutate: Callable[[Session], object]) -> Session:
-        lock = self._lock_for(session_id)
-        with lock:
+        with self.exclusive(session_id):
             current = self._load_unlocked(session_id)
             previous_version = current.version
             mutate(current)
@@ -48,8 +55,7 @@ class SessionRepository:
 
     def commit(self, session: Session, expected_version: int) -> Session:
         session_id = self._validate_session_id(session.session_id)
-        lock = self._lock_for(session_id)
-        with lock:
+        with self.exclusive(session_id):
             current = self._load_unlocked(session_id)
             if current.version != expected_version:
                 raise VersionConflict(f"expected version {expected_version}, got {current.version}")
@@ -58,10 +64,29 @@ class SessionRepository:
             self._write_unlocked(stored)
             return self._copy(stored)
 
+    @contextmanager
+    def exclusive(self, session_id: str) -> Iterator[None]:
+        """Hold this session's process and filesystem guards without exposing state."""
+        session_id = self._validate_session_id(session_id)
+        with self._lock_for(session_id):
+            if fcntl is None:
+                # Non-Unix platforms retain cross-instance safety within this process.
+                yield
+                return
+
+            lock_path = self._lock_root / f"{session_id}.lock"
+            with lock_path.open("a+b") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     def _lock_for(self, session_id: str) -> RLock:
         session_id = self._validate_session_id(session_id)
-        with self._locks_lock:
-            return self._locks.setdefault(session_id, RLock())
+        key = (self.root, session_id)
+        with _LOCK_REGISTRY_GUARD:
+            return _LOCK_REGISTRY.setdefault(key, RLock())
 
     def _path(self, session_id: str) -> Path:
         return self.root / f"{self._validate_session_id(session_id)}.json"
