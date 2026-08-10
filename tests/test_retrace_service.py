@@ -1,6 +1,7 @@
 import json
 
 from asr_agent.context_judge import BeliefProposal, ContextJudgment, FocusProposal
+from asr_agent.models import MemoryBelief
 from asr_agent.retrace import ReTraceService
 
 
@@ -183,6 +184,71 @@ def test_stale_analysis_rejudges_against_latest_session(tmp_path):
 
     assert seen_turn_counts == [2]
     assert result["revalidated"] is True
+
+
+def test_session_exposes_realtime_observability_snapshot(tmp_path):
+    def judge(**_):
+        return ContextJudgment(
+            "NOVEL",
+            0.91,
+            rationale="新信息补充了负责人",
+            beliefs=[BeliefProposal("实验室", "负责人", "涂博士", confidence=0.89, evidence_turn_ids=["t1"])],
+        )
+
+    service = ReTraceService(tmp_path, context_judge=judge)
+    service.long_term_memory.save("default", [
+        MemoryBelief(
+            belief_id="long-1",
+            subject="实验室",
+            predicate="负责人",
+            value="涂博士",
+            confidence=0.96,
+            status="stable",
+            source_turn_ids=["old-t1"],
+            source_session_ids=["old-session"],
+        ),
+    ])
+
+    service.process_turn("s", "t1", "实验室负责人是涂博士")
+    state = service.get_session("s")
+    trace = state["observability"]
+
+    assert trace["latest_analysis"] == {
+        "turn_id": "t1",
+        "outcome": "NOVEL",
+        "confidence": 0.91,
+        "rationale": "新信息补充了负责人",
+        "observed_version": 1,
+        "analyzed_version": 2,
+        "revalidated": False,
+    }
+    assert [turn["turn_id"] for turn in trace["short_term"]["recent_turns"]] == ["t1"]
+    assert trace["short_term"]["working_beliefs"][0]["value"] == "涂博士"
+    assert trace["long_term"]["beliefs"][0]["belief_id"] == "long-1"
+
+
+def test_hypothesis_observability_keeps_focus_relationship(tmp_path):
+    def judge(**_):
+        return ContextJudgment(
+            "CONFLICT",
+            0.9,
+            focus=[FocusProposal(
+                "t1",
+                "旧负责人",
+                "新负责人",
+                ["旧负责人", "新负责人"],
+                ["t2"],
+                relationship="TEMPORAL_CHANGE",
+            )],
+        )
+
+    service = ReTraceService(tmp_path, context_judge=judge)
+    service.process_turn("s", "t1", "旧负责人参加会议")
+    service.process_turn("s", "t2", "新负责人今天接任")
+
+    state = service.get_session("s")
+    hypothesis = state["observability"]["short_term"]["open_hypotheses"][0]
+    assert hypothesis["relationship"] == "TEMPORAL_CHANGE"
 
 
 def test_service_restart_replays_projection_from_raw_and_ledger(tmp_path):

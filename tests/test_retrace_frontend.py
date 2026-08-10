@@ -62,3 +62,26 @@ def test_workspace_visualizes_the_full_autonomous_decision_path():
     source = Path("frontend/src/main.ts").read_text(encoding="utf-8")
     for label in ("OBSERVE", "MEMORY RETRIEVE", "CONTEXT JUDGE", "TARGETED RELISTEN", "EVENT REPLAY"):
         assert label in source
+
+
+def test_workspace_exposes_dual_timescale_memory_and_belief_provenance():
+    source = Path("frontend/src/main.ts").read_text(encoding="utf-8")
+    for label in ("SHORT-TERM", "LONG-TERM", "WORKING BELIEFS", "STABLE BELIEFS", "Source turns", "Supersedes"):
+        assert label in source
+    assert "observability" in source
+
+
+def test_workspace_shows_all_agent_decisions_relationships_and_versions():
+    source = Path("frontend/src/main.ts").read_text(encoding="utf-8")
+    for label in (
+        "KEEP_OLD", "ACCEPT_NEW", "COEXIST", "DEFER", "ROLLBACK",
+        "MUTUALLY_EXCLUSIVE", "TEMPORAL_CHANGE", "Observed v", "Analyzed v",
+    ):
+        assert label in source
+
+
+def test_workspace_removes_stale_demo_and_degenerate_prompt_copy():
+    source = Path("frontend/src/main.ts").read_text(encoding="utf-8")
+    assert "R0015" not in source
+    assert "遥遥遥" not in source
+    assert "Hear it twice" not in source

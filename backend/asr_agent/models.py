@@ -61,6 +61,7 @@ class WorkingHypothesis:
     current_interpretation: str
     proposed_interpretation: str
     alternatives: list[str]
+    relationship: str = "MUTUALLY_EXCLUSIVE"
     supporting_evidence: list[EvidenceRef] = field(default_factory=list)
     contradicting_evidence: list[EvidenceRef] = field(default_factory=list)
     audio_windows: list[dict[str, Any]] = field(default_factory=list)
@@ -80,6 +81,7 @@ class WorkingHypothesis:
             current_interpretation=str(value["current_interpretation"]),
             proposed_interpretation=str(value["proposed_interpretation"]),
             alternatives=list(value.get("alternatives", [])),
+            relationship=str(value.get("relationship", "MUTUALLY_EXCLUSIVE")),
             supporting_evidence=[EvidenceRef.from_dict(item) for item in value.get("supporting_evidence", [])],
             contradicting_evidence=[EvidenceRef.from_dict(item) for item in value.get("contradicting_evidence", [])],
             audio_windows=list(value.get("audio_windows", [])),

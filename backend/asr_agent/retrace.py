@@ -58,7 +58,9 @@ class ReTraceService:
     def get_session(self, session_id: str) -> dict[str, Any]:
         session = self.repository.load(session_id)
         self.ledger.replay(session)
-        return session.as_dict()
+        result = session.as_dict()
+        result["observability"] = self._observability(session)
+        return result
 
     def reset_session(self, session_id: str, *, memory_scope: str = "default") -> dict[str, Any]:
         return self.repository.create(Session(session_id, memory_scope=memory_scope)).as_dict()
@@ -154,6 +156,7 @@ class ReTraceService:
                     current_interpretation=focus.span,
                     proposed_interpretation=focus.proposed_text,
                     alternatives=focus.alternatives,
+                    relationship=focus.relationship,
                     supporting_evidence=[EvidenceRef(item, "context", focus.proposed_text) for item in focus.evidence_turn_ids],
                     created_version=snapshot.version,
                     last_evaluated_version=snapshot.version,
@@ -262,6 +265,8 @@ class ReTraceService:
             self.ledger.append_many(snapshot, [*audit_events, *events], event_version=snapshot.version + 1)
             snapshot.analysis_status = "deferred" if deferred else "idle"
             trigger.meta["analyzed_observed_version"] = observed_version
+            trigger.meta["analyzed_session_version"] = snapshot.version + 1
+            trigger.meta["analysis_revalidated"] = observed_version is not None and snapshot.version != observed_version
             trigger.meta["context_judgment"] = {
                 "outcome": judgment.outcome,
                 "confidence": judgment.confidence,
@@ -291,6 +296,50 @@ class ReTraceService:
                 "session": committed.as_dict(),
             }
         raise VersionConflict("analysis could not commit after retries")
+
+    def _observability(self, session: Session) -> dict[str, Any]:
+        if not session.turns:
+            return {
+                "latest_analysis": None,
+                "short_term": {
+                    "recent_turns": [],
+                    "dependent_turns": [],
+                    "working_beliefs": [],
+                    "open_hypotheses": [],
+                },
+                "long_term": {"beliefs": []},
+            }
+
+        latest = session.turns[-1]
+        packet = self.memory_retriever.retrieve(session, latest)
+        analyzed = next(
+            (turn for turn in reversed(session.turns) if turn.meta.get("context_judgment")),
+            None,
+        )
+        latest_analysis = None
+        if analyzed is not None:
+            judgment = dict(analyzed.meta.get("context_judgment") or {})
+            latest_analysis = {
+                "turn_id": analyzed.turn_id,
+                "outcome": judgment.get("outcome", "UNCERTAIN"),
+                "confidence": float(judgment.get("confidence", 0.0)),
+                "rationale": str(judgment.get("rationale", "")),
+                "observed_version": analyzed.meta.get("analyzed_observed_version"),
+                "analyzed_version": analyzed.meta.get("analyzed_session_version"),
+                "revalidated": bool(analyzed.meta.get("analysis_revalidated", False)),
+            }
+        return {
+            "latest_analysis": latest_analysis,
+            "short_term": {
+                "recent_turns": [turn.as_dict() for turn in packet.recent_turns],
+                "dependent_turns": [turn.as_dict() for turn in packet.dependent_turns],
+                "working_beliefs": [belief.as_dict() for belief in packet.working_beliefs],
+                "open_hypotheses": [hypothesis.as_dict() for hypothesis in session.open_hypotheses.values()],
+            },
+            "long_term": {
+                "beliefs": [belief.as_dict() for belief in packet.long_term_beliefs],
+            },
+        }
 
     def process_turn(
         self,

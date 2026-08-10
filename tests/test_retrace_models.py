@@ -57,7 +57,7 @@ def test_service_saves_and_reloads_json_session(tmp_path):
     saved_json = json.loads((tmp_path / "s1.json").read_text())
     reloaded = ReTraceService(tmp_path).get_session("s1")
 
-    assert saved_json == reloaded
+    assert saved_json == {key: value for key, value in reloaded.items() if key != "observability"}
     assert reloaded["turns"][0]["raw_text"] == "泰康"
 
 
@@ -74,6 +74,21 @@ def test_working_hypothesis_keeps_competing_interpretations():
     assert hypothesis.proposed_interpretation == "泰康"
     assert hypothesis.alternatives == ["泰信", "泰康"]
     assert hypothesis.status == "active"
+
+
+def test_working_hypothesis_persists_temporal_relationship():
+    hypothesis = WorkingHypothesis(
+        hypothesis_id="h1",
+        target_turn_ids=["t1"],
+        current_interpretation="旧负责人",
+        proposed_interpretation="新负责人",
+        alternatives=["旧负责人", "新负责人"],
+        relationship="TEMPORAL_CHANGE",
+    )
+
+    restored = WorkingHypothesis.from_dict(hypothesis.as_dict())
+
+    assert restored.relationship == "TEMPORAL_CHANGE"
 
 
 def test_versioned_session_deserializes_nested_models():
