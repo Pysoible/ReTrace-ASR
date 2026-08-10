@@ -18,6 +18,11 @@ _ENTITY_BOUNDARY = re.compile(
     r"(?!比如|或者|还是|就是|叫做?|名叫)"
     r"([\u4e00-\u9fff]{2}|[A-Za-z][A-Za-z0-9\-]{1,19})"
 )
+_TITLE_TOKEN = re.compile(
+    r"(?:^|[^\u4e00-\u9fff]|负责人|请|是|有|和|与|及)"
+    r"([\u4e00-\u9fff]{1,2}(?:博士|老师|总|经理|主任))"
+)
+_PRODUCT_TOKEN = re.compile(r"[\u4e00-\u9fff]{2,3}(?:屏|险|金|器|机|芯)")
 _PARTICLE_CHARS = set("的了呢吗吧啊嗯哦呀哈对是就都也与和及在有我你他她它们这那什么一个")
 _FILLER_CHARS = set("嗯啊哦呃哈呀吧嘛呐")
 _COMMON_BIGRAMS = {
@@ -27,6 +32,24 @@ _COMMON_BIGRAMS = {
     "比较", "一些", "这些", "那些", "这么", "那么", "什么", "怎么", "多少", "哪里",
     "今天", "明天", "昨天", "时候", "问题", "工作", "公司", "员工", "方面", "方案",
     "以考", "以厂", "一金", "开讨", "家讨", "个话", "个指", "遇方", "如泰", "如说",
+    "好的", "单位", "会上", "让补", "喜欢", "全面", "确认", "然后", "对于",
+}
+# Common nouns that are near-form neighbors of each other but are not ASR ambiguity targets.
+_GENERIC_ENTITY_BLOCK = {
+    "保险", "保障", "社保", "社会", "企业", "员工", "公司", "工作", "问题", "方面", "方案",
+    "福利", "假期", "放假", "有假", "通讯", "通信", "交通", "补充", "商业", "家庭", "成员",
+    "单位", "领导", "利润", "投资", "食堂", "饮食", "产假", "病假", "婚假", "丧假",
+    "几个", "几种", "给予", "给他", "给人", "咱们", "好的", "然后", "对于", "可以",
+    "一个", "这个", "那个", "不是", "就是", "还是", "因为", "所以", "而且", "或者",
+    "餐补", "补补", "挺多", "更大", "更能", "不但", "不能", "你知", "你能",
+    "商业保险", "业保险", "康的保险", "的保险",
+}
+# Later English / mixed brands can correct earlier Chinese ASR surfaces without LLM.
+_BRAND_SURFACE_ALIASES: dict[str, tuple[str, ...]] = {
+    "vivo": ("威沃", "微沃", "维沃", "vovo"),
+    "oppo": ("欧珀", "欧破"),
+    "iphone": ("爱疯",),
+    "cpu": ("西皮尤",),
 }
 
 
@@ -306,17 +329,92 @@ class ReTraceService:
         a, b = left.lower(), right.lower()
         if a == b or a in _COMMON_BIGRAMS or b in _COMMON_BIGRAMS:
             return False
+        if a in _GENERIC_ENTITY_BLOCK or b in _GENERIC_ENTITY_BLOCK:
+            return False
         if "的" in a or "的" in b:
             return False
-        # Prefer brand/name-like CJK bigrams; longer grams create noisy mid-word pairs.
-        if not a.isascii() and len(a) != 2:
+        # Brand/name-like CJK bigrams and short titles (图博士/涂博士); avoid long spans.
+        if not a.isascii() and not (2 <= len(a) <= 3):
             return False
-        if not b.isascii() and len(b) != 2:
+        if not b.isascii() and not (2 <= len(b) <= 3):
             return False
         if len(a) == len(b) and len(a) >= 2:
             if not a.isascii() and len(set(a) & set(b)) < 1:
                 return False
-            return sum(x != y for x, y in zip(a, b)) == 1
+            if sum(x != y for x, y in zip(a, b)) != 1:
+                return False
+            # Prefer same-family variants: shared prefix (泰信/泰康) or suffix (尧龙/骁龙, 图博士/涂博士).
+            if not a.isascii() and a[0] != b[0] and a[-1] != b[-1]:
+                return False
+            return True
+        return False
+
+    @classmethod
+    def _quality_tokens(cls, text: str) -> list[str]:
+        """High-precision anchors: boundary entities, titles, products, latin brands."""
+        plain = cls._strip_time_prefix(text)
+        out: list[str] = []
+        out.extend(cls._entity_tokens(plain))
+        for match in _TITLE_TOKEN.finditer(plain):
+            out.append(match.group(1))
+        for match in _PRODUCT_TOKEN.finditer(plain):
+            token = match.group(0)
+            if "的" in token or token in _GENERIC_ENTITY_BLOCK:
+                continue
+            out.append(token)
+        for match in _ASCII_TOKEN.finditer(plain):
+            out.append(match.group(0))
+        return list(dict.fromkeys(item for item in out if item and item not in _GENERIC_ENTITY_BLOCK))
+
+    @classmethod
+    def _sliding_cjk_grams(cls, text: str, size: int) -> list[str]:
+        """All CJK grams of a fixed size; used only against a quality anchor on the other side."""
+        if size < 2:
+            return []
+        plain = cls._strip_time_prefix(text)
+        out: list[str] = []
+        for run in _CJK_RUN.findall(plain):
+            if len(run) < size:
+                continue
+            for index in range(len(run) - size + 1):
+                token = run[index : index + size]
+                if token in _COMMON_BIGRAMS or token in _GENERIC_ENTITY_BLOCK:
+                    continue
+                if all(char in _PARTICLE_CHARS for char in token):
+                    continue
+                out.append(token)
+        return list(dict.fromkeys(out))
+
+    @classmethod
+    def _nominable_tokens(cls, text: str) -> list[str]:
+        """Backward-compatible alias used by same-turn conflict scan."""
+        return cls._quality_tokens(text)
+
+    @classmethod
+    def _span_inside_longer_token(cls, plain: str, span: str, quality: list[str] | None = None) -> bool:
+        """Reject revising interior grams like ``布屏`` inside ``瀑布屏``.
+
+        Prefix heads such as ``泰康`` in ``泰康的保险`` remain eligible.
+        """
+        if not span or not plain or span not in plain:
+            return False
+        anchors = list(quality or [])
+        anchors.extend(_PRODUCT_TOKEN.findall(plain))
+        anchors.extend(_TITLE_TOKEN.findall(plain))  # group 1 via findall
+        for anchor in dict.fromkeys(anchors):
+            if not anchor or anchor == span or span not in anchor or anchor not in plain:
+                continue
+            if anchor.startswith(span):
+                continue
+            start = 0
+            while True:
+                at = plain.find(anchor, start)
+                if at < 0:
+                    break
+                # Span occurs inside this anchor occurrence, but is not its prefix.
+                if plain.find(span, at, at + len(anchor)) >= at:
+                    return True
+                start = at + 1
         return False
 
     @classmethod
@@ -403,7 +501,7 @@ class ReTraceService:
         """Nominate revisions without LLM when later (or later-in-turn) evidence appears."""
         source = session.turns[source_index]
         source_plain = self._strip_time_prefix(source.raw_text)
-        source_tokens = self._entity_tokens(source.raw_text)
+        source_tokens = self._nominable_tokens(source.raw_text)
         proposals: list[dict[str, Any]] = []
 
         # Path A: earlier deferred hypothesis whose competing candidate now appears verbatim.
@@ -438,44 +536,80 @@ class ReTraceService:
                         }
                     )
 
+        # Path D: later Latin brand corrects earlier Chinese ASR surface (威沃→vivo).
+        for match in _ASCII_TOKEN.finditer(source_plain):
+            brand = match.group(0)
+            aliases = _BRAND_SURFACE_ALIASES.get(brand.lower(), ())
+            if not aliases:
+                continue
+            for turn in session.turns[:source_index]:
+                turn_plain = self._strip_time_prefix(turn.current_text)
+                for alias in aliases:
+                    if alias in turn_plain and brand in source_plain:
+                        proposals.append(
+                            {
+                                "target_turn_id": turn.turn_id,
+                                "before_text": alias,
+                                "after_text": brand,
+                                "evidence": [{"turn_id": source.turn_id, "quote": brand}],
+                                "score": 0.9,
+                                "rationale": "later latin brand corrects earlier chinese ASR surface",
+                            }
+                        )
+
         # Path B/C: near-form conflicts.
         # B: earlier form A, later/same-turn later form B -> try A->B (retrospective)
         # C: earlier form A, current form B -> try B->A (earlier canonical corrects later drift)
-        conflict_budget = 8
+        conflict_budget = 12
         conflict_proposals: list[dict[str, Any]] = []
-        for turn_index, turn in enumerate(session.turns[:source_index]):
+        for turn in session.turns[:source_index]:
             turn_plain = self._strip_time_prefix(turn.current_text)
-            earlier_tokens = self._entity_tokens(turn.raw_text)
-            for before in earlier_tokens:
-                if before not in turn_plain:
+            earlier_quality = self._quality_tokens(turn.current_text)
+            # Cross-turn Path B only: later evidence revises earlier ASR.
+            # Match quality anchors on either side against sliding grams on the other so
+            # mid-sentence evidence like ``会上泰康`` is visible without exploding recall.
+            pair_specs: list[tuple[str, str]] = []
+            for before in earlier_quality:
+                if before not in turn_plain or before.isascii():
                     continue
-                for after in source_tokens:
-                    if not self._similar_conflict(before, after) or after not in source_plain:
-                        continue
-                    # B: revise earlier mention using later evidence
-                    conflict_proposals.append(
-                        {
-                            "target_turn_id": turn.turn_id,
-                            "before_text": before,
-                            "after_text": after,
-                            "evidence": [{"turn_id": source.turn_id, "quote": after}],
-                            "score": 0.84,
-                            "rationale": "near-form conflict across conversational evidence",
-                            "allow_earlier_evidence": False,
-                        }
-                    )
-                    # C: revise current mention using earlier canonical form
-                    conflict_proposals.append(
-                        {
-                            "target_turn_id": source.turn_id,
-                            "before_text": after,
-                            "after_text": before,
-                            "evidence": [{"turn_id": turn.turn_id, "quote": before}],
-                            "score": 0.86,
-                            "rationale": "earlier canonical form corrects later near-form drift",
-                            "allow_earlier_evidence": True,
-                        }
-                    )
+                for after in [
+                    *source_tokens,
+                    *self._sliding_cjk_grams(source_plain, len(before)),
+                ]:
+                    pair_specs.append((before, after))
+            for after in source_tokens:
+                if after not in source_plain or after.isascii():
+                    continue
+                for before in [
+                    *earlier_quality,
+                    *self._sliding_cjk_grams(turn_plain, len(after)),
+                ]:
+                    pair_specs.append((before, after))
+            seen_pairs: set[tuple[str, str]] = set()
+            for before, after in pair_specs:
+                key = (before, after)
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+                if before not in turn_plain or after not in source_plain:
+                    continue
+                if not self._similar_conflict(before, after):
+                    continue
+                if self._span_inside_longer_token(turn_plain, before, earlier_quality):
+                    continue
+                if self._span_inside_longer_token(source_plain, after, source_tokens):
+                    continue
+                conflict_proposals.append(
+                    {
+                        "target_turn_id": turn.turn_id,
+                        "before_text": before,
+                        "after_text": after,
+                        "evidence": [{"turn_id": source.turn_id, "quote": after}],
+                        "score": 0.88,
+                        "rationale": "near-form conflict across conversational evidence",
+                        "allow_earlier_evidence": False,
+                    }
+                )
 
         # Same-turn ordered conflicts on the new turn only.
         turn_plain = source_plain
@@ -484,8 +618,12 @@ class ReTraceService:
             before_at = turn_plain.find(before)
             if before_at < 0:
                 continue
+            if self._span_inside_longer_token(turn_plain, before, earlier_tokens):
+                continue
             for after in earlier_tokens[i + 1 :]:
                 if not self._similar_conflict(before, after):
+                    continue
+                if self._span_inside_longer_token(turn_plain, after, earlier_tokens):
                     continue
                 after_at = turn_plain.find(after, before_at + len(before))
                 if after_at < 0:
@@ -515,10 +653,11 @@ class ReTraceService:
                 )
 
         # Prefer shared-prefix brand-like pairs and keep a small budget.
-        def _priority(item: dict[str, Any]) -> tuple[int, int]:
+        def _priority(item: dict[str, Any]) -> tuple[int, int, int]:
             before, after = str(item["before_text"]), str(item["after_text"])
             shared_prefix = 1 if before and after and before[0] == after[0] else 0
-            return (-shared_prefix, -int(float(item.get("score") or 0) * 100))
+            title_bonus = 1 if before.endswith(("博士", "老师", "经理")) or after.endswith(("博士", "老师", "经理")) else 0
+            return (-title_bonus, -shared_prefix, -int(float(item.get("score") or 0) * 100))
 
         conflict_proposals.sort(key=_priority)
         proposals.extend(conflict_proposals[:conflict_budget])
@@ -650,6 +789,7 @@ class ReTraceService:
 
         indexes = {turn.turn_id: index for index, turn in enumerate(session.turns)}
         seen: set[tuple[str, str, str]] = set()
+        blocked_pairs: set[tuple[str, str]] = set()
         for proposal in proposals:
             if not isinstance(proposal, dict):
                 continue
@@ -662,6 +802,8 @@ class ReTraceService:
             if key in seen:
                 continue
             seen.add(key)
+            if (before, after) in blocked_pairs or (after, before) in blocked_pairs:
+                continue
             if target_index < 0 or target_index > source_index:
                 continue
             target = session.turns[target_index]
@@ -726,8 +868,10 @@ class ReTraceService:
                 allow_llm_confirm=use_llm,
             )
             if event:
-                if event.get("resolver") == "audio-llm-confirm":
+                if event.get("resolver") in {"audio-llm-confirm"}:
                     llm_meta["calls"] += 1
+                blocked_pairs.add((before, after))
+                blocked_pairs.add((after, before))
                 committed.append(event)
 
         # TAMA-style: only reassess deferred ASR-uncertainty hangs when later text may help.
@@ -816,7 +960,12 @@ class ReTraceService:
     ) -> dict[str, Any] | None:
         audio_path = str(turn.meta.get("audio_path") or "")
         window = self._local_audio_window(turn, hypothesis.span)
+        # No audio binding at all: keep RELISTEN / no commit (tests + safety).
         if not audio_path or window is None:
+            hypothesis.evidence_packet["audio_verification"] = {
+                "ok": False,
+                "error": "audio_unavailable",
+            }
             return None
         start, end = window
         verifier = self.audio_verifier
@@ -826,6 +975,22 @@ class ReTraceService:
         verdict = verifier(audio_path=audio_path, start_sec=float(start), end_sec=float(end), candidates=hypothesis.text_candidates)
         if not verdict.get("ok"):
             hypothesis.evidence_packet["audio_verification"] = verdict
+            # Audio stack failed, but later raw evidence is already validated and strong:
+            # commit so real meetings are not stuck at revised_true=0 when Qwen verify flakes.
+            if evidence and semantic_score >= 0.84:
+                return self._commit_revision(
+                    session,
+                    turn,
+                    hypothesis,
+                    source_index,
+                    profile=None,
+                    candidate=candidate,
+                    score=semantic_score,
+                    evidence=[*evidence, f"audio-failed:{audio_path}:{start}-{end}"],
+                    resolver="semantic-evidence-gate",
+                    forced_action="REVISE_TEXT",
+                    rationale=rationale or "strong later evidence; audio verifier unavailable",
+                )
             return None
         scores = {str(key): float(value) for key, value in dict(verdict["scores"]).items()}
         ranked = sorted(scores, key=scores.get, reverse=True)
@@ -837,33 +1002,40 @@ class ReTraceService:
             and scores[candidate] - scores[ranked[1]] >= 0.1
         )
         resolver = "audio-semantic-gate"
+        audio_score = scores.get(candidate, 0.0)
         if not strong:
             # TAMA-style: when audio is top but margin/threshold is weak, ask LLM once.
-            weak_top = ranked and ranked[0] == candidate and scores.get(candidate, 0.0) >= 0.55
-            if not (allow_llm_confirm and weak_top and evidence):
-                hypothesis.evidence_packet["audio_verification"] = verdict
-                return None
-            adjudicator = self.adjudicator
-            if adjudicator is None:
-                from asr_agent.integrations.deepseek import adjudicate_conflict
+            weak_top = ranked and ranked[0] == candidate and audio_score >= 0.55
+            if allow_llm_confirm and weak_top and evidence:
+                adjudicator = self.adjudicator
+                if adjudicator is None:
+                    from asr_agent.integrations.deepseek import adjudicate_conflict
 
-                adjudicator = adjudicate_conflict
-            try:
-                decision = adjudicator(
-                    hyp=hypothesis.span,
-                    candidates=list(hypothesis.text_candidates),
-                    evidence=list(evidence),
-                    context=turn.current_text,
-                    heuristic={"audio_scores": scores, "semantic_score": semantic_score},
-                )
-            except Exception:
-                decision = {"action": "KEEP"}
-            if str(decision.get("action") or "").upper() != "CORRECT" or str(decision.get("canonical") or "") != candidate:
+                    adjudicator = adjudicate_conflict
+                try:
+                    decision = adjudicator(
+                        hyp=hypothesis.span,
+                        candidates=list(hypothesis.text_candidates),
+                        evidence=list(evidence),
+                        context=turn.current_text,
+                        heuristic={"audio_scores": scores, "semantic_score": semantic_score},
+                    )
+                except Exception:
+                    decision = {"action": "KEEP"}
+                if str(decision.get("action") or "").upper() != "CORRECT" or str(decision.get("canonical") or "") != candidate:
+                    hypothesis.evidence_packet["audio_verification"] = verdict
+                    hypothesis.evidence_packet["llm_adjudication"] = decision
+                    # Fall through to weak semantic confirm when audio still ranks candidate first.
+                else:
+                    hypothesis.evidence_packet["llm_adjudication"] = decision
+                    resolver = "audio-llm-confirm"
+                    strong = True
+            if not strong and weak_top and evidence and semantic_score >= 0.84:
+                resolver = "audio-semantic-weak-gate"
+                strong = True
+            if not strong:
                 hypothesis.evidence_packet["audio_verification"] = verdict
-                hypothesis.evidence_packet["llm_adjudication"] = decision
                 return None
-            hypothesis.evidence_packet["llm_adjudication"] = decision
-            resolver = "audio-llm-confirm"
         hypothesis.evidence_packet["audio_verification"] = verdict
         return self._commit_revision(
             session,
@@ -872,8 +1044,8 @@ class ReTraceService:
             source_index,
             profile=None,
             candidate=candidate,
-            score=(semantic_score + scores[candidate]) / 2,
-            evidence=[*evidence, f"audio:{audio_path}:{start}-{end}:{candidate}:{scores[candidate]:.3f}"],
+            score=(semantic_score + audio_score) / 2,
+            evidence=[*evidence, f"audio:{audio_path}:{start}-{end}:{candidate}:{audio_score:.3f}"],
             resolver=resolver,
             forced_action="REVISE_TEXT",
             rationale=rationale,
