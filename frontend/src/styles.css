@@ -174,7 +174,7 @@ button { letter-spacing: 0; }
 .method-trace { margin: 0; padding: 7px 17px 14px; list-style: none; }
 .method-trace li { display: grid; grid-template-columns: 22px minmax(0, 1fr) 46px; gap: 8px; align-items: start; min-height: 45px; position: relative; }
 .method-trace li:not(:last-child)::after { content: ""; position: absolute; left: 10px; top: 22px; bottom: 0; width: 1px; background: var(--line-strong); }
-.stage-index { display: grid; place-items: center; width: 21px; height: 21px; border: 1px solid var(--line-strong); border-radius: 50%; color: var(--muted); background: #fff; font: 700 9px/1 var(--mono); z-index: 1; }
+.method-trace .stage-index { display: grid; place-items: center; width: 21px; height: 21px; border: 1px solid var(--line-strong); border-radius: 50%; color: var(--muted); background: #fff; font: 700 9px/1 var(--mono); z-index: 1; }
 .method-trace b, .method-trace span { display: block; }
 .method-trace b { padding-top: 2px; font: 700 9px/1.25 var(--mono); }
 .method-trace div span { margin-top: 3px; color: var(--muted); font-size: 10px; line-height: 1.35; }

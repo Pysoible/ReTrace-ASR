@@ -85,3 +85,11 @@ def test_workspace_removes_stale_demo_and_degenerate_prompt_copy():
     assert "R0015" not in source
     assert "遥遥遥" not in source
     assert "Hear it twice" not in source
+
+
+def test_method_trace_step_number_keeps_centering_after_generic_span_rule():
+    styles = Path("frontend/src/styles.css").read_text(encoding="utf-8")
+    assert ".method-trace .stage-index" in styles
+    centered_rule = styles.split(".method-trace .stage-index", 1)[1].split("}", 1)[0]
+    assert "display: grid" in centered_rule
+    assert "place-items: center" in centered_rule
