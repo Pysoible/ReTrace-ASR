@@ -1,7 +1,6 @@
 """Evidence-grounded retrospective revision for conversational ASR."""
 from __future__ import annotations
 
-import json
 import re
 import uuid
 from dataclasses import asdict
@@ -9,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from asr_agent.models import EntityProfile, Hypothesis, RevisionEvent, Session, Turn
+from asr_agent.storage import SessionRepository
 from asr_agent.uncertainty import detect_suspicious_spans
 
 _TIME_PREFIX = re.compile(r"^\[\d+(?:\.\d+)?-\d+(?:\.\d+)?\]\s*")
@@ -64,6 +64,7 @@ class ReTraceService:
         audio_retranscriber: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self.storage_dir = storage_dir
+        self.repository = SessionRepository(storage_dir)
         self.evidence_scorer = evidence_scorer
         self.reflector = reflector
         self.adjudicator = adjudicator
@@ -71,9 +72,10 @@ class ReTraceService:
         self.audio_retranscriber = audio_retranscriber
 
     def upsert_entities(self, session_id: str, profiles: list[EntityProfile]) -> dict[str, Any]:
-        session = self._load(session_id)
-        session.entities.update({profile.entity_id: profile for profile in profiles})
-        self._save(session)
+        session = self.repository.update(
+            session_id,
+            lambda current: current.entities.update({profile.entity_id: profile for profile in profiles}),
+        )
         return session.as_dict()
 
     def get_session(self, session_id: str) -> dict[str, Any]:
@@ -110,8 +112,10 @@ class ReTraceService:
 
     def reset_session(self, session_id: str) -> dict[str, Any]:
         """Replace an existing session with an empty one (one long audio = one session)."""
-        session = Session(session_id=session_id)
-        self._save(session)
+        session = self.repository.update(
+            session_id,
+            lambda current: current.__dict__.update(Session(session_id=session_id).__dict__),
+        )
         return session.as_dict()
 
     def process_turn(
@@ -129,7 +133,42 @@ class ReTraceService:
         risk: str = "medium",
         nbest: list[str] | None = None,
     ) -> dict[str, Any]:
-        session = self._load(session_id)
+        result: dict[str, Any] = {}
+
+        def mutate(session: Session) -> None:
+            result.update(self._process_turn_in_session(
+                session,
+                turn_id,
+                text,
+                confidence=confidence,
+                text_candidates=text_candidates,
+                entity_candidate_ids=entity_candidate_ids,
+                use_llm=use_llm,
+                source=source,
+                meta=meta,
+                risk=risk,
+                nbest=nbest,
+            ))
+
+        session = self.repository.update(session_id, mutate)
+        result["session"] = session.as_dict()
+        return result
+
+    def _process_turn_in_session(
+        self,
+        session: Session,
+        turn_id: str,
+        text: str,
+        *,
+        confidence: dict[str, float] | None,
+        text_candidates: dict[str, list[str]] | None,
+        entity_candidate_ids: dict[str, list[str]] | None,
+        use_llm: bool,
+        source: str,
+        meta: dict[str, Any] | None,
+        risk: str,
+        nbest: list[str] | None,
+    ) -> dict[str, Any]:
         if any(turn.turn_id == turn_id for turn in session.turns):
             raise ValueError(f"duplicate turn_id: {turn_id}")
 
@@ -188,9 +227,7 @@ class ReTraceService:
         # mutate the displayed transcript.  This keeps the agent closed-set and
         # prevents a fluent text model from hallucinating a historical correction.
         revisions = self._reflect(session, source_index, use_llm=use_llm)
-        self._save(session)
         return {
-            "session": session.as_dict(),
             "revisions": revisions,
             "actions": [item.action for item in hypotheses],
             "integrations": {"source": source},
@@ -1128,13 +1165,8 @@ class ReTraceService:
         session.revision_events.append(event)
         return asdict(event)
 
-    def _path(self, session_id: str) -> Path:
-        return self.storage_dir / f"{session_id}.json"
-
     def _load(self, session_id: str) -> Session:
-        path = self._path(session_id)
-        return Session.from_dict(json.loads(path.read_text())) if path.exists() else Session(session_id)
+        return self.repository.load(session_id)
 
-    def _save(self, session: Session) -> None:
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
-        self._path(session.session_id).write_text(json.dumps(session.as_dict(), ensure_ascii=False, indent=2))
+    def _save(self, session: Session, expected_version: int) -> Session:
+        return self.repository.commit(session, expected_version)
