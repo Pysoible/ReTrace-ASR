@@ -43,17 +43,49 @@ class ContextJudgment:
     beliefs: list[BeliefProposal] = field(default_factory=list)
 
 
+def _as_list(value: Any) -> list[Any]:
+    """Model JSON often returns null for empty arrays; coerce before iterating."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    raise ValueError(f"expected list or null, got {type(value).__name__}")
+
+
+def _focus_from_raw(item: Any) -> FocusProposal:
+    if isinstance(item, FocusProposal):
+        return item
+    if not isinstance(item, dict):
+        raise ValueError(f"focus item must be an object, got {type(item).__name__}")
+    raw = dict(item)
+    raw["alternatives"] = _as_list(raw.get("alternatives"))
+    raw["evidence_turn_ids"] = _as_list(raw.get("evidence_turn_ids"))
+    raw.setdefault("rationale", "")
+    raw.setdefault("relationship", "MUTUALLY_EXCLUSIVE")
+    return FocusProposal(**raw)
+
+
+def _belief_from_raw(item: Any) -> BeliefProposal:
+    if isinstance(item, BeliefProposal):
+        return item
+    if not isinstance(item, dict):
+        raise ValueError(f"belief item must be an object, got {type(item).__name__}")
+    raw = dict(item)
+    raw["aliases"] = _as_list(raw.get("aliases"))
+    raw["evidence_turn_ids"] = _as_list(raw.get("evidence_turn_ids"))
+    return BeliefProposal(**raw)
+
+
 def normalize_judgment(value: ContextJudgment | dict[str, Any], session: Session) -> ContextJudgment:
     if isinstance(value, dict):
-        focus = [item if isinstance(item, FocusProposal) else FocusProposal(**item) for item in value.get("focus", [])]
-        beliefs = [
-            item if isinstance(item, BeliefProposal) else BeliefProposal(**item)
-            for item in value.get("beliefs", [])
-        ]
+        # Some gateways return "label" instead of the protocol field "outcome".
+        outcome = value.get("outcome", value.get("label", "UNCERTAIN"))
+        focus = [_focus_from_raw(item) for item in _as_list(value.get("focus"))]
+        beliefs = [_belief_from_raw(item) for item in _as_list(value.get("beliefs"))]
         value = ContextJudgment(
-            outcome=str(value.get("outcome", "UNCERTAIN")).upper(),
-            confidence=float(value.get("confidence", 0.0)),
-            rationale=str(value.get("rationale", "")),
+            outcome=str(outcome or "UNCERTAIN").upper(),
+            confidence=float(value.get("confidence") or 0.0),
+            rationale=str(value.get("rationale") or ""),
             focus=focus,
             beliefs=beliefs,
         )
@@ -70,12 +102,13 @@ def normalize_judgment(value: ContextJudgment | dict[str, Any], session: Session
             raise ValueError(f"focus span is not present in target turn: {item.span!r}")
         if not item.proposed_text or item.proposed_text == item.span:
             raise ValueError("proposed_text must be non-empty and different from span")
-        item.alternatives = list(dict.fromkeys(str(candidate) for candidate in item.alternatives if str(candidate)))
+        item.alternatives = list(dict.fromkeys(str(candidate) for candidate in _as_list(item.alternatives) if str(candidate)))
         if item.span not in item.alternatives or item.proposed_text not in item.alternatives:
             raise ValueError("alternatives must contain both current and proposed text")
+        item.evidence_turn_ids = [str(turn_id) for turn_id in _as_list(item.evidence_turn_ids)]
         if any(turn_id not in turns for turn_id in item.evidence_turn_ids):
             raise ValueError("focus references an unknown evidence turn")
-        item.relationship = item.relationship.upper()
+        item.relationship = (item.relationship or "MUTUALLY_EXCLUSIVE").upper()
         if item.relationship not in FOCUS_RELATIONSHIPS:
             raise ValueError(f"invalid focus relationship: {item.relationship}")
     for belief in value.beliefs:
@@ -85,7 +118,8 @@ def normalize_judgment(value: ContextJudgment | dict[str, Any], session: Session
         if not belief.subject or not belief.predicate or not belief.value:
             raise ValueError("belief subject, predicate and value are required")
         belief.confidence = min(1.0, max(0.0, float(belief.confidence)))
-        belief.aliases = list(dict.fromkeys(item.strip() for item in belief.aliases if item.strip()))
+        belief.aliases = list(dict.fromkeys(item.strip() for item in _as_list(belief.aliases) if item and str(item).strip()))
+        belief.evidence_turn_ids = [str(turn_id) for turn_id in _as_list(belief.evidence_turn_ids)]
         if any(turn_id not in turns for turn_id in belief.evidence_turn_ids):
             raise ValueError("belief references an unknown evidence turn")
     if value.outcome in {"CONSISTENT", "NOVEL"} and value.focus:

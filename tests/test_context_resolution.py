@@ -58,6 +58,33 @@ def test_context_judgment_carries_grounded_working_beliefs():
     assert normalized.beliefs[0].value == "涂博士"
 
 
+def test_normalize_judgment_accepts_null_arrays_and_label_alias():
+    """DeepSeek sometimes returns focus/beliefs=null and uses label instead of outcome."""
+    session = Session("s", turns=[Turn("t1", "今天和涂博士讨论泰康方案", "今天和涂博士讨论泰康方案")])
+    normalized = normalize_judgment(
+        {
+            "label": "NOVEL",
+            "confidence": 0.8,
+            "focus": None,
+            "beliefs": [
+                {
+                    "subject": "user",
+                    "predicate": "讨论",
+                    "value": "泰康方案",
+                    "aliases": None,
+                    "confidence": 0.8,
+                    "evidence_turn_ids": ["t1"],
+                }
+            ],
+        },
+        session,
+    )
+
+    assert normalized.outcome == "NOVEL"
+    assert normalized.focus == []
+    assert normalized.beliefs[0].aliases == []
+
+
 def test_context_judgment_rejects_ungrounded_belief_evidence():
     session = Session("s", turns=[Turn("t1", "测试", "测试")])
     judgment = ContextJudgment(
