@@ -186,8 +186,8 @@ def _extract_json_object(raw: str) -> Any | None:
     return None
 
 
-def _is_garbage_transcript(text: str) -> bool:
-    """Reject diarization/schema dumps and degenerate loops."""
+def _is_invalid_transcript(text: str) -> bool:
+    """Reject empty/schema output while preserving loops for auditable recovery."""
     cleaned = (text or "").strip()
     if not cleaned:
         return True
@@ -195,16 +195,6 @@ def _is_garbage_transcript(text: str) -> bool:
         return True
     if "start_time" in cleaned and "end_time" in cleaned and "label" in cleaned:
         return True
-    if re.fullmatch(r"(.)\1{5,}", cleaned.replace(" ", "")):
-        return True
-    # heavy repetition of a short token, e.g. 瑶龙瑶龙瑶龙...
-    compact = re.sub(r"\s+", "", cleaned)
-    if len(compact) >= 8:
-        for width in (2, 3, 4):
-            token = compact[:width]
-            if token and compact == token * (len(compact) // width) + compact[:(len(compact) % width)]:
-                if compact.count(token) >= 4:
-                    return True
     return False
 
 
@@ -244,13 +234,13 @@ def parse_observation(raw: str) -> dict[str, Any]:
     payload = _extract_json_object(raw)
     if isinstance(payload, dict) and isinstance(payload.get("text"), str):
         text = payload["text"].strip()
-        if _is_garbage_transcript(text):
+        if _is_invalid_transcript(text):
             return {"text": "", "uncertainty": {}}
         uncertainty = _parse_uncertain_spans(text, payload.get("uncertain_spans"))
         return {"text": text, "uncertainty": uncertainty}
 
     text = _strip_code_fence(raw)
-    if _is_garbage_transcript(text):
+    if _is_invalid_transcript(text):
         return {"text": "", "uncertainty": {}}
     return {"text": text, "uncertainty": {}}
 

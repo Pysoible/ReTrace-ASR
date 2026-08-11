@@ -21,6 +21,12 @@ def test_parse_observation_rejects_diarization_json_dump():
     assert result["text"] == ""
 
 
+def test_parse_observation_preserves_degenerate_loop_for_auditable_recovery():
+    result = parse_observation('{"text":"啊啊啊啊啊啊啊啊","uncertain_spans":[]}')
+
+    assert result["text"] == "啊啊啊啊啊啊啊啊"
+
+
 def test_parse_uncertainty_tags_against_fixed_text():
     text = "首先知道大家用的是什么品牌威沃"
     raw = '{"uncertain_spans":[{"span":"威沃","candidates":["威沃","vivo"],"confidence":0.3}]}'

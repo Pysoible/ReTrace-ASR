@@ -1,6 +1,7 @@
 """Agent-first orchestration for realtime, revisable ASR sessions."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Callable
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -10,6 +11,7 @@ from asr_agent.context_judge import (
     ContextJudgment,
     normalize_judgment,
 )
+from asr_agent.degeneration import DegenerationAssessment, assess_transcript, should_replace_degenerate
 from asr_agent.ledger import RevisionLedger
 from asr_agent.memory import LongTermMemoryRepository, MemoryConsolidator, MemoryRetriever
 from asr_agent.models import (
@@ -25,6 +27,7 @@ from asr_agent.storage import SessionRepository, VersionConflict
 
 
 ContextJudge = Callable[..., ContextJudgment | dict[str, Any]]
+AudioRetranscriber = Callable[..., dict[str, Any]]
 
 
 class ReTraceService:
@@ -36,6 +39,7 @@ class ReTraceService:
         *,
         context_judge: ContextJudge | None = None,
         audio_verifier: Callable[..., dict[str, Any]] | None = None,
+        audio_retranscriber: AudioRetranscriber | None = None,
         resolver: EvidenceResolver | None = None,
         memory_dir: Path | None = None,
     ) -> None:
@@ -50,6 +54,11 @@ class ReTraceService:
             context_judge = judge_context
         self.context_judge = context_judge
         self.resolver = resolver or EvidenceResolver(audio_verifier=audio_verifier)
+        if audio_retranscriber is None:
+            from asr_agent.integrations.audio_verifier import retranscribe_window
+
+            audio_retranscriber = retranscribe_window
+        self.audio_retranscriber = audio_retranscriber
         self.memory_consolidator = MemoryConsolidator(
             self.long_term_memory,
             confidence_threshold=self.resolver.policy.thresholds.long_memory,
@@ -125,15 +134,28 @@ class ReTraceService:
                     "session": snapshot.as_dict(),
                 }
             snapshot.analysis_status = "analyzing"
+            recovery_event, degeneration = self._recover_degenerate_turn(
+                snapshot,
+                trigger,
+                observed_version=observed_version,
+            )
+            if recovery_event is not None:
+                trigger.current_text = recovery_event.after_text
             memory = self.memory_retriever.retrieve(snapshot, trigger)
-            try:
-                raw_judgment = self.context_judge(session=snapshot, current_turn=trigger, memory=memory)
-                judgment = normalize_judgment(raw_judgment, snapshot)
-            except Exception as exc:
-                judgment = ContextJudgment("UNCERTAIN", rationale=f"context judge unavailable: {exc}")
+            if degeneration.degenerate and recovery_event is None:
+                judgment = ContextJudgment(
+                    "UNCERTAIN",
+                    rationale="first-pass transcript is degenerate and audio re-transcription did not recover it",
+                )
+            else:
+                try:
+                    raw_judgment = self.context_judge(session=snapshot, current_turn=trigger, memory=memory)
+                    judgment = normalize_judgment(raw_judgment, snapshot)
+                except Exception as exc:
+                    judgment = ContextJudgment("UNCERTAIN", rationale=f"context judge unavailable: {exc}")
 
             self._apply_beliefs(snapshot, judgment.beliefs)
-            events: list[RevisionEvent] = []
+            events: list[RevisionEvent] = [recovery_event] if recovery_event is not None else []
             audit_events: list[RevisionEvent] = []
             deferred = judgment.outcome == "UNCERTAIN" and not judgment.focus
             if not judgment.focus:
@@ -296,6 +318,78 @@ class ReTraceService:
                 "session": committed.as_dict(),
             }
         raise VersionConflict("analysis could not commit after retries")
+
+    def _recover_degenerate_turn(
+        self,
+        session: Session,
+        turn: Turn,
+        *,
+        observed_version: int | None,
+    ) -> tuple[RevisionEvent | None, DegenerationAssessment]:
+        meta = turn.meta
+        start_sec, end_sec = meta.get("start_sec"), meta.get("end_sec")
+        duration = None
+        if start_sec is not None and end_sec is not None:
+            duration = max(0.0, float(end_sec) - float(start_sec))
+        assessment = assess_transcript(turn.raw_text, duration_sec=duration)
+        meta["degeneration"] = {
+            "detected": assessment.degenerate,
+            "score": assessment.score,
+            "reasons": list(assessment.reasons),
+            "recovered": False,
+        }
+        if not assessment.degenerate:
+            return None, assessment
+
+        audio_path = meta.get("audio_path")
+        if not audio_path or start_sec is None or end_sec is None:
+            meta["degeneration"]["error"] = "historical audio unavailable"
+            return None, assessment
+        try:
+            result = self.audio_retranscriber(
+                audio_path=str(audio_path),
+                start_sec=float(start_sec),
+                end_sec=float(end_sec),
+            )
+        except Exception as exc:
+            meta["degeneration"]["error"] = f"audio re-transcription failed: {exc}"
+            return None, assessment
+
+        payload = result if isinstance(result, dict) else {}
+        candidate = str(payload.get("text") or "").strip() if payload.get("ok") else ""
+        candidate_assessment = assess_transcript(candidate, duration_sec=duration)
+        meta["degeneration"]["candidate_score"] = candidate_assessment.score
+        meta["degeneration"]["candidate_reasons"] = list(candidate_assessment.reasons)
+        if not candidate or not should_replace_degenerate(assessment, candidate_assessment):
+            meta["degeneration"]["error"] = str(payload.get("error") or "re-transcription did not improve quality")
+            return None, assessment
+
+        prefix_match = re.match(r"^(\[\d+(?:\.\d+)?-\d+(?:\.\d+)?\]\s*)", turn.raw_text)
+        after_text = f"{prefix_match.group(1) if prefix_match else ''}{candidate}"
+        meta["degeneration"]["recovered"] = True
+        meta["degeneration"]["replacement"] = candidate
+        reasons = ",".join(assessment.reasons) or "degenerate transcript"
+        return RevisionEvent(
+            event_id=self._event_id(
+                session.session_id,
+                turn.turn_id,
+                observed_version,
+                "REVISE_CURRENT",
+                "degeneration",
+            ),
+            action="REVISE_CURRENT",
+            target_turn_id=turn.turn_id,
+            source_turn_id=turn.turn_id,
+            span=turn.raw_text,
+            before_text=turn.raw_text,
+            after_text=after_text,
+            entity_id=None,
+            score=max(0.0, min(1.0, assessment.score - candidate_assessment.score)),
+            evidence=[f"audio:{audio_path}:{start_sec}-{end_sec}", f"degeneration:{reasons}"],
+            resolver="audio-degeneration-recovery",
+            rationale=f"open re-transcription recovered first-pass degeneration ({reasons})",
+            replacement=after_text,
+        ), assessment
 
     def _observability(self, session: Session) -> dict[str, Any]:
         if not session.turns:

@@ -33,6 +33,64 @@ def test_observation_keeps_raw_text_immutable(tmp_path):
     assert turn["current_text"] == "图博士来了"
 
 
+def test_agent_retranscribes_an_obviously_degenerate_current_turn(tmp_path):
+    calls = []
+
+    def retranscribe(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "text": "我们下周一开始进行项目验收"}
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=lambda **_: ContextJudgment("CONSISTENT", 0.9),
+        audio_retranscriber=retranscribe,
+    )
+
+    result = service.process_turn(
+        "s",
+        "t1",
+        "啊啊啊啊啊啊啊啊",
+        source="qwen-omni",
+        meta={"audio_path": "/tmp/meeting.wav", "start_sec": 10.0, "end_sec": 17.0},
+    )
+
+    turn = result["session"]["turns"][0]
+    revision = result["revisions"][0]
+    assert turn["raw_text"] == "啊啊啊啊啊啊啊啊"
+    assert turn["current_text"] == "我们下周一开始进行项目验收"
+    assert revision["action"] == "REVISE_CURRENT"
+    assert revision["resolver"] == "audio-degeneration-recovery"
+    assert calls == [{"audio_path": "/tmp/meeting.wav", "start_sec": 10.0, "end_sec": 17.0}]
+
+
+def test_degenerate_turn_does_not_enter_context_memory_when_rereading_fails(tmp_path):
+    judge_called = False
+
+    def judge(**_):
+        nonlocal judge_called
+        judge_called = True
+        return ContextJudgment("NOVEL", 0.9)
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=judge,
+        audio_retranscriber=lambda **_: {"ok": False, "error": "model unavailable"},
+    )
+
+    result = service.process_turn(
+        "s",
+        "t1",
+        "项目项目项目项目项目项目",
+        source="qwen-omni",
+        meta={"audio_path": "/tmp/meeting.wav", "start_sec": 0.0, "end_sec": 8.0},
+    )
+
+    assert judge_called is False
+    assert result["status"] == "deferred"
+    assert result["revisions"] == []
+    assert result["session"]["turns"][0]["current_text"] == "项目项目项目项目项目项目"
+
+
 def test_agent_can_revise_history_when_new_context_and_audio_agree(tmp_path):
     service = ReTraceService(
         tmp_path,
