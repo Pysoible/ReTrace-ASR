@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from asr_agent.integrations.deepseek import deepseek_status
-from asr_agent.integrations.qwen_asr import asr_status, preload_engine, transcribe_audio
+from asr_agent.integrations.qwen_asr import asr_status, preload_engine, shutdown_engines, transcribe_audio
 from asr_agent.realtime import RealtimeAnalysisCoordinator
 from asr_agent.retrace import ReTraceService
 
@@ -83,6 +83,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         yield
+        shutdown_engines()
         coordinator.close()
 
     app = FastAPI(title="ReTrace-ASR", lifespan=lifespan)

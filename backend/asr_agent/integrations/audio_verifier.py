@@ -83,17 +83,16 @@ def _crop_audio(audio_path: str, start_sec: float, end_sec: float):
 
 def _qwen_runner(*, audio_path: str, start_sec: float, end_sec: float, candidates: list[str]) -> dict[str, Any]:
     """Ask Qwen-Omni to compare a closed candidate set over a cropped audio window."""
-    from asr_agent.integrations.qwen_asr import _engine, _infer_one
+    from asr_agent.integrations.qwen_asr import _infer_one_audio
 
     clipped = _crop_audio(audio_path, start_sec, end_sec)
     try:
-        engine, request_config = _engine()
         prompt = (
             "Listen only to this audio and compare the supplied transcript candidates. "
             "Return strict JSON {\"scores\":{candidate:number,...}} with every and only supplied candidate. "
             f"Candidates: {json.dumps(candidates, ensure_ascii=False)}"
         )
-        raw = _infer_one(engine, request_config, clipped, prompt)
+        raw = _infer_one_audio(clipped, prompt)
     finally:
         clipped.unlink(missing_ok=True)
     try:
@@ -107,12 +106,11 @@ def _qwen_runner(*, audio_path: str, start_sec: float, end_sec: float, candidate
 
 def _qwen_retranscribe_runner(*, audio_path: str, start_sec: float, end_sec: float) -> dict[str, Any]:
     """Open re-ASR over a cropped window — used when the first-pass transcript is degenerate."""
-    from asr_agent.integrations.qwen_asr import _PLAIN_PROMPT, _engine, _infer_one
+    from asr_agent.integrations.qwen_asr import _PLAIN_PROMPT, _infer_one_audio
 
     clipped = _crop_audio(audio_path, start_sec, end_sec)
     try:
-        engine, request_config = _engine()
-        text = _infer_one(engine, request_config, clipped, _PLAIN_PROMPT)
+        text = _infer_one_audio(clipped, _PLAIN_PROMPT)
     finally:
         clipped.unlink(missing_ok=True)
     return {"text": text}
