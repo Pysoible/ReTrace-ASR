@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from asr_agent.integrations.audio_chunk import (
     cleanup_chunks,
@@ -554,6 +554,112 @@ def _enrich_uncertainty(engine, request_config, chunk_path: Path, text: str, unc
     return uncertainty if uncertainty else {"confidence": {}, "text_candidates": {}}
 
 
+def _acoustic_disagreement_enabled() -> bool:
+    return _truthy(os.getenv("ASR_ACOUSTIC_DISAGREEMENT"))
+
+
+def _attach_acoustic_disagreement(chunk_path: Path, text: str, uncertainty: dict[str, Any]) -> dict[str, Any]:
+    """Run a second independent ASR (paraformer) and attach spans where the two
+    acoustic models disagree — a genuine acoustic-uncertainty signal that is
+    independent of the LLM judge and of Qwen's self-reported confidence."""
+    if not _acoustic_disagreement_enabled() or not text:
+        return uncertainty
+    try:
+        from asr_agent.integrations import acoustic  # local import to avoid cycles
+
+        disagreements = acoustic.detect_asr_disagreement(chunk_path, text)
+    except Exception:
+        return uncertainty
+    if disagreements:
+        uncertainty = dict(uncertainty)
+        uncertainty["acoustic_disagreement"] = disagreements
+    return uncertainty
+
+
+def _infer_chunks_streaming(
+    chunk_paths: list[Path],
+    prompt: str,
+    on_chunk: Callable[[int, str], None],
+) -> None:
+    """Transcribe chunks across GPUs, invoking on_chunk(index, raw) as soon as
+    each chunk finishes so the caller can stream results incrementally."""
+    workers = _engines()
+    shards = shard_indices(len(chunk_paths), len(workers))
+
+    def _run(worker: Any, indices: list[int]) -> None:
+        for index in indices:
+            try:
+                raw = worker.infer_one(chunk_paths[index], prompt)
+            except Exception:
+                raw = ""
+            on_chunk(index, raw)
+
+    with ThreadPoolExecutor(max_workers=max(1, len(workers))) as pool:
+        futures = [
+            pool.submit(_run, worker, indices)
+            for worker, indices in zip(workers, shards)
+            if indices
+        ]
+        for future in as_completed(futures):
+            future.result()
+
+
+def stream_transcribe_audio(
+    audio: str,
+    on_chunk: Callable[[int, str, dict[str, Any], dict[str, Any]], None],
+) -> dict[str, Any]:
+    """Streaming Qwen-Omni ASR: split the audio, transcribe chunks across all GPUs
+    and call ``on_chunk(index, text, uncertainty, chunk_meta)`` as soon as each
+    chunk's transcript is ready (dual-GPU parallel)."""
+    audio = (audio or "").strip()
+    if not audio:
+        raise RuntimeError("需要音频路径 audio")
+
+    cfg = read_asr_config()
+    path = _resolve_audio(audio, cfg)
+    if path is None:
+        raise RuntimeError(f"找不到音频文件: {audio}（绝对路径，或相对 ASR_AUDIO_DIR={cfg.audio_dir}）")
+
+    _engines()
+    chunk_info = split_audio_file(path, read_chunk_config())
+    chunk_paths = [Path(item["path"]) for item in chunk_info["chunks"]]
+    chunk_meta = [
+        {
+            "index": item["index"],
+            "start_sec": item["start_sec"],
+            "end_sec": item["end_sec"],
+        }
+        for item in chunk_info["chunks"]
+    ]
+
+    def _finish(index: int, raw: str) -> None:
+        observation = parse_observation(raw)
+        text = str(observation.get("text") or "")
+        if not text:
+            try:
+                plain = _infer_one_audio(chunk_paths[index], _PLAIN_PROMPT)
+                observation = parse_observation(plain)
+            except Exception:
+                pass
+        text = str(observation.get("text") or "")
+        uncertainty = dict(observation.get("uncertainty") or {})
+        uncertainty = _attach_acoustic_disagreement(chunk_paths[index], text, uncertainty)
+        on_chunk(index, text, uncertainty, chunk_meta[index])
+
+    try:
+        _infer_chunks_streaming(chunk_paths, _OBS_PROMPT, _finish)
+    finally:
+        cleanup_chunks(chunk_info)
+    return {
+        "ok": True,
+        "audio": str(path),
+        "chunk_count": int(chunk_info.get("chunk_count") or len(chunk_paths)),
+        "duration_sec": chunk_info.get("duration_sec"),
+        "chunked": bool(chunk_info.get("chunked")),
+        "chunks": chunk_meta,
+    }
+
+
 def transcribe_audio(audio: str) -> dict[str, Any]:
     """Single-pass Qwen-Omni ASR for chunked conversational observations."""
     audio = (audio or "").strip()
@@ -614,6 +720,11 @@ def transcribe_audio(audio: str) -> dict[str, Any]:
                 chunk_paths[index],
                 str(observation.get("text") or ""),
                 dict(observation.get("uncertainty") or {}),
+            )
+            observation["uncertainty"] = _attach_acoustic_disagreement(
+                chunk_paths[index],
+                str(observation.get("text") or ""),
+                observation["uncertainty"],
             )
 
         parts = [str(item.get("text") or "") for item in observations]

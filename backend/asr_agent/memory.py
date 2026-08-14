@@ -159,7 +159,14 @@ class MemoryConsolidator:
                     merged.evidence_kinds = list(dict.fromkeys([*merged.evidence_kinds, *candidate.evidence_kinds]))
                     merged.confidence = max(merged.confidence, candidate.confidence)
                     merged.updated_version = max(merged.updated_version, candidate.updated_version)
-                independently_supported = len(set(merged.source_session_ids)) >= 2
+                # A belief is independently supported when it is corroborated across
+                # sessions OR across distinct turns within the same long-audio session.
+                # (A single 20-minute audio is one session, so cross-session-only would
+                # never promote anything — multi-turn agreement is equally strong.)
+                independently_supported = (
+                    len(set(merged.source_session_ids)) >= 2
+                    or len(set(merged.source_turn_ids)) >= 2
+                )
                 audio_verified = "audio_verified" in merged.evidence_kinds
                 if merged.confidence < self.confidence_threshold or not (independently_supported or audio_verified):
                     merged.status = "provisional"

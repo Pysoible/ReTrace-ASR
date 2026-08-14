@@ -102,6 +102,10 @@ let selectedEventId = '';
 let memoryView: 'short' | 'long' = 'short';
 let status = '等待新的 ASR observation。';
 let busy = false;
+let liveEventSource: EventSource | null = null;
+let liveStreamSession = '';
+// Panel collapse state: keyed by panel name, expanded by default.
+let collapsedPanels: Record<string, boolean> = {};
 
 const decisionActions = ['KEEP_OLD', 'ACCEPT_NEW', 'COEXIST', 'DEFER', 'REVISE_CURRENT', 'REVISE_HISTORY', 'ROLLBACK'];
 const relationshipLabels: Record<string, string> = {
@@ -287,8 +291,10 @@ function renderMemory(): string {
   }
   const recent = short?.recent_turns ?? [];
   const dependent = short?.dependent_turns ?? [];
-  const beliefs = short?.working_beliefs ?? Object.values(session?.working_beliefs ?? {});
-  const hypotheses = short?.open_hypotheses ?? Object.values(session?.open_hypotheses ?? {});
+  // Fall back to the raw session map when the observability array is empty,
+  // so WORKING BELIEFS is never misleadingly shown as zero.
+  const beliefs = (short?.working_beliefs?.length ? short.working_beliefs : Object.values(session?.working_beliefs ?? {}));
+  const hypotheses = (short?.open_hypotheses?.length ? short.open_hypotheses : Object.values(session?.open_hypotheses ?? {}));
   return `${tabs}<div class="memory-content">
     <div class="memory-section-title"><b>RECENT CONTEXT</b><span>${recent.length}</span></div>
     ${recent.length ? `<div class="context-list">${recent.map((turn) => `<button data-context-turn="${escapeHtml(turn.turn_id)}"><span>${escapeHtml(turn.turn_id)}</span><p>${escapeHtml(stripTime(turn.current_text))}</p></button>`).join('')}</div>` : '<p class="compact-empty">尚无近期 turn。</p>'}
@@ -320,35 +326,43 @@ function render(): void {
     </section>
 
     <div class="workspace-grid">
-      <section class="workspace-panel transcript-panel">
-        <div class="panel-head"><div><span class="eyebrow">LIVE TRANSCRIPT</span><h2>时序字幕</h2></div><span>raw → current</span></div>
-        ${renderTurns()}
+      <section class="workspace-panel transcript-panel ${collapsedPanels.transcript ? 'collapsed' : ''}">
+        <div class="panel-head">
+          <div><span class="eyebrow">LIVE TRANSCRIPT</span><h2>时序字幕</h2></div>
+          <span class="panel-head-actions"><span>raw → current</span><button class="panel-toggle" data-toggle="transcript" title="${collapsedPanels.transcript ? '展开' : '收起'}">${collapsedPanels.transcript ? '▸' : '▾'}</button></span>
+        </div>
+        <div class="panel-body">${renderTurns()}</div>
       </section>
 
-      <section class="workspace-panel agent-panel">
-        <div class="panel-head"><div><span class="eyebrow">AGENT NOTE</span><h2>实时推理轨迹</h2></div><span>append-only audit</span></div>
-        ${renderAnalysis()}
-        ${renderMethodTrace()}
-        <div class="subsection-head"><b>DECISION DETAIL</b><span>${decisionActions.join(' · ')}</span></div>
-        ${renderDecision(selectedEvent())}
-        <div class="subsection-head"><b>EVENT LEDGER</b><span>${allEvents().length} events</span></div>
-        ${renderLedger()}
+      <section class="workspace-panel agent-panel ${collapsedPanels.agent ? 'collapsed' : ''}">
+        <div class="panel-head">
+          <div><span class="eyebrow">AGENT NOTE</span><h2>实时推理轨迹</h2></div>
+          <span class="panel-head-actions"><span>append-only audit</span><button class="panel-toggle" data-toggle="agent" title="${collapsedPanels.agent ? '展开' : '收起'}">${collapsedPanels.agent ? '▸' : '▾'}</button></span>
+        </div>
+        <div class="panel-body">${renderAnalysis()}
+          ${renderMethodTrace()}
+          <div class="subsection-head"><b>DECISION DETAIL</b><span>${decisionActions.join(' · ')}</span></div>
+          ${renderDecision(selectedEvent())}
+          <div class="subsection-head"><b>EVENT LEDGER</b><span>${allEvents().length} events</span></div>
+          ${renderLedger()}
+        </div>
       </section>
 
-      <aside class="workspace-panel memory-panel">
-        <div class="panel-head"><div><span class="eyebrow">MEMORY INSPECTOR</span><h2>双时间尺度记忆</h2></div><span>read only</span></div>
-        ${renderMemory()}
+      <aside class="workspace-panel memory-panel ${collapsedPanels.memory ? 'collapsed' : ''}">
+        <div class="panel-head">
+          <div><span class="eyebrow">MEMORY INSPECTOR</span><h2>双时间尺度记忆</h2></div>
+          <span class="panel-head-actions"><span>read only</span><button class="panel-toggle" data-toggle="memory" title="${collapsedPanels.memory ? '展开' : '收起'}">${collapsedPanels.memory ? '▸' : '▾'}</button></span>
+        </div>
+        <div class="panel-body">${renderMemory()}</div>
       </aside>
     </div>
 
     <section class="observation">
-      <div class="composer-copy"><span class="eyebrow">QWEN-OMNI AUDIO INPUT</span><h2>追加实时 observation</h2><p>音频或文本进入同一自动分析队列，无需用户确认。</p></div>
+      <div class="composer-copy"><span class="eyebrow">QWEN-OMNI AUDIO INPUT</span><h2>音频输入</h2><p>上传音频后实时转写并自动分析，每个 turn 完成后即时显示。</p></div>
       <div class="input-stack">
         <label><span>Session ID</span><input id="session" value="${escapeHtml(session?.session_id || 'demo')}" aria-label="Session ID"></label>
         <label class="file-field"><span>Audio file</span><input id="audio" type="file" accept="audio/*" aria-label="Audio file"></label>
         <button id="submit-audio" class="secondary-command" ${busy ? 'disabled' : ''}>Transcribe audio</button>
-        <label class="text-field"><span>ASR observation</span><textarea id="text" placeholder="输入最新 ASR 文本，Agent 将结合上下文自动判断" aria-label="ASR observation"></textarea></label>
-        <button id="submit-text" class="primary-command" ${busy ? 'disabled' : ''}>Append observation</button>
         <p class="status-line"><span class="status-dot ${busy ? 'busy' : ''}"></span>${escapeHtml(status)}</p>
       </div>
     </section>
@@ -366,6 +380,12 @@ function render(): void {
     selectedTurnId = selected?.target_turn_id || selectedTurnId;
     render();
   }));
+  document.querySelectorAll<HTMLButtonElement>('[data-toggle]').forEach((button) => button.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const name = button.dataset.toggle || '';
+    collapsedPanels[name] = !collapsedPanels[name];
+    render();
+  }));
   document.querySelectorAll<HTMLButtonElement>('[data-memory]').forEach((button) => button.addEventListener('click', () => {
     memoryView = button.dataset.memory === 'long' ? 'long' : 'short';
     render();
@@ -375,53 +395,28 @@ function render(): void {
     selectedEventId = '';
     render();
   }));
-  document.querySelector<HTMLButtonElement>('#submit-text')?.addEventListener('click', submitText);
   document.querySelector<HTMLButtonElement>('#submit-audio')?.addEventListener('click', submitAudio);
 }
 
-async function waitForAnalysis(sessionId: string): Promise<Session> {
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    await new Promise((resolve) => window.setTimeout(resolve, 100));
-    const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`);
-    if (!response.ok) throw new Error(await response.text());
-    const current = (await response.json()).session as Session;
-    if (current.analysis_status !== 'queued' && current.analysis_status !== 'analyzing') return current;
-  }
-  throw new Error('analysis timeout');
+async function refreshSession(sessionId: string): Promise<Session> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`);
+  if (!response.ok) throw new Error(await response.text());
+  return (await response.json()).session as Session;
 }
 
-async function submitText(): Promise<void> {
-  const sessionId = document.querySelector<HTMLInputElement>('#session')!.value.trim() || 'demo';
-  const text = document.querySelector<HTMLTextAreaElement>('#text')!.value.trim();
-  if (!text) return;
-  busy = true;
-  status = 'Observation queued · analyzing context…';
-  render();
-  try {
-    const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/turns`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ turn_id: `t${Date.now()}`, text }),
-    });
-    if (!response.ok) throw new Error(await response.text());
-    session = await waitForAnalysis(sessionId);
-    selectedTurnId = session.turns.at(-1)?.turn_id || '';
-    selectedEventId = allEvents().at(-1)?.event_id || '';
-    status = session.analysis_status === 'deferred' ? '证据不足，假设已自动保留等待后续信息。' : '上下文分析完成。';
-  } catch (error) {
-    status = `请求失败：${error instanceof Error ? error.message : String(error)}`;
-  } finally {
-    busy = false;
-    render();
-  }
+function closeLiveStream(): void {
+  liveEventSource?.close();
+  liveEventSource = null;
+  liveStreamSession = '';
 }
 
 async function submitAudio(): Promise<void> {
   const sessionId = document.querySelector<HTMLInputElement>('#session')!.value.trim() || 'auto';
   const file = document.querySelector<HTMLInputElement>('#audio')!.files?.[0];
   if (!file) return;
+  closeLiveStream();
   busy = true;
-  status = '音频识别与上下文分析进行中…';
+  status = '音频上传中…';
   render();
   try {
     const form = new FormData();
@@ -429,13 +424,71 @@ async function submitAudio(): Promise<void> {
     const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/audio/upload`, { method: 'POST', body: form });
     if (!response.ok) throw new Error(await response.text());
     const body = await response.json();
-    session = body.session as Session;
-    selectedTurnId = session.turns.at(-1)?.turn_id || '';
-    selectedEventId = allEvents().at(-1)?.event_id || '';
-    status = `${body.turn_count} turns · ${transcriptEvents().length} revisions。`;
+    const boundSession = (body.session_id as string) || sessionId;
+    liveStreamSession = boundSession;
+    status = '音频已上传 · 正在实时转写与分析，每个 turn 完成后即时显示…';
+    busy = false;
+    render();
+
+    const es = new EventSource(`/api/sessions/${encodeURIComponent(boundSession)}/events`);
+    liveEventSource = es;
+    es.onmessage = async (event) => {
+      let payload: any;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (payload.type === 'session') {
+        status = '正在切分并转写音频…';
+        render();
+        return;
+      }
+      if (payload.type === 'asr_done') {
+        status = `音频转写完成（${payload.chunk_count ?? ''} 段），正在逐句分析上下文…`;
+        render();
+        return;
+      }
+      if (payload.type === 'turn') {
+        try {
+          session = payload.session ?? (await refreshSession(boundSession));
+        } catch {
+          /* keep last session */
+        }
+        selectedTurnId = payload.turn_id || session?.turns.at(-1)?.turn_id || '';
+        selectedEventId = allEvents().at(-1)?.event_id || '';
+        status = `已处理 ${session?.turns.length ?? payload.index + 1} 个 turn · 持续分析中…`;
+        render();
+        return;
+      }
+      if (payload.type === 'done') {
+        try {
+          session = payload.session ?? (await refreshSession(boundSession));
+        } catch {
+          /* keep last session */
+        }
+        closeLiveStream();
+        selectedTurnId = session?.turns.at(-1)?.turn_id || '';
+        selectedEventId = allEvents().at(-1)?.event_id || '';
+        status = `完成：${session?.turns.length ?? 0} turns · ${transcriptEvents().length} revisions。`;
+        busy = false;
+        render();
+        return;
+      }
+      if (payload.type === 'error') {
+        status = `处理出错：${String(payload.message ?? '未知错误')}`;
+        closeLiveStream();
+        busy = false;
+        render();
+      }
+    };
+    es.onerror = () => {
+      // EventSource auto-reconnects; only surface a message once the stream ends.
+      if (!liveStreamSession) return;
+    };
   } catch (error) {
+    closeLiveStream();
     status = `音频处理失败：${error instanceof Error ? error.message : String(error)}`;
-  } finally {
     busy = false;
     render();
   }

@@ -132,3 +132,42 @@ def test_development_threshold_selection_prefers_recall_under_error_cap():
     assert selected.threshold == 0.70
     assert selected.recall == 1.0
     assert selected.source == "development"
+
+
+def test_resolver_refuses_a_name_swap_when_both_words_are_already_in_the_turn():
+    """Guard against "时候" → "狮子狗" false positives: when the proposed
+    replacement already appears elsewhere in the same raw turn (and the span is
+    a normal word), a closed-set verifier listening to the whole window is
+    misled — refuse the swap rather than risk an absurd revision."""
+    target = Turn("t1", "狮子狗刚出的的时候，它不就是就是刚进去", "狮子狗刚出的的时候，它不就是就是刚进去",
+                  meta={"audio_path": "/tmp/fake.wav", "start_sec": 0, "end_sec": 1})
+    source = Turn("t2", "狮子狗刚出的的时候", "狮子狗刚出的的时候")
+    session = Session("s", turns=[target, source])
+    focus = FocusProposal("t1", "时候", "狮子狗", ["时候", "狮子狗"], ["t2"])
+
+    resolver = EvidenceResolver(
+        audio_verifier=lambda **_: {"ok": True, "scores": {"时候": 0.04, "狮子狗": 0.96}}
+    )
+
+    result = resolver.resolve(session, source, focus, context_confidence=0.9)
+
+    assert result.action == "DEFER"
+    assert "already appears elsewhere" in result.rationale
+
+
+def test_resolver_still_revises_when_proposed_is_not_already_in_the_turn():
+    """The guard must not block legitimate revisions where the proposed word is
+    genuinely new (e.g. 图博士 → 涂博士 when 涂博士 never occurred before)."""
+    target = Turn("t1", "图博士来了", "图博士来了", meta={"audio_path": "/tmp/fake.wav", "start_sec": 0, "end_sec": 1})
+    source = Turn("t2", "负责人涂博士到了", "负责人涂博士到了")
+    session = Session("s", turns=[target, source])
+    focus = FocusProposal("t1", "图博士", "涂博士", ["图博士", "涂博士"], ["t2"])
+
+    resolver = EvidenceResolver(
+        audio_verifier=lambda **_: {"ok": True, "scores": {"图博士": 0.1, "涂博士": 0.9}}
+    )
+
+    result = resolver.resolve(session, source, focus, context_confidence=0.95)
+
+    assert result.action == "REVISE_HISTORY"
+    assert result.replacement == "涂博士"

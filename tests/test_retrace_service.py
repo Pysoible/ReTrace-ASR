@@ -331,3 +331,105 @@ def test_service_restart_replays_projection_from_raw_and_ledger(tmp_path):
 
     assert restored["turns"][0]["raw_text"] == "图博士来了"
     assert restored["turns"][0]["current_text"] == "涂博士来了"
+
+
+def test_uncertain_relisten_is_rejected_when_hotword_biases_the_model(tmp_path):
+    """A relisten that merely differs (led astray by a stale domain hotword like
+    CS:GO) must NOT overwrite the first pass — it is the same ASR model and can
+    produce an even worse transcript (e.g. "C S go连加二" for a LoL clip)."""
+    def judge(**_):
+        return ContextJudgment("UNCERTAIN", 0.5)
+
+    retranscribe_calls = []
+
+    def retranscribe(**kwargs):
+        retranscribe_calls.append(kwargs)
+        return {"ok": True, "text": "C S go连加二，那这个英雄跟那个跟螳螂还是有有渊源呐，是吧？"}
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=judge,
+        audio_retranscriber=retranscribe,
+    )
+
+    result = service.process_turn(
+        "s",
+        "t1",
+        "[0.0-7.0] 这个连加额，那这个英雄跟那个跟螳螂还是有有渊源的是吧？",
+        source="qwen-omni",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0.0, "end_sec": 7.0},
+    )
+
+    turn = result["session"]["turns"][0]
+    assert turn["raw_text"] == "[0.0-7.0] 这个连加额，那这个英雄跟那个跟螳螂还是有有渊源的是吧？"
+    assert turn["current_text"] == "[0.0-7.0] 这个连加额，那这个英雄跟那个跟螳螂还是有有渊源的是吧？"
+    assert not [r for r in result["revisions"] if r["resolver"] == "audio-uncertainty-relisten"]
+    assert turn["meta"]["relisten_uncertain"]["rejected"]
+
+
+def test_uncertain_relisten_adopts_when_it_surfaces_a_remembered_entity(tmp_path):
+    """When the relisten actually recovers a remembered domain entity verbatim,
+    the revision is adopted (contextual biasing worked)."""
+    def judge(*, current_turn, **_):
+        if current_turn.turn_id == "t1":
+            return ContextJudgment(
+                "NOVEL",
+                0.91,
+                beliefs=[BeliefProposal("speaker", "mentions", "雷恩加尔", confidence=0.9, evidence_turn_ids=["t1"])],
+            )
+        return ContextJudgment("UNCERTAIN", 0.5)
+
+    def retranscribe(**kwargs):
+        return {"ok": True, "text": "对，这个雷恩加尔，那这个英雄跟那个螳螂还是很有渊源的，是吧？"}
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=judge,
+        audio_retranscriber=retranscribe,
+    )
+    service.process_turn("s", "t1", "我们聊一下雷恩加尔这个英雄")
+
+    result = service.process_turn(
+        "s",
+        "t2",
+        "[0.0-7.0] 这个连加额，那这个英雄跟那个跟螳螂还是有有渊源的是吧？",
+        source="qwen-omni",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0.0, "end_sec": 7.0},
+    )
+
+    turn = result["session"]["turns"][1]
+    assert turn["current_text"] == "对，这个雷恩加尔，那这个英雄跟那个螳螂还是很有渊源的，是吧？"
+    revision = [r for r in result["revisions"] if r["resolver"] == "audio-uncertainty-relisten"]
+    assert revision
+    assert revision[0]["action"] == "REVISE_CURRENT"
+    assert revision[0]["after_text"].startswith("[0.0-7.0]")
+
+
+def test_judge_tolerates_single_object_focus_from_model(tmp_path):
+    """A model returning "focus": {...} (single dict) instead of a list must not
+    fail the whole judgment — it should be treated as a one-element list."""
+    from asr_agent.context_judge import normalize_judgment
+
+    service = ReTraceService(tmp_path)
+    service.process_turn("s", "t1", "图博士来了")
+    service.process_turn("s", "t2", "负责人涂博士到了")
+
+    raw = {
+        "outcome": "CONFLICT",
+        "confidence": 0.9,
+        "rationale": "后文确认",
+        "focus": {
+            "target_turn_id": "t2",
+            "span": "涂博士",
+            "proposed_text": "图博士",
+            "alternatives": ["涂博士", "图博士"],
+            "evidence_turn_ids": ["t2"],
+            "relationship": "MUTUALLY_EXCLUSIVE",
+        },
+        "beliefs": [],
+    }
+    session = service.repository.load("s")
+    judgment = normalize_judgment(raw, session)
+    assert judgment.outcome == "CONFLICT"
+    assert len(judgment.focus) == 1
+    assert judgment.focus[0].proposed_text == "图博士"

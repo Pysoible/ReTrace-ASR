@@ -19,7 +19,7 @@ class PolicyThresholds:
     suspect: float = 0.45
     relisten: float = 0.55
     revise: float = 0.78
-    long_memory: float = 0.85
+    long_memory: float = 0.70
     audio_margin: float = 0.15
 
 

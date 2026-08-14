@@ -43,15 +43,25 @@ def retranscribe_window(
     end_sec: float,
     *,
     runner: Callable[..., dict[str, Any]] | None = None,
+    domain_hints: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Open-vocabulary re-ASR for a historical audio window (degenerate-turn recovery)."""
+    """Open-vocabulary re-ASR for a historical audio window (degenerate-turn recovery).
+
+    ``domain_hints`` are remembered domain terms (proper nouns) that are likely
+    to occur in this conversation. Passing them as hotwords helps the ASR model
+    prefer the correct proper noun over a mis-heard homophone — this is standard
+    contextual biasing. It is optional: re-ASR still works with no hints.
+    """
     if end_sec <= start_sec:
         return {"ok": False, "error": "need a valid audio window"}
     if not Path(audio_path).exists():
         return {"ok": False, "error": f"audio is unavailable: {audio_path}"}
     try:
         payload = (runner or _qwen_retranscribe_runner)(
-            audio_path=audio_path, start_sec=start_sec, end_sec=end_sec
+            audio_path=audio_path,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            domain_hints=domain_hints,
         )
     except Exception as exc:
         return {"ok": False, "error": f"audio retranscription failed: {exc}"}
@@ -104,13 +114,32 @@ def _qwen_runner(*, audio_path: str, start_sec: float, end_sec: float, candidate
         raise
 
 
-def _qwen_retranscribe_runner(*, audio_path: str, start_sec: float, end_sec: float) -> dict[str, Any]:
-    """Open re-ASR over a cropped window — used when the first-pass transcript is degenerate."""
+def _qwen_retranscribe_runner(
+    *,
+    audio_path: str,
+    start_sec: float,
+    end_sec: float,
+    domain_hints: list[str] | None = None,
+) -> dict[str, Any]:
+    """Open re-ASR over a cropped window — used when the first-pass transcript is degenerate.
+
+    ``domain_hints`` act as hotwords: remembered terms likely in this conversation.
+    They bias the ASR model toward the correct proper noun without constraining it
+    to a closed set.
+    """
     from asr_agent.integrations.qwen_asr import _PLAIN_PROMPT, _infer_one_audio
 
     clipped = _crop_audio(audio_path, start_sec, end_sec)
+    hints = [str(item).strip() for item in (domain_hints or []) if str(item).strip()]
+    prompt = _PLAIN_PROMPT
+    if hints:
+        prompt = (
+            "转写这段中文语音。只输出转写文本，不要输出 JSON、标签或解释。"
+            "本对话中可能出现以下专有名词，请优先识别为正确的名称："
+            f"{'、'.join(hints[:20])}。"
+        )
     try:
-        text = _infer_one_audio(clipped, _PLAIN_PROMPT)
+        text = _infer_one_audio(clipped, prompt)
     finally:
         clipped.unlink(missing_ok=True)
     return {"text": text}

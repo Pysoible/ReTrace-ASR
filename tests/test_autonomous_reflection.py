@@ -30,6 +30,31 @@ def test_fallback_judge_marks_low_confidence_as_uncertain_without_guessing_span(
     assert result.focus == []
 
 
+def test_fallback_judge_flags_acoustic_disagreement_as_uncertain():
+    """A second independent ASR disagreeing with the first pass is an acoustic
+    uncertainty signal — the fallback judge must mark it UNCERTAIN (triggering
+    relisten) without itself nominating any span."""
+    judge = ExplicitSignalFallbackJudge()
+    turn = Turn(
+        "t1",
+        "这个连加额，那这个英雄跟那个跟螳螂还是有有渊源的是吧？",
+        "这个连加额，那这个英雄跟那个跟螳螂还是有有渊源的是吧？",
+        meta={
+            "uncertainty": {
+                "acoustic_disagreement": [
+                    {"tag": "replace", "span_a": "加额，", "span_b": "家的", "offset_a": 2, "offset_b": 2},
+                ]
+            }
+        },
+    )
+    session = Session("s", turns=[turn])
+
+    result = judge(session=session, current_turn=turn, memory=None)
+
+    assert result.outcome == "UNCERTAIN"
+    assert result.focus == []
+
+
 def test_old_global_ngram_nomination_is_removed():
     source = Path("backend/asr_agent/retrace.py").read_text(encoding="utf-8")
     assert "_COMMON_BIGRAMS" not in source

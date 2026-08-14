@@ -1,17 +1,28 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import queue
 import re
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from asr_agent.integrations.deepseek import deepseek_status
-from asr_agent.integrations.qwen_asr import asr_status, preload_engine, shutdown_engines, transcribe_audio
+from asr_agent.integrations.qwen_asr import (
+    asr_status,
+    preload_engine,
+    shutdown_engines,
+    stream_transcribe_audio,
+    transcribe_audio,
+)
 from asr_agent.realtime import RealtimeAnalysisCoordinator
 from asr_agent.retrace import ReTraceService
 
@@ -67,6 +78,73 @@ def _audio_session_id(audio_path: str, requested: str | None = None) -> str:
     stem = Path(name).stem or "audio"
     safe = re.sub(r"[^A-Za-z0-9_\u4e00-\u9fff-]+", "_", stem).strip("_") or "audio"
     return f"audio_{safe[:96]}"
+
+
+# --- Streaming audio-session events (Server-Sent Events) -------------------
+
+_EVENT_STREAMS: dict[str, "queue.Queue[dict[str, Any] | None]"] = {}
+_EVENT_STREAMS_LOCK = threading.Lock()
+
+
+def _new_event_stream(session_id: str) -> "queue.Queue[dict[str, Any] | None]":
+    events: queue.Queue[dict[str, Any] | None] = queue.Queue()
+    with _EVENT_STREAMS_LOCK:
+        _EVENT_STREAMS[session_id] = events
+    return events
+
+
+def _drop_event_stream(session_id: str) -> None:
+    with _EVENT_STREAMS_LOCK:
+        _EVENT_STREAMS.pop(session_id, None)
+
+
+def _publish(session_id: str, event: dict[str, Any] | None) -> None:
+    with _EVENT_STREAMS_LOCK:
+        events = _EVENT_STREAMS.get(session_id)
+    if events is not None:
+        events.put(event)
+
+
+class _OrderedChunkProcessor:
+    """Consume transcribed chunks strictly in index order from a worker thread.
+
+    Transcriptions arrive concurrently from both GPUs; the processor buffers
+    out-of-order results and emits turn `(index, payload)` in ascending order so
+    the session timeline stays consistent.
+    """
+
+    def __init__(self, on_ready: Any) -> None:
+        self._on_ready = on_ready
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._pending: dict[int, Any] = {}
+        self._next = 0
+        self._done = False
+
+    def submit(self, index: int, payload: Any) -> None:
+        with self._cond:
+            self._pending[index] = payload
+            self._cond.notify_all()
+
+    def finish(self) -> None:
+        with self._cond:
+            self._done = True
+            self._cond.notify_all()
+
+    def run(self) -> None:
+        while True:
+            with self._cond:
+                while self._next not in self._pending and not self._done:
+                    self._cond.wait()
+                if self._next in self._pending:
+                    index = self._next
+                    payload = self._pending.pop(index)
+                    self._next += 1
+                elif self._done:
+                    break
+                else:
+                    continue
+            self._on_ready(index, payload)
 
 
 def create_app(
@@ -146,7 +224,10 @@ def create_app(
 
         chunk_meta = list(asr.get("chunks") or [])
         bound_session = _audio_session_id(audio_path, session_id)
-        service.reset_session(bound_session)
+        # Each audio session keeps its own durable long-term memory file
+        # (scope == session id), so switching sessions never loses or mixes
+        # previously consolidated beliefs.
+        service.reset_session(bound_session, memory_scope=bound_session)
 
         uncertainties = list(asr.get("uncertainties") or [])
         nbest_by_chunk = list(asr.get("nbest") or [])
@@ -204,6 +285,134 @@ def create_app(
             asr=asr,
         )
 
+    def _stream_audio_session_background(
+        session_id: str,
+        *,
+        audio_path: str,
+        source: str = "qwen-omni",
+    ) -> None:
+        """Stream a long audio into a session turn-by-turn, publishing SSE events.
+
+        Runs on a worker thread: chunks are transcribed in parallel across GPUs and
+        the ordered processor analyses them one by one, pushing a ``turn`` event to
+        the frontend as soon as each turn's judgment is ready.
+        """
+        # The event stream key must match the bound session id that the frontend
+        # connects to (the upload request may have used a generic "demo"/"auto"
+        # session id, while the derived bound_session is the real identifier).
+        bound_session = _audio_session_id(audio_path, session_id)
+        events = _new_event_stream(bound_session)
+        try:
+            service.reset_session(bound_session, memory_scope=bound_session)
+            _publish(bound_session, {"type": "session", "session_id": bound_session})
+        except Exception as exc:
+            _publish(bound_session, {"type": "error", "message": f"初始化会话失败: {exc}"})
+            events.put(None)
+            _drop_event_stream(bound_session)
+            return
+
+        def _analyze_chunk(index: int, payload: Any) -> None:
+            text, uncertainty, chunk = payload
+            turn_id = f"t{index + 1:03d}"
+            start = chunk.get("start_sec")
+            end = chunk.get("end_sec")
+            display = (text or "").strip()
+            if start is not None and end is not None and display:
+                display = f"[{float(start):.1f}-{float(end):.1f}] {display}"
+            if not display:
+                _publish(bound_session, {"type": "turn", "index": index, "turn_id": turn_id, "text": "", "session": service.get_session(bound_session)})
+                return
+            try:
+                result = service.process_turn(
+                    bound_session,
+                    turn_id,
+                    display,
+                    confidence=dict(uncertainty.get("confidence") or {}),
+                    text_candidates=dict(uncertainty.get("text_candidates") or {}),
+                    source=source,
+                    nbest=[],
+                    meta={
+                        "audio_path": audio_path,
+                        "chunk_index": index,
+                        "start_sec": start,
+                        "end_sec": end,
+                        "uncertainty": uncertainty,
+                    },
+                )
+            except Exception as exc:
+                _publish(bound_session, {"type": "error", "message": f"分析 turn {turn_id} 失败: {exc}"})
+                return
+            _publish(
+                bound_session,
+                {
+                    "type": "turn",
+                    "index": index,
+                    "turn_id": turn_id,
+                    "text": display,
+                    "judgment": result.get("judgment"),
+                    "revisions": result.get("revisions") or [],
+                    "session": service.get_session(bound_session),
+                },
+            )
+
+        processor = _OrderedChunkProcessor(_analyze_chunk)
+        worker = threading.Thread(
+            target=processor.run,
+            name=f"retrace-order-{bound_session}",
+            daemon=True,
+        )
+        worker.start()
+
+        def _on_chunk(index: int, text: str, uncertainty: dict[str, Any], chunk: dict[str, Any]) -> None:
+            processor.submit(index, (text, uncertainty, chunk))
+
+        try:
+            summary = stream_transcribe_audio(audio_path, _on_chunk)
+            _publish(bound_session, {"type": "asr_done", "chunk_count": summary.get("chunk_count"), "duration_sec": summary.get("duration_sec")})
+        except Exception as exc:
+            _publish(bound_session, {"type": "error", "message": f"音频转写失败: {exc}"})
+        finally:
+            processor.finish()
+            worker.join(timeout=120)
+            _publish(bound_session, {"type": "done", "session_id": bound_session, "session": service.get_session(bound_session)})
+            events.put(None)
+            _drop_event_stream(bound_session)
+
+    def _start_stream_audio_session(session_id: str, *, audio_path: str) -> dict[str, Any]:
+        bound_session = _audio_session_id(audio_path, session_id)
+        thread = threading.Thread(
+            target=_stream_audio_session_background,
+            args=(session_id,),
+            kwargs={"audio_path": audio_path},
+            name=f"retrace-audio-{bound_session}",
+            daemon=True,
+        )
+        thread.start()
+        return {
+            "session_id": bound_session,
+            "status": "processing",
+            "stream": f"/api/sessions/{bound_session}/events",
+        }
+
+    @app.get("/api/sessions/{session_id}/events")
+    async def session_events(session_id: str) -> StreamingResponse:
+        with _EVENT_STREAMS_LOCK:
+            events = _EVENT_STREAMS.get(session_id)
+
+        async def event_generator():
+            try:
+                while True:
+                    item = await asyncio.to_thread(events.get)
+                    if item is None:
+                        break
+                    yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+            finally:
+                _drop_event_stream(session_id)
+
+        if events is None:
+            raise HTTPException(status_code=404, detail="没有进行中的音频会话")
+        return StreamingResponse(event_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
     @app.post("/api/sessions/{session_id}/audio")
     def process_audio_turn(session_id: str, request: AudioTurnRequest) -> dict[str, Any]:
         return _run_audio_session(
@@ -222,7 +431,9 @@ def create_app(
         if not content:
             raise HTTPException(status_code=400, detail="empty audio upload")
         dest.write_bytes(content)
-        return _run_audio_session(
+        # Streaming mode: return immediately; the frontend follows the SSE stream
+        # and renders each turn as soon as its judgment is ready.
+        return _start_stream_audio_session(
             session_id,
             audio_path=str(dest),
         )

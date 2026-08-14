@@ -1,6 +1,7 @@
 """Agent-first orchestration for realtime, revisable ASR sessions."""
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any, Callable
@@ -11,7 +12,12 @@ from asr_agent.context_judge import (
     ContextJudgment,
     normalize_judgment,
 )
-from asr_agent.degeneration import DegenerationAssessment, assess_transcript, should_replace_degenerate
+from asr_agent.degeneration import (
+    DegenerationAssessment,
+    assess_transcript,
+    should_replace_degenerate,
+    trim_degenerate_tail,
+)
 from asr_agent.ledger import RevisionLedger
 from asr_agent.memory import LongTermMemoryRepository, MemoryConsolidator, MemoryRetriever
 from asr_agent.models import (
@@ -156,6 +162,24 @@ class ReTraceService:
 
             self._apply_beliefs(snapshot, judgment.beliefs)
             events: list[RevisionEvent] = [recovery_event] if recovery_event is not None else []
+            # Open-vocabulary relisten fallback: when the judge is uncertain (or
+            # conflicted) but could not point at a specific span, go back to the
+            # audio and re-transcribe the window. This catches garbled proper
+            # nouns even when the correct word was never mentioned in memory.
+            if (
+                not recovery_event
+                and judgment.outcome in {"UNCERTAIN", "CONFLICT"}
+                and not judgment.focus
+            ):
+                relisten_event = self._relisten_uncertain_window(
+                    snapshot,
+                    trigger,
+                    observed_version=observed_version,
+                    memory=memory,
+                )
+                if relisten_event is not None:
+                    events.append(relisten_event)
+                    trigger.current_text = relisten_event.after_text
             audit_events: list[RevisionEvent] = []
             deferred = judgment.outcome == "UNCERTAIN" and not judgment.focus
             if not judgment.focus:
@@ -361,6 +385,38 @@ class ReTraceService:
         meta["degeneration"]["candidate_score"] = candidate_assessment.score
         meta["degeneration"]["candidate_reasons"] = list(candidate_assessment.reasons)
         if not candidate or not should_replace_degenerate(assessment, candidate_assessment):
+            # Fallback: the whole window may contain a meaningful prefix followed by a
+            # degenerate loop (e.g. real speech then a repeated "对。"). Trim the tail.
+            # trim_degenerate_tail already preserves the [start-end] timestamp prefix.
+            trimmed = trim_degenerate_tail(turn.raw_text)
+            trimmed_assessment = assess_transcript(trimmed, duration_sec=duration)
+            meta["degeneration"]["trimmed"] = bool(trimmed != turn.raw_text)
+            if trimmed != turn.raw_text and not trimmed_assessment.degenerate:
+                after_text = trimmed
+                meta["degeneration"]["recovered"] = True
+                meta["degeneration"]["replacement"] = trimmed
+                reasons = ",".join(assessment.reasons) or "degenerate transcript"
+                return RevisionEvent(
+                    event_id=self._event_id(
+                        session.session_id,
+                        turn.turn_id,
+                        observed_version,
+                        "REVISE_CURRENT",
+                        "degeneration-trim",
+                    ),
+                    action="REVISE_CURRENT",
+                    target_turn_id=turn.turn_id,
+                    source_turn_id=turn.turn_id,
+                    span=turn.raw_text,
+                    before_text=turn.raw_text,
+                    after_text=after_text,
+                    entity_id=None,
+                    score=max(0.0, min(1.0, assessment.score - trimmed_assessment.score)),
+                    evidence=[f"audio:{audio_path}:{start_sec}-{end_sec}", f"degeneration:{reasons}"],
+                    resolver="audio-degeneration-recovery",
+                    rationale=f"degenerate tail trimmed after retranscription stayed degenerate ({reasons})",
+                    replacement=after_text,
+                ), assessment
             meta["degeneration"]["error"] = str(payload.get("error") or "re-transcription did not improve quality")
             return None, assessment
 
@@ -391,6 +447,125 @@ class ReTraceService:
             replacement=after_text,
         ), assessment
 
+    def _relisten_uncertain_window(
+        self,
+        session: Session,
+        turn: Turn,
+        *,
+        observed_version: int | None,
+        memory: Any | None = None,
+    ) -> RevisionEvent | None:
+        """Open-vocabulary relisten when the judge is uncertain but gave no focus.
+
+        If the model flagged the turn as UNCERTAIN/CONFLICT without pinpointing a
+        specific span (e.g. a garbled proper noun when the correct entity was
+        never mentioned), we still go back to the audio and re-transcribe the
+        window. If the relisten clearly differs from the first pass, we revise —
+        this does not depend on the correct word being remembered anywhere.
+
+        When memory is available, its remembered domain terms are passed as
+        hotwords (domain_hints) so the ASR model is biased toward the correct
+        proper noun (contextual biasing). Optional: relisten works without hints.
+        """
+        meta = turn.meta
+        start_sec, end_sec = meta.get("start_sec"), meta.get("end_sec")
+        audio_path = meta.get("audio_path")
+        if not audio_path or start_sec is None or end_sec is None:
+            return None
+        hints = None
+        if memory is not None:
+            try:
+                from asr_agent.integrations.deepseek import _domain_entities
+
+                hints = _domain_entities(memory) or None
+            except Exception:
+                hints = None
+        try:
+            result = self.audio_retranscriber(
+                audio_path=str(audio_path),
+                start_sec=float(start_sec),
+                end_sec=float(end_sec),
+                domain_hints=hints,
+            )
+        except Exception as exc:
+            meta["relisten_uncertain"] = {"error": f"audio re-transcription failed: {exc}"}
+            return None
+        payload = result if isinstance(result, dict) else {}
+        candidate = str(payload.get("text") or "").strip() if payload.get("ok") else ""
+        if not candidate:
+            meta["relisten_uncertain"] = {"error": str(payload.get("error") or "empty relisten")}
+            return None
+
+        def _strip(ts: str) -> str:
+            return re.sub(r"^\[\d+(?:\.\d+)?-\d+(?:\.\d+)?\]\s*", "", ts).strip()
+
+        raw_body = _strip(turn.raw_text)
+        cand_body = _strip(candidate)
+        if not raw_body or not cand_body:
+            return None
+        # Keep only meaningful characters for a diff decision.
+        keep = lambda s: "".join(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", s))
+        raw_keep = keep(raw_body)
+        cand_keep = keep(cand_body)
+        if raw_keep == cand_keep:
+            meta["relisten_uncertain"] = {"relistened": True, "changed": False}
+            return None
+        # Require the relisten to be substantially different (and plausibly better:
+        # not longer garbage repetition). Guard against relisten being degenerate.
+        import difflib
+
+        ratio = difflib.SequenceMatcher(None, raw_keep, cand_keep).ratio()
+        if ratio > 0.9:
+            meta["relisten_uncertain"] = {"relistened": True, "changed": False, "ratio": round(ratio, 3)}
+            return None
+        # A relisten that merely differs from the first pass is NOT automatically
+        # better — it is the same ASR model and can be led astray (e.g. a stale
+        # domain hotword like "CS:GO" biasing a LoL clip toward "C S go"). The
+        # judge already had its say and produced no focus, so an unrelated
+        # remembered term passed as a hotword is misleading. Adopt the relisten
+        # only when it surfaced a remembered domain entity verbatim, or when it
+        # clearly recovers a degenerate first pass.
+        raw_assessment = assess_transcript(raw_body)
+        cand_assessment = assess_transcript(cand_body)
+        hint_matches = [h for h in (hints or []) if h and h in cand_body]
+        adopt = bool(hint_matches) or (raw_assessment.degenerate and not cand_assessment.degenerate)
+        if not adopt:
+            meta["relisten_uncertain"] = {
+                "relistened": True,
+                "changed": False,
+                "ratio": round(ratio, 3),
+                "rejected": "relisten differs but recovers no remembered entity nor a degenerate pass",
+            }
+            return None
+        # candidate may itself carry a [start-end] prefix; reuse the original
+        # timestamp and avoid duplicating it.
+        prefix_match = re.match(r"^(\[\d+(?:\.\d+)?-\d+(?:\.\d+)?\]\s*)", turn.raw_text)
+        original_prefix = prefix_match.group(1) if prefix_match else ""
+        cand_no_ts = _strip(candidate)
+        after_text = f"{original_prefix}{cand_no_ts}"
+        meta["relisten_uncertain"] = {"relistened": True, "changed": True, "ratio": round(ratio, 3), "replacement": cand_no_ts}
+        return RevisionEvent(
+            event_id=self._event_id(
+                session.session_id,
+                turn.turn_id,
+                observed_version,
+                "REVISE_CURRENT",
+                "uncertain-relisten",
+            ),
+            action="REVISE_CURRENT",
+            target_turn_id=turn.turn_id,
+            source_turn_id=turn.turn_id,
+            span=turn.raw_text,
+            before_text=turn.raw_text,
+            after_text=after_text,
+            entity_id=None,
+            score=max(0.0, min(1.0, 1.0 - ratio)),
+            evidence=[f"audio:{audio_path}:{start_sec}-{end_sec}", "uncertainty:relisten"],
+            resolver="audio-uncertainty-relisten",
+            rationale="open relisten of an uncertain window recovered a different transcript",
+            replacement=cand_no_ts,
+        )
+
     def _observability(self, session: Session) -> dict[str, Any]:
         if not session.turns:
             return {
@@ -406,6 +581,15 @@ class ReTraceService:
 
         latest = session.turns[-1]
         packet = self.memory_retriever.retrieve(session, latest)
+        # LONG-TERM inspector shows the full stable belief set, not only the
+        # subset relevant to the latest turn — users expect to see what has been
+        # consolidated across the whole session.
+        try:
+            stable_long_term = [
+                item for item in self.long_term_memory.load(session.memory_scope) if item.status == "stable"
+            ]
+        except (OSError, ValueError, json.JSONDecodeError):
+            stable_long_term = []
         analyzed = next(
             (turn for turn in reversed(session.turns) if turn.meta.get("context_judgment")),
             None,
@@ -431,7 +615,7 @@ class ReTraceService:
                 "open_hypotheses": [hypothesis.as_dict() for hypothesis in session.open_hypotheses.values()],
             },
             "long_term": {
-                "beliefs": [belief.as_dict() for belief in packet.long_term_beliefs],
+                "beliefs": [belief.as_dict() for belief in stable_long_term],
             },
         }
 

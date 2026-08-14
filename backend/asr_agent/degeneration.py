@@ -76,3 +76,37 @@ def should_replace_degenerate(
         and not candidate.degenerate
         and original.score - candidate.score >= minimum_improvement
     )
+
+
+_REPEAT_LOOP = re.compile(r"([\u4e00-\u9fff]{1,4}[。！？!?；;，,]?)\1{2,}")
+
+
+def trim_degenerate_tail(text: str) -> str:
+    """Strip a degenerate tail while keeping a meaningful prefix.
+
+    A chunk can start with real content and then collapse into a repeated loop
+    (e.g. ``十一的。正好是节假日放假的时候。对。对。对。...``). Retranscription
+    of the whole window may still come back degenerate, so as a fallback we drop
+    everything from the first repeated loop onward and keep the meaningful prefix.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return raw
+    prefix_match = re.match(r"^(\[\d+(?:\.\d+)?-\d+(?:\.\d+)?\]\s*)", raw)
+    prefix = prefix_match.group(1) if prefix_match else ""
+    content = raw[len(prefix):]
+    if not content.strip():
+        return raw
+    # Nothing to trim if the text is not degenerate in the first place.
+    if not assess_transcript(content).degenerate:
+        return raw
+    loop = _REPEAT_LOOP.search(content)
+    if loop is None:
+        return raw
+    kept = content[: loop.start()].strip()
+    if not kept:
+        return raw
+    # Make sure what we keep is genuinely non-degenerate.
+    if assess_transcript(kept).degenerate:
+        return raw
+    return f"{prefix}{kept}"

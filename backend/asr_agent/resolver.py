@@ -43,6 +43,27 @@ class EvidenceResolver:
         target = next((turn for turn in session.turns if turn.turn_id == focus.target_turn_id), None)
         if target is None or (focus.span not in target.raw_text and focus.span not in target.current_text):
             return Resolution("DEFER", focus.target_turn_id, focus.span, rationale="invalid target span")
+        # Guard against a class of false positives where BOTH the span and the
+        # proposed replacement already appear verbatim in the original raw text
+        # (e.g. "时候" → "狮子狗" in "狮子狗刚出的时候…"). Here the span is a
+        # normal word and the "correct" name already occurs elsewhere in the same
+        # turn, so ASR already recognized it; a closed-set verifier listening to
+        # the whole window is misled by that other occurrence. Refusing to revise
+        # is safe (we only skip a revision, never invent one).
+        if (
+            focus.span in target.raw_text
+            and focus.proposed_text in target.raw_text
+            and focus.proposed_text != focus.span
+        ):
+            return Resolution(
+                "DEFER",
+                target.turn_id,
+                focus.span,
+                rationale=(
+                    f"proposed replacement {focus.proposed_text!r} already appears elsewhere in the "
+                    "same turn; refusing a low-confidence name swap"
+                ),
+            )
         if focus.relationship == "COEXIST":
             return Resolution(
                 "COEXIST",
@@ -84,6 +105,34 @@ class EvidenceResolver:
             return Resolution("KEEP_OLD", target.turn_id, focus.span, score=ordered[0][1] if ordered else 0.0)
         top = ordered[0][1]
         margin = top - (ordered[1][1] if len(ordered) > 1 else 0.0)
+        # Second acoustic gate (direction 2): a classical ASR (paraformer) votes
+        # on the same focused window. If the two acoustic models disagree — the
+        # LLM favors the proposed word but the classical ASR favors the original
+        # span — we conservatively DEFER rather than authorize a risky revision.
+        acoustic_vote: float | None = None
+        try:
+            from asr_agent.integrations import acoustic  # local import to avoid cycles
+
+            vote = acoustic.acoustic_verify(
+                audio_path=str(audio_path),
+                start_sec=float(start_sec),
+                end_sec=float(end_sec),
+                candidates=focus.alternatives,
+            )
+            if isinstance(vote, dict) and vote.get("ok") and isinstance(vote.get("scores"), dict):
+                vote_scores = vote["scores"]
+                vote_winner = max(vote_scores, key=lambda key: vote_scores[key])
+                if vote_winner == focus.span:
+                    return Resolution(
+                        "DEFER",
+                        target.turn_id,
+                        focus.span,
+                        score=top,
+                        rationale="second acoustic ASR (paraformer) disagrees with the proposed correction",
+                    )
+                acoustic_vote = float(vote_scores.get(focus.proposed_text, 0.0))
+        except Exception:
+            acoustic_vote = None
         features = EvidenceFeatures(
             context_confidence=context_confidence,
             audio_confidence=top,
@@ -96,6 +145,8 @@ class EvidenceResolver:
         action = "REVISE_CURRENT" if target.turn_id == source_turn.turn_id else "REVISE_HISTORY"
         evidence = [f"context:{turn_id}" for turn_id in focus.evidence_turn_ids]
         evidence.append(f"audio:{audio_path}:{start_sec}-{end_sec}")
+        if acoustic_vote is not None:
+            evidence.append(f"acoustic_vote:{focus.proposed_text}")
         return Resolution(
             action,
             target.turn_id,

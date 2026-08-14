@@ -47,3 +47,45 @@ def test_deepseek_context_judge_safely_defers_malformed_output(monkeypatch):
 
     assert result.outcome == "UNCERTAIN"
     assert result.focus == []
+
+
+def _belief(value: str):
+    from asr_agent.models import MemoryBelief
+
+    return MemoryBelief(
+        belief_id="b",
+        subject="speaker",
+        predicate="mentions_champion",
+        value=value,
+        confidence=0.9,
+        status="provisional",
+        source_turn_ids=["t1"],
+        source_session_ids=["s"],
+    )
+
+
+def test_domain_entities_exclude_canonical_text():
+    """canonical_text beliefs record span corrections, not domain proper nouns;
+    their values (e.g. "是说"/"是设") must not be surfaced as domain entities
+    to the LLM judge."""
+    from asr_agent.models import MemoryBelief
+
+    memory = MemoryPacket(working_beliefs=[
+        MemoryBelief(
+            belief_id="c1", subject="turn:x:canonical_span", predicate="canonical_text",
+            value="是说", aliases=["是设"], confidence=0.9, status="provisional",
+            source_turn_ids=["t1"], source_session_ids=["s"],
+        ),
+        MemoryBelief(
+            belief_id="c2", subject="turn:x:canonical_span", predicate="canonical_text",
+            value="是设", aliases=["是什"], confidence=0.9, status="provisional",
+            source_turn_ids=["t1"], source_session_ids=["s"],
+        ),
+        _belief("皇子"),
+    ])
+
+    entities = deepseek._domain_entities(memory)
+
+    assert "是说" not in entities
+    assert "是设" not in entities
+    assert "皇子" in entities
