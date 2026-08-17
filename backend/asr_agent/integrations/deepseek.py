@@ -45,6 +45,11 @@ _CONTEXT_JUDGE_SYSTEM = (
     "不一致的片段。这些位置很可能真的听错了（两个声学模型在同一处都拿不准），你应当优先检查这些片段，"
     "但不要盲目相信——仍需结合语义判断它们是否真的读起来像某个已知专有名词，避免把普通词的近音差异"
     "当成 ASR 错误。"
+    "user 消息里的 low_conf_chars 是另一个声学层面的独立信号：它列出了第二个独立 ASR 自己在解码时"
+    "置信度偏低的具体字符（带 conf 值）。这些字符说明声学模型在该位置上拿不准，是字级声学置信度的"
+    "直接体现。你应当把它们视为'此处可能听错'的线索，与语义判断结合使用：如果某个低置信度字与上下文"
+    "不搭、或读起来像某个已知专有名词/领域词，则更可能是 ASR 错误，可在 focus 中针对该字所在的最短"
+    "词提出候选。反之，如果低置信度字在语义上完全通顺，则不必强行修订。"
     "用 beliefs 输出有原文 Turn 证据的结构化新事实：subject、predicate、value、aliases、confidence、"
     "valid_from、valid_to、evidence_turn_ids。"
     "仅在 CONFLICT 或 UNCERTAIN 且存在具体证据时给出 focus；每个 focus 必须包含 "
@@ -137,7 +142,9 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
     """
     if not _api_key():
         return ExplicitSignalFallbackJudge()(session=session, current_turn=current_turn, memory=memory)
-    acoustic_disagreement = (current_turn.meta.get("uncertainty") or {}).get("acoustic_disagreement")
+    uncertainty = current_turn.meta.get("uncertainty") or {}
+    acoustic_disagreement = uncertainty.get("acoustic_disagreement")
+    low_conf_chars = uncertainty.get("low_conf_chars")
     payload = {
         "current_turn": current_turn.as_dict(),
         "recent_turns": [turn.as_dict() for turn in memory.recent_turns],
@@ -149,6 +156,9 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
         # Acoustic uncertainty: spans where a second independent ASR disagreed
         # with the first pass. These are strong candidates for mis-hearings.
         "acoustic_disagreement": acoustic_disagreement,
+        # Char-level acoustic confidence: characters the second ASR itself was
+        # unsure about, with their confidence values.
+        "low_conf_chars": low_conf_chars,
     }
     try:
         result = _chat_json(

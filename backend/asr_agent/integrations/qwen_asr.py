@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import multiprocessing as mp
 import os
 import re
@@ -19,6 +20,8 @@ from asr_agent.integrations.audio_chunk import (
     read_chunk_config,
     split_audio_file,
 )
+
+_log = logging.getLogger("asr_agent.qwen_asr")
 
 DEFAULT_MODEL_PATH = "/home/ma-user/work/dataset/sjk_data/sjk/model_demo/checkpoint-793-merged"
 DEFAULT_AUDIO_DIR = "/home/ma-user/work/dataset/sjk_data/ASR_audio"
@@ -558,21 +561,64 @@ def _acoustic_disagreement_enabled() -> bool:
     return _truthy(os.getenv("ASR_ACOUSTIC_DISAGREEMENT"))
 
 
+def _speech_duration_sec(chunk_path: Path) -> float:
+    """Estimate the voiced duration (seconds) of a chunk via energy VAD.
+
+    Used to detect truncation: a chunk with many seconds of speech but a tiny
+    transcript is likely to have been under-transcribed by the first pass.
+    """
+    try:
+        import librosa
+        import soundfile as sf
+
+        audio, sr = sf.read(str(chunk_path), always_2d=False)
+        if getattr(audio, "ndim", 1) > 1:
+            audio = audio.mean(axis=1)
+        if len(audio) < sr * 0.1:
+            return 0.0
+        intervals = librosa.effects.split(audio, top_db=30.0)
+        return sum(ed - st for st, ed in intervals) / sr
+    except Exception:
+        return 0.0
+
+
+def _is_truncated(chunk_path: Path, text: str, *, min_chars_per_sec: float = 1.5) -> bool:
+    """True when the transcript density is suspiciously low for the voiced time.
+
+    Normal conversational Mandarin is ~3-5 chars/sec of speech; an under-
+    transcribed chunk drops below ~1 char/sec. Empty transcripts are always
+    considered truncated (the caller then re-listens with the plain prompt).
+    """
+    if not text:
+        return True
+    speech = _speech_duration_sec(chunk_path)
+    if speech < 3.0:  # too little speech to judge reliably
+        return False
+    n_chars = len(re.sub(r"[^\w\u4e00-\u9fff]", "", text))
+    density = n_chars / max(speech, 0.1)
+    return density < min_chars_per_sec
+
+
 def _attach_acoustic_disagreement(chunk_path: Path, text: str, uncertainty: dict[str, Any]) -> dict[str, Any]:
-    """Run a second independent ASR (paraformer) and attach spans where the two
-    acoustic models disagree — a genuine acoustic-uncertainty signal that is
-    independent of the LLM judge and of Qwen's self-reported confidence."""
+    """Run a second independent ASR (paraformer) once and attach two acoustic
+    uncertainty signals: (1) spans where the two acoustic models disagree, and
+    (2) characters whose paraformer decoder confidence is low — both genuine
+    acoustic-uncertainty signals independent of the LLM judge and of Qwen's
+    self-reported confidence."""
     if not _acoustic_disagreement_enabled() or not text:
         return uncertainty
     try:
         from asr_agent.integrations import acoustic  # local import to avoid cycles
 
-        disagreements = acoustic.detect_asr_disagreement(chunk_path, text)
+        disagreements, low_conf = acoustic.acoustic_signals(chunk_path, text)
     except Exception:
         return uncertainty
-    if disagreements:
+    if disagreements or low_conf:
         uncertainty = dict(uncertainty)
-        uncertainty["acoustic_disagreement"] = disagreements
+        if disagreements:
+            uncertainty["acoustic_disagreement"] = disagreements
+        if low_conf:
+            uncertainty["low_conf_chars"] = low_conf
     return uncertainty
 
 
@@ -642,6 +688,25 @@ def stream_transcribe_audio(
             except Exception:
                 pass
         text = str(observation.get("text") or "")
+        # Truncation re-listen: when the first pass produced a suspiciously short
+        # transcript for the voiced duration (under-transcription), re-listen once
+        # with the plain prompt and adopt it only if it is substantially fuller.
+        if text and _is_truncated(chunk_paths[index], text):
+            try:
+                plain = _infer_one_audio(chunk_paths[index], _PLAIN_PROMPT)
+                plain_obs = parse_observation(plain)
+                plain_text = str(plain_obs.get("text") or "")
+                plain_trunc = _is_truncated(chunk_paths[index], plain_text) if plain_text else None
+                print(
+                    f"[truncation-relisten] chunk={index} first={text[:60]!r} "
+                    f"plain={plain_text[:60]!r} plain_truncated={plain_trunc}",
+                    flush=True,
+                )
+                if plain_text and not plain_trunc:
+                    observation = plain_obs
+                    text = plain_text
+            except Exception as exc:  # noqa: BLE001
+                print(f"[truncation-relisten] chunk={index} FAILED {exc!r}", flush=True)
         uncertainty = dict(observation.get("uncertainty") or {})
         uncertainty = _attach_acoustic_disagreement(chunk_paths[index], text, uncertainty)
         on_chunk(index, text, uncertainty, chunk_meta[index])

@@ -221,8 +221,10 @@ class ExplicitSignalFallbackJudge:
         diverse_nbest = len(set(nbest)) > 1
         # A second independent ASR (paraformer) disagreed with the first pass —
         # an acoustic uncertainty signal that is independent of the LLM.
-        disagreement = (current_turn.meta.get("uncertainty") or {}).get("acoustic_disagreement")
-        if low or diverse_nbest or disagreement:
+        uncertainty = current_turn.meta.get("uncertainty") or {}
+        disagreement = uncertainty.get("acoustic_disagreement")
+        low_conf_chars = uncertainty.get("low_conf_chars")
+        if low or diverse_nbest or disagreement or low_conf_chars:
             return ContextJudgment(
                 outcome="UNCERTAIN",
                 confidence=0.5,

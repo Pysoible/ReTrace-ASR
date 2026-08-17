@@ -1,4 +1,31 @@
-from asr_agent.integrations.qwen_asr import parse_observation, parse_uncertainty_tags
+from asr_agent.integrations.qwen_asr import (
+    _is_truncated,
+    _speech_duration_sec,
+    parse_observation,
+    parse_uncertainty_tags,
+)
+
+
+def test_is_truncated_flags_low_density_transcript(monkeypatch):
+    """A chunk with 10s of speech but only 4 chars is under-transcribed."""
+    monkeypatch.setattr("asr_agent.integrations.qwen_asr._speech_duration_sec", lambda _p: 10.0)
+
+    assert _is_truncated(None, "M四还好") is True  # 4 chars / 10s = 0.4
+    assert _is_truncated(None, "") is True  # empty transcript
+
+
+def test_is_truncated_accepts_normal_density(monkeypatch):
+    monkeypatch.setattr("asr_agent.integrations.qwen_asr._speech_duration_sec", lambda _p: 10.0)
+
+    # 29 chars / 10s = 2.9 chars/sec — normal conversational Mandarin.
+    assert _is_truncated(None, "这个游戏的话我觉得就是怎么说呢就是它这个机制还是不错的") is False
+
+
+def test_is_truncated_skips_short_speech(monkeypatch):
+    monkeypatch.setattr("asr_agent.integrations.qwen_asr._speech_duration_sec", lambda _p: 2.0)
+
+    # Too little voiced time (< 3s) → not judged, even if density is low.
+    assert _is_truncated(None, "嗯") is False
 
 
 def test_parse_observation_accepts_json_with_uncertain_spans():

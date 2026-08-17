@@ -65,34 +65,76 @@ def _get_paraformer() -> Any:
         return _PARAFORMER
 
 
-def _transcribe_paraformer(audio_path: str | Path) -> str:
+def _transcribe_paraformer_detailed(audio_path: str | Path) -> tuple[str, list[dict[str, Any]]]:
+    """Run paraformer once; return ``(text, char_confs)``.
+
+    ``char_confs`` is ``[{"char": "呢", "conf": 0.58}, ...]`` in recognition
+    order. Sharing one forward pass means disagreement detection and char-level
+    confidence do not pay the model cost twice.
+    """
     model = _get_paraformer()
     if not model:
-        return ""
+        return "", []
     try:
-        result = model.generate(input=str(audio_path))
-    except Exception:
-        return ""
-    if not result:
-        return ""
-    return str((result[0].get("text") or "") if isinstance(result, list) else "").strip()
+        import torch
+        from funasr.utils.load_utils import extract_fbank, load_audio_text_image_video
+
+        paraformer = model.model
+        kwargs = model.kwargs
+        frontend = kwargs.get("frontend")
+        tokenizer = kwargs.get("tokenizer")
+        device = kwargs.get("device", "cpu")
+        fs = kwargs.get("fs", 16000)
+
+        audio_sample_list = load_audio_text_image_video(
+            str(audio_path),
+            fs=frontend.fs,
+            audio_fs=fs,
+            data_type="sound",
+            tokenizer=tokenizer,
+        )
+        speech, speech_lengths = extract_fbank(
+            audio_sample_list, data_type="sound", frontend=frontend
+        )
+        speech = speech.to(device=device)
+        speech_lengths = speech_lengths.to(device=device)
+
+        with torch.no_grad():
+            encoder_out, encoder_out_lens = paraformer.encode(speech, speech_lengths)
+            if isinstance(encoder_out, tuple):
+                encoder_out = encoder_out[0]
+            predictor_outs = paraformer.calc_predictor(encoder_out, encoder_out_lens)
+            pre_token_length = predictor_outs[1].round().long()
+            if torch.max(pre_token_length) < 1:
+                return "", []
+            decoder_outs = paraformer.cal_decoder_with_predictor(
+                encoder_out, encoder_out_lens, predictor_outs[0], pre_token_length
+            )
+            am_scores = decoder_outs[0][0, : pre_token_length[0], :]
+            probs = torch.softmax(am_scores, dim=-1)
+            yseq = am_scores.argmax(dim=-1).tolist()
+            confs = probs.max(dim=-1)[0].tolist()
+
+        kept_ids: list[int] = []
+        char_confs: list[dict[str, Any]] = []
+        for token_id, conf in zip(yseq, confs):
+            if token_id in (paraformer.sos, paraformer.eos, paraformer.blank_id):
+                continue
+            kept_ids.append(token_id)
+            token = str(tokenizer.ids2tokens([token_id])[0] or "")
+            if token and (token.isalnum() or "\u4e00" <= token <= "\u9fff"):
+                char_confs.append({"char": token, "conf": round(float(conf), 4)})
+        text = tokenizer.tokens2text(tokenizer.ids2tokens(kept_ids))
+        return str(text or "").strip(), char_confs
+    except Exception:  # pragma: no cover - optional dependency
+        return "", []
 
 
-def detect_asr_disagreement(
-    audio_path: str | Path,
-    first_pass_text: str,
-    *,
-    min_span: int = 2,
-) -> list[dict[str, Any]]:
-    """Return spans where a second ASR (paraformer) disagrees with the first pass.
+def _transcribe_paraformer(audio_path: str | Path) -> str:
+    return _transcribe_paraformer_detailed(audio_path)[0]
 
-    Each item: {tag, span_a (first pass), span_b (paraformer), offset_a, offset_b}.
-    Only CJK/alnum runs of length >= min_span are reported, so punctuation-only
-    or single-character differences are ignored.
-    """
-    second = _transcribe_paraformer(audio_path)
-    if not second or not first_pass_text:
-        return []
+
+def _diff_texts(first_pass_text: str, second: str, min_span: int) -> list[dict[str, Any]]:
     sm = difflib.SequenceMatcher(None, first_pass_text, second, autojunk=False)
     spans: list[dict[str, Any]] = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -115,6 +157,60 @@ def detect_asr_disagreement(
             }
         )
     return spans
+
+
+def acoustic_signals(
+    audio_path: str | Path,
+    first_pass_text: str,
+    *,
+    min_span: int = 2,
+    low_conf_threshold: float = 0.75,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """One paraformer forward pass → (disagreement_spans, low_conf_chars).
+
+    This is the single acoustic entry point used by the streaming pipeline, so a
+    chunk is never transcribed twice by the second ASR.
+    """
+    second, char_confs = _transcribe_paraformer_detailed(audio_path)
+    disagreements: list[dict[str, Any]] = []
+    if second and first_pass_text:
+        disagreements = _diff_texts(first_pass_text, second, min_span)
+    low_conf = [c for c in char_confs if c["conf"] < low_conf_threshold]
+    return disagreements, low_conf
+
+
+def detect_asr_disagreement(
+    audio_path: str | Path,
+    first_pass_text: str,
+    *,
+    min_span: int = 2,
+) -> list[dict[str, Any]]:
+    """Return spans where a second ASR (paraformer) disagrees with the first pass.
+
+    Each item: {tag, span_a (first pass), span_b (paraformer), offset_a, offset_b}.
+    Only CJK/alnum runs of length >= min_span are reported, so punctuation-only
+    or single-character differences are ignored.
+    """
+    second = _transcribe_paraformer(audio_path)
+    if not second or not first_pass_text:
+        return []
+    return _diff_texts(first_pass_text, second, min_span)
+
+
+def char_level_confidence(audio_path: str | Path) -> list[dict[str, Any]]:
+    """Return per-character acoustic confidence from the paraformer decoder.
+
+    Reuses the in-process paraformer (``_get_paraformer``) but reads the decoder
+    logits directly, so we get a confidence value for every recognized character
+    instead of just the final text. Low-confidence characters are the acoustic
+    "doubt" signal for direction 2 (char-level acoustic confidence): they point
+    at exactly which characters the model itself is unsure about, even when the
+    sentence is semantically fluent.
+
+    Returns ``[{"char": "呢", "conf": 0.58}, ...]`` in recognition order.
+    Degrades to ``[]`` when funasr is unavailable or an error occurs.
+    """
+    return _transcribe_paraformer_detailed(audio_path)[1]
 
 
 def extract_mfcc(
@@ -203,76 +299,4 @@ def _dtw(a: np.ndarray, b: np.ndarray) -> float:
             d = float(np.linalg.norm(a[i - 1] - b[j - 1]))
             cost[i, j] = d + min(cost[i - 1, j], cost[i, j - 1], cost[i - 1, j - 1])
     return cost[n, m] / (n + m)
-
-
-def transcribe_window(audio_path: str | Path, start_sec: float, end_sec: float) -> str:
-    """Re-transcribe one audio window with paraformer (the second acoustic ASR).
-
-    Used as an *independent acoustic* re-scoring of a focused span — instead of
-    asking the LLM (Qwen-Omni) to re-listen to the whole window, a classical
-    acoustic ASR votes on what it hears at that exact position.
-    """
-    if end_sec <= start_sec:
-        return ""
-    try:
-        audio, sr = _load_mono(audio_path)
-    except Exception:
-        return ""
-    seg = _crop(audio, sr, start_sec, end_sec)
-    if len(seg) < sr * 0.05:
-        return ""
-    import soundfile as sf
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
-        tmp = Path(handle.name)
-        sf.write(str(tmp), seg, sr)
-    try:
-        return _transcribe_paraformer(tmp)
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
-def _pinyin_text(text: str) -> str:
-    try:
-        from pypinyin import lazy_pinyin
-
-        return "".join(lazy_pinyin(text)).lower()
-    except Exception:  # pragma: no cover - optional dependency
-        return text
-
-
-def acoustic_verify(
-    audio_path: str | Path,
-    start_sec: float,
-    end_sec: float,
-    candidates: list[str],
-) -> dict[str, Any]:
-    """Acoustic re-scoring of a focused window via a second ASR's transcript.
-
-    The second ASR (paraformer) re-transcribes the window; each candidate is
-    scored by pinyin similarity to that transcript. Returns the same shape as
-    ``verify_candidates`` (``{"ok": True, "scores": {...}}``) so it can be used
-    as an alternative / additional acoustic authorizer.
-    """
-    unique = list(dict.fromkeys(str(item).strip() for item in candidates if item and str(item).strip()))
-    if len(unique) < 2:
-        return {"ok": False, "error": "need at least two candidates"}
-    second = transcribe_window(audio_path, start_sec, end_sec)
-    if not second:
-        return {"ok": False, "error": "paraformer re-transcription unavailable"}
-    second_py = _pinyin_text(second)
-    if not second_py:
-        return {"ok": False, "error": "pinyin unavailable"}
-    scores: dict[str, float] = {}
-    for candidate in unique:
-        cand_py = _pinyin_text(candidate)
-        if not cand_py:
-            scores[candidate] = 0.0
-            continue
-        scores[candidate] = difflib.SequenceMatcher(None, cand_py, second_py).ratio()
-    total = sum(scores.values())
-    if total <= 0:
-        return {"ok": False, "error": "no acoustic similarity"}
-    return {"ok": True, "scores": {candidate: value / total for candidate, value in scores.items()}}
 

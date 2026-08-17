@@ -10,6 +10,7 @@ set -a
 set +a
 
 export ASR_AUDIO_ENABLED="${ASR_AUDIO_ENABLED:-1}"
+export ASR_ACOUSTIC_DISAGREEMENT="${ASR_ACOUSTIC_DISAGREEMENT:-1}"
 export ASR_DOMAINTERMS_ROOT="${ASR_DOMAINTERMS_ROOT:-$ROOT/../ASR_domainterms}"
 export ASR_MODEL_PATH="${ASR_MODEL_PATH:-/home/ma-user/work/dataset/sjk_data/sjk/model_demo/checkpoint-793-merged}"
 export ASR_AUDIO_DIR="${ASR_AUDIO_DIR:-/home/ma-user/work/dataset/sjk_data/ASR_audio}"

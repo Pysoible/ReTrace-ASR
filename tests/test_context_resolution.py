@@ -171,3 +171,82 @@ def test_resolver_still_revises_when_proposed_is_not_already_in_the_turn():
 
     assert result.action == "REVISE_HISTORY"
     assert result.replacement == "涂博士"
+
+
+def test_acoustic_support_is_one_when_span_falls_in_disagreement_region():
+    """A focused span inside an acoustic-disagreement region (where two ASRs
+    disagreed) gets acoustic_support=1.0 — the audio is genuinely ambiguous
+    there, so the revision is better grounded."""
+    target = Turn(
+        "t1",
+        "这个连加额，那这个英雄跟那个跟螳螂还是有有渊源的是吧？",
+        "这个连加额，那这个英雄跟那个跟螳螂还是有有渊源的是吧？",
+        meta={
+            "uncertainty": {
+                "acoustic_disagreement": [
+                    {"tag": "replace", "span_a": "加额，", "span_b": "家的", "offset_a": 2, "offset_b": 2},
+                ]
+            }
+        },
+    )
+
+    assert EvidenceResolver._acoustic_support(target, "加额") == 1.0
+    assert EvidenceResolver._acoustic_support(target, "连加额") == 1.0
+
+
+def test_acoustic_support_is_zero_when_span_outside_disagreement():
+    """A span outside the disagreement region has acoustic_support=0.0."""
+    target = Turn(
+        "t1",
+        "这个连加额，那这个英雄跟那个跟螳螂还是有有渊源的是吧？",
+        "这个连加额，那这个英雄跟那个跟螳螂还是有有渊源的是吧？",
+        meta={
+            "uncertainty": {
+                "acoustic_disagreement": [
+                    {"tag": "replace", "span_a": "加额，", "span_b": "家的", "offset_a": 2, "offset_b": 2},
+                ]
+            }
+        },
+    )
+
+    assert EvidenceResolver._acoustic_support(target, "螳螂") == 0.0
+    assert EvidenceResolver._acoustic_support(target, "英雄") == 0.0
+
+
+def test_acoustic_support_is_zero_without_disagreement_meta():
+    """No acoustic_disagreement meta → acoustic_support=0.0 (graceful)."""
+    target = Turn("t1", "这个连加额，那这个英雄", "这个连加额，那这个英雄")
+
+    assert EvidenceResolver._acoustic_support(target, "连加额") == 0.0
+
+
+def test_acoustic_support_flows_into_revision_evidence():
+    """When the span is acoustically supported, the revision evidence records
+    the acoustic_disagreement marker."""
+    target = Turn(
+        "t1",
+        "这个连加额，那这个英雄跟那个跟螳螂还是有有渊源的是吧？",
+        "这个连加额，那这个英雄跟那个跟螳螂还是有有渊源的是吧？",
+        meta={
+            "audio_path": "/tmp/fake.wav",
+            "start_sec": 0.0,
+            "end_sec": 7.0,
+            "uncertainty": {
+                "acoustic_disagreement": [
+                    {"tag": "replace", "span_a": "加额，", "span_b": "家的", "offset_a": 2, "offset_b": 2},
+                ]
+            },
+        },
+    )
+    source = Turn("t2", "这个雷恩加尔", "这个雷恩加尔")
+    session = Session("s", turns=[target, source])
+    focus = FocusProposal("t1", "连加额", "雷恩加尔", ["连加额", "雷恩加尔"], ["t2"])
+
+    resolver = EvidenceResolver(
+        audio_verifier=lambda **_: {"ok": True, "scores": {"连加额": 0.05, "雷恩加尔": 0.95}}
+    )
+
+    result = resolver.resolve(session, source, focus, context_confidence=0.9)
+
+    assert result.action == "REVISE_HISTORY"
+    assert any("acoustic_disagreement" in item for item in result.evidence)

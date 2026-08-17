@@ -1,6 +1,7 @@
 """Resolve a Context Judge focus with targeted historical audio."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -30,6 +31,35 @@ class EvidenceResolver:
     ) -> None:
         self.audio_verifier = audio_verifier or verify_candidates
         self.policy = policy or DecisionPolicy()
+
+    @staticmethod
+    def _acoustic_support(target: Turn, span: str) -> float:
+        """1.0 when ``span`` falls inside an acoustic-disagreement region.
+
+        The disagreement regions are recorded on the turn during the first pass
+        (see ``acoustic.detect_asr_disagreement``) and mark where a second,
+        independent ASR disagreed with the first pass — error-dense regions.
+        A revision whose span lands in such a region is *acoustically supported*
+        (the audio is genuinely ambiguous there), so it becomes one of the
+        evidence features rather than a hard gate.
+        """
+        disagreement = (target.meta.get("uncertainty") or {}).get("acoustic_disagreement") or []
+        if not disagreement or not span:
+            return 0.0
+        # The disagreement offsets are relative to the timestamp-free transcript
+        # (the same text passed to detect_asr_disagreement), so strip the leading
+        # [start-end] timestamp from raw_text before locating the span.
+        text = re.sub(r"^\[\d+(?:\.\d+)?-\d+(?:\.\d+)?\]\s*", "", target.raw_text or "")
+        pos = text.find(span)
+        if pos < 0:
+            return 0.0
+        span_end = pos + len(span)
+        for item in disagreement:
+            start = int(item.get("offset_a") or 0)
+            end = start + len(str(item.get("span_a") or ""))
+            if start < span_end and pos < end:  # any character-level overlap
+                return 1.0
+        return 0.0
 
     def resolve(
         self,
@@ -105,48 +135,28 @@ class EvidenceResolver:
             return Resolution("KEEP_OLD", target.turn_id, focus.span, score=ordered[0][1] if ordered else 0.0)
         top = ordered[0][1]
         margin = top - (ordered[1][1] if len(ordered) > 1 else 0.0)
-        # Second acoustic gate (direction 2): a classical ASR (paraformer) votes
-        # on the same focused window. If the two acoustic models disagree — the
-        # LLM favors the proposed word but the classical ASR favors the original
-        # span — we conservatively DEFER rather than authorize a risky revision.
-        acoustic_vote: float | None = None
-        try:
-            from asr_agent.integrations import acoustic  # local import to avoid cycles
-
-            vote = acoustic.acoustic_verify(
-                audio_path=str(audio_path),
-                start_sec=float(start_sec),
-                end_sec=float(end_sec),
-                candidates=focus.alternatives,
-            )
-            if isinstance(vote, dict) and vote.get("ok") and isinstance(vote.get("scores"), dict):
-                vote_scores = vote["scores"]
-                vote_winner = max(vote_scores, key=lambda key: vote_scores[key])
-                if vote_winner == focus.span:
-                    return Resolution(
-                        "DEFER",
-                        target.turn_id,
-                        focus.span,
-                        score=top,
-                        rationale="second acoustic ASR (paraformer) disagrees with the proposed correction",
-                    )
-                acoustic_vote = float(vote_scores.get(focus.proposed_text, 0.0))
-        except Exception:
-            acoustic_vote = None
+        # Acoustic support: the focused span falls inside a region where two
+        # independent ASRs disagreed (error-dense). This is a *feature* fed into
+        # the calibration policy — it raises revision confidence when the audio
+        # is genuinely ambiguous at the span, and lowers it otherwise. It is not
+        # a hard gate: the closed-set verifier already did the authoritative
+        # acoustic check above.
+        acoustic_support = self._acoustic_support(target, focus.span)
         features = EvidenceFeatures(
             context_confidence=context_confidence,
             audio_confidence=top,
             audio_margin=margin,
             memory_support=memory_support,
             independent_sources=len(set(focus.evidence_turn_ids)),
+            acoustic_support=acoustic_support,
         )
         if self.policy.decide(features, has_audio=True) != "REVISE":
             return Resolution("DEFER", target.turn_id, focus.span, score=top, rationale="evidence below bootstrap policy")
         action = "REVISE_CURRENT" if target.turn_id == source_turn.turn_id else "REVISE_HISTORY"
         evidence = [f"context:{turn_id}" for turn_id in focus.evidence_turn_ids]
         evidence.append(f"audio:{audio_path}:{start_sec}-{end_sec}")
-        if acoustic_vote is not None:
-            evidence.append(f"acoustic_vote:{focus.proposed_text}")
+        if acoustic_support:
+            evidence.append(f"acoustic_disagreement:{focus.span}")
         return Resolution(
             action,
             target.turn_id,

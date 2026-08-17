@@ -12,6 +12,9 @@ class EvidenceFeatures:
     audio_margin: float = 0.0
     memory_support: float = 0.0
     independent_sources: int = 0
+    # Acoustic-disagreement support: 1.0 when the focused span falls inside a
+    # region where two independent ASRs disagreed (an error-dense region), else 0.0.
+    acoustic_support: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,9 @@ class LinearLogitCalibrator:
     margin_weight: float = 1.5
     memory_weight: float = 0.5
     sources_weight: float = 0.2
+    # Weight for the acoustic-disagreement support: a focused span that falls in
+    # an error-dense disagreement region is more likely to be a true mis-hearing.
+    acoustic_weight: float = 0.8
 
     def predict(self, features: EvidenceFeatures) -> float:
         z = (
@@ -89,6 +95,7 @@ class LinearLogitCalibrator:
             + self.margin_weight * features.audio_margin
             + self.memory_weight * features.memory_support
             + self.sources_weight * min(3, features.independent_sources)
+            + self.acoustic_weight * features.acoustic_support
         )
         return 1.0 / (1.0 + exp(-z))
 
