@@ -166,10 +166,16 @@ class ReTraceService:
             # conflicted) but could not point at a specific span, go back to the
             # audio and re-transcribe the window. This catches garbled proper
             # nouns even when the correct word was never mentioned in memory.
+            # Char-level acoustic confidence (low_conf_chars) is an independent
+            # acoustic doubt signal: even a CONSISTENT judgment is overridden so
+            # the agent re-listens to a window the acoustic model itself flagged
+            # as unreliable — audio evidence drives both *whether* to doubt and
+            # *whether* to adopt the relisten, instead of the LLM judge alone.
+            has_acoustic_doubt = bool((trigger.meta.get("uncertainty") or {}).get("low_conf_chars"))
             if (
                 not recovery_event
-                and judgment.outcome in {"UNCERTAIN", "CONFLICT"}
                 and not judgment.focus
+                and (judgment.outcome in {"UNCERTAIN", "CONFLICT"} or has_acoustic_doubt)
             ):
                 relisten_event = self._relisten_uncertain_window(
                     snapshot,
@@ -472,34 +478,52 @@ class ReTraceService:
         audio_path = meta.get("audio_path")
         if not audio_path or start_sec is None or end_sec is None:
             return None
-        hints = None
-        if memory is not None:
-            try:
-                from asr_agent.integrations.deepseek import _domain_entities
-
-                hints = _domain_entities(memory) or None
-            except Exception:
-                hints = None
-        try:
-            result = self.audio_retranscriber(
-                audio_path=str(audio_path),
-                start_sec=float(start_sec),
-                end_sec=float(end_sec),
-                domain_hints=hints,
-            )
-        except Exception as exc:
-            meta["relisten_uncertain"] = {"error": f"audio re-transcription failed: {exc}"}
-            return None
-        payload = result if isinstance(result, dict) else {}
-        candidate = str(payload.get("text") or "").strip() if payload.get("ok") else ""
-        if not candidate:
-            meta["relisten_uncertain"] = {"error": str(payload.get("error") or "empty relisten")}
-            return None
 
         def _strip(ts: str) -> str:
             return re.sub(r"^\[\d+(?:\.\d+)?-\d+(?:\.\d+)?\]\s*", "", ts).strip()
 
         raw_body = _strip(turn.raw_text)
+        # Char-level acoustic confidence already gave us the second ASR's own
+        # transcript (paraformer_text) with per-character confidence. Use a
+        # *high-confidence* char-level correction as the "second opinion": it
+        # only rewrites characters the second ASR was itself sure about, which is
+        # far safer than wholesale adopting paraformer's whole transcript.
+        uncertainty = meta.get("uncertainty") or {}
+        paraformer_text = str(uncertainty.get("paraformer_text") or "").strip()
+        char_confs = uncertainty.get("paraformer_char_confs") or []
+        hints: list[str] | None = None
+        is_high_conf = False
+        if paraformer_text and char_confs:
+            from asr_agent.integrations import acoustic
+
+            candidate = acoustic.high_conf_correction(raw_body, paraformer_text, char_confs)
+            is_high_conf = True
+        elif paraformer_text:
+            candidate = paraformer_text
+        else:
+            if memory is not None:
+                try:
+                    from asr_agent.integrations.deepseek import _domain_entities
+
+                    hints = _domain_entities(memory) or None
+                except Exception:
+                    hints = None
+            try:
+                result = self.audio_retranscriber(
+                    audio_path=str(audio_path),
+                    start_sec=float(start_sec),
+                    end_sec=float(end_sec),
+                    domain_hints=hints,
+                )
+            except Exception as exc:
+                meta["relisten_uncertain"] = {"error": f"audio re-transcription failed: {exc}"}
+                return None
+            payload = result if isinstance(result, dict) else {}
+            candidate = str(payload.get("text") or "").strip() if payload.get("ok") else ""
+        if not candidate:
+            meta["relisten_uncertain"] = {"error": "empty relisten"}
+            return None
+
         cand_body = _strip(candidate)
         if not raw_body or not cand_body:
             return None
@@ -510,12 +534,15 @@ class ReTraceService:
         if raw_keep == cand_keep:
             meta["relisten_uncertain"] = {"relistened": True, "changed": False}
             return None
-        # Require the relisten to be substantially different (and plausibly better:
-        # not longer garbage repetition). Guard against relisten being degenerate.
         import difflib
 
         ratio = difflib.SequenceMatcher(None, raw_keep, cand_keep).ratio()
-        if ratio > 0.9:
+        # A high-confidence char-level correction changes only a few characters
+        # by design, so its similarity ratio is naturally near 1.0 — do NOT reject
+        # it for being "too similar". The whole point of the correction is that a
+        # small, acoustically-confident edit is applied. For other relistens, a
+        # ratio > 0.9 means the relisten is essentially the same transcript.
+        if not is_high_conf and ratio > 0.9:
             meta["relisten_uncertain"] = {"relistened": True, "changed": False, "ratio": round(ratio, 3)}
             return None
         # A relisten that merely differs from the first pass is NOT automatically
@@ -528,7 +555,16 @@ class ReTraceService:
         raw_assessment = assess_transcript(raw_body)
         cand_assessment = assess_transcript(cand_body)
         hint_matches = [h for h in (hints or []) if h and h in cand_body]
-        adopt = bool(hint_matches) or (raw_assessment.degenerate and not cand_assessment.degenerate)
+        # Exception: when the second ASR itself flagged low-confidence characters
+        # (char-level acoustic confidence), we have independent acoustic evidence
+        # that this exact window is unreliable. The agent may then adopt the
+        # relisten even without a remembered entity, provided the candidate is
+        # not itself degenerate. This is the audio-driven correction path.
+        low_conf_chars = (turn.meta.get("uncertainty") or {}).get("low_conf_chars")
+        has_acoustic_doubt = bool(low_conf_chars)
+        adopt = bool(hint_matches) or (
+            raw_assessment.degenerate and not cand_assessment.degenerate
+        ) or ((has_acoustic_doubt or is_high_conf) and not cand_assessment.degenerate)
         if not adopt:
             meta["relisten_uncertain"] = {
                 "relistened": True,
@@ -543,7 +579,14 @@ class ReTraceService:
         original_prefix = prefix_match.group(1) if prefix_match else ""
         cand_no_ts = _strip(candidate)
         after_text = f"{original_prefix}{cand_no_ts}"
-        meta["relisten_uncertain"] = {"relistened": True, "changed": True, "ratio": round(ratio, 3), "replacement": cand_no_ts}
+        meta["relisten_uncertain"] = {
+            "relistened": True,
+            "changed": True,
+            "ratio": round(ratio, 3),
+            "replacement": cand_no_ts,
+            "acoustic_doubt": has_acoustic_doubt,
+            "low_conf_chars": low_conf_chars,
+        }
         return RevisionEvent(
             event_id=self._event_id(
                 session.session_id,
@@ -560,7 +603,7 @@ class ReTraceService:
             after_text=after_text,
             entity_id=None,
             score=max(0.0, min(1.0, 1.0 - ratio)),
-            evidence=[f"audio:{audio_path}:{start_sec}-{end_sec}", "uncertainty:relisten"],
+            evidence=[f"audio:{audio_path}:{start_sec}-{end_sec}", "uncertainty:relisten", *(["acoustic:low-conf-chars"] if has_acoustic_doubt else [])],
             resolver="audio-uncertainty-relisten",
             rationale="open relisten of an uncertain window recovered a different transcript",
             replacement=cand_no_ts,

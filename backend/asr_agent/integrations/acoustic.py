@@ -171,12 +171,88 @@ def acoustic_signals(
     This is the single acoustic entry point used by the streaming pipeline, so a
     chunk is never transcribed twice by the second ASR.
     """
+    full = acoustic_signals_full(
+        audio_path, first_pass_text, min_span=min_span, low_conf_threshold=low_conf_threshold
+    )
+    return full["disagreements"], full["low_conf_chars"]
+
+
+def acoustic_signals_full(
+    audio_path: str | Path,
+    first_pass_text: str,
+    *,
+    min_span: int = 2,
+    low_conf_threshold: float = 0.75,
+) -> dict[str, Any]:
+    """One paraformer forward pass → all acoustic signals in a single dict.
+
+    ``paraformer_text`` and ``char_confs`` are kept so the agent can use the
+    second ASR's own transcript (with per-character confidence) as a "second
+    opinion" when re-listening to an acoustically doubtful window, rather than
+    re-running the same first-pass model.
+    """
     second, char_confs = _transcribe_paraformer_detailed(audio_path)
     disagreements: list[dict[str, Any]] = []
     if second and first_pass_text:
         disagreements = _diff_texts(first_pass_text, second, min_span)
     low_conf = [c for c in char_confs if c["conf"] < low_conf_threshold]
-    return disagreements, low_conf
+    return {
+        "disagreements": disagreements,
+        "low_conf_chars": low_conf,
+        "paraformer_text": second,
+        "char_confs": char_confs,
+    }
+
+
+def _keep_chars(text: str) -> str:
+    return "".join(ch for ch in text if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+
+
+def high_conf_correction(
+    first_pass_text: str,
+    paraformer_text: str,
+    char_confs: list[dict[str, Any]],
+    *,
+    min_conf: float = 0.85,
+) -> str:
+    """Char-level correction using the second ASR's high-confidence disagreement.
+
+    Diff the first pass against the paraformer transcript and apply only the
+    differences where paraformer's own decoder confidence is >= ``min_conf``.
+    Low-confidence paraformer characters are *not* trusted (the model itself is
+    unsure there), and deletions (chars paraformer dropped) are kept from the
+    first pass to avoid introducing new omissions. This is a precise alternative
+    to wholesale replacing the transcript with paraformer's version.
+    """
+    if not paraformer_text or not char_confs:
+        return first_pass_text
+    pf_clean = _keep_chars(paraformer_text)
+    fp_clean = _keep_chars(first_pass_text)
+    if not pf_clean or not fp_clean:
+        return first_pass_text
+    # char_confs must align 1:1 with pf_clean; otherwise bail out safely.
+    if len(char_confs) != len(pf_clean) or any(
+        c["char"] != ch for c, ch in zip(char_confs, pf_clean)
+    ):
+        return first_pass_text
+    confs = [float(c["conf"]) for c in char_confs]
+
+    def _high(j1: int, j2: int) -> bool:
+        return j2 > j1 and all(confs[j] >= min_conf for j in range(j1, j2))
+
+    sm = difflib.SequenceMatcher(None, fp_clean, pf_clean, autojunk=False)
+    out: list[str] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            out.append(fp_clean[i1:i2])
+        elif tag == "replace":
+            out.append(pf_clean[j1:j2] if _high(j1, j2) else fp_clean[i1:i2])
+        elif tag == "insert":
+            if _high(j1, j2):
+                out.append(pf_clean[j1:j2])
+        elif tag == "delete":
+            out.append(fp_clean[i1:i2])
+    return "".join(out)
 
 
 def detect_asr_disagreement(

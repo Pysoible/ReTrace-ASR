@@ -600,25 +600,30 @@ def _is_truncated(chunk_path: Path, text: str, *, min_chars_per_sec: float = 1.5
 
 
 def _attach_acoustic_disagreement(chunk_path: Path, text: str, uncertainty: dict[str, Any]) -> dict[str, Any]:
-    """Run a second independent ASR (paraformer) once and attach two acoustic
-    uncertainty signals: (1) spans where the two acoustic models disagree, and
-    (2) characters whose paraformer decoder confidence is low — both genuine
-    acoustic-uncertainty signals independent of the LLM judge and of Qwen's
-    self-reported confidence."""
+    """Run a second independent ASR (paraformer) once and attach acoustic
+    uncertainty signals: (1) spans where the two acoustic models disagree,
+    (2) characters whose paraformer decoder confidence is low, and (3) the
+    paraformer transcript itself (with per-character confidence) as a "second
+    opinion" the agent can use for correction — all independent of the LLM judge
+    and of Qwen's self-reported confidence."""
     if not _acoustic_disagreement_enabled() or not text:
         return uncertainty
     try:
         from asr_agent.integrations import acoustic  # local import to avoid cycles
 
-        disagreements, low_conf = acoustic.acoustic_signals(chunk_path, text)
+        signals = acoustic.acoustic_signals_full(chunk_path, text)
     except Exception:
         return uncertainty
-    if disagreements or low_conf:
+    if signals["disagreements"] or signals["low_conf_chars"] or signals["paraformer_text"]:
         uncertainty = dict(uncertainty)
-        if disagreements:
-            uncertainty["acoustic_disagreement"] = disagreements
-        if low_conf:
-            uncertainty["low_conf_chars"] = low_conf
+        if signals["disagreements"]:
+            uncertainty["acoustic_disagreement"] = signals["disagreements"]
+        if signals["low_conf_chars"]:
+            uncertainty["low_conf_chars"] = signals["low_conf_chars"]
+        if signals["paraformer_text"]:
+            uncertainty["paraformer_text"] = signals["paraformer_text"]
+        if signals["char_confs"]:
+            uncertainty["paraformer_char_confs"] = signals["char_confs"]
     return uncertainty
 
 

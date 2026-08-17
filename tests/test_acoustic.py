@@ -43,3 +43,47 @@ def test_detect_asr_disagreement_uses_shared_diff(monkeypatch):
     monkeypatch.setattr(acoustic, "_transcribe_paraformer", lambda _p: "我是张三")
     spans = acoustic.detect_asr_disagreement("/tmp/x.wav", "我是李四")
     assert any("张三" in s["span_b"] or "李四" in s["span_a"] for s in spans)
+
+
+def test_high_conf_correction_replaces_only_high_conf_disagreement():
+    # "吗" (first pass) vs "呢" (paraformer, high conf) → replace.
+    fp = "你对这个游戏有什么看法吗"
+    pf = "你对这个游戏有什么看法呢"
+    confs = [
+        {"char": "你", "conf": 0.9}, {"char": "对", "conf": 0.9}, {"char": "这", "conf": 0.9},
+        {"char": "个", "conf": 0.9}, {"char": "游", "conf": 0.9}, {"char": "戏", "conf": 0.9},
+        {"char": "有", "conf": 0.9}, {"char": "什", "conf": 0.9}, {"char": "么", "conf": 0.9},
+        {"char": "看", "conf": 0.9}, {"char": "法", "conf": 0.9}, {"char": "呢", "conf": 0.92},
+    ]
+    assert acoustic.high_conf_correction(fp, pf, confs) == "你对这个游戏有什么看法呢"
+
+
+def test_high_conf_correction_keeps_low_conf_first_pass_char():
+    # paraformer's "呢" is low-confidence → keep first-pass "吗".
+    fp = "你对这个游戏有什么看法吗"
+    pf = "你对这个游戏有什么看法呢"
+    confs = [
+        {"char": "你", "conf": 0.9}, {"char": "对", "conf": 0.9}, {"char": "这", "conf": 0.9},
+        {"char": "个", "conf": 0.9}, {"char": "游", "conf": 0.9}, {"char": "戏", "conf": 0.9},
+        {"char": "有", "conf": 0.9}, {"char": "什", "conf": 0.9}, {"char": "么", "conf": 0.9},
+        {"char": "看", "conf": 0.9}, {"char": "法", "conf": 0.9}, {"char": "呢", "conf": 0.55},
+    ]
+    assert acoustic.high_conf_correction(fp, pf, confs) == "你对这个游戏有什么看法吗"
+
+
+def test_high_conf_correction_inserts_high_conf_omitted_chars():
+    # paraformer has extra chars with high confidence → insert (fix omission).
+    fp = "我吃"
+    pf = "我吃饭"
+    confs = [
+        {"char": "我", "conf": 0.9}, {"char": "吃", "conf": 0.9},
+        {"char": "饭", "conf": 0.88},
+    ]
+    assert acoustic.high_conf_correction(fp, pf, confs) == "我吃饭"
+
+
+def test_high_conf_correction_bails_on_misaligned_confs():
+    fp = "我吃"
+    pf = "我吃饭"
+    confs = [{"char": "我", "conf": 0.9}]  # length mismatch → bail out
+    assert acoustic.high_conf_correction(fp, pf, confs) == "我吃"
