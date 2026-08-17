@@ -221,8 +221,8 @@ def high_conf_correction(
     differences where paraformer's own decoder confidence is >= ``min_conf``.
     Low-confidence paraformer characters are *not* trusted (the model itself is
     unsure there), and deletions (chars paraformer dropped) are kept from the
-    first pass to avoid introducing new omissions. This is a precise alternative
-    to wholesale replacing the transcript with paraformer's version.
+    first pass to avoid introducing new omissions. Edits are applied at exact
+    character positions, so the first pass's punctuation is preserved.
     """
     if not paraformer_text or not char_confs:
         return first_pass_text
@@ -240,19 +240,31 @@ def high_conf_correction(
     def _high(j1: int, j2: int) -> bool:
         return j2 > j1 and all(confs[j] >= min_conf for j in range(j1, j2))
 
+    # Original positions of the CJK/alnum characters in first_pass_text.
+    fp_pos = [i for i, ch in enumerate(first_pass_text) if ch.isalnum() or "\u4e00" <= ch <= "\u9fff"]
+
     sm = difflib.SequenceMatcher(None, fp_clean, pf_clean, autojunk=False)
-    out: list[str] = []
+    edits: list[tuple[int, int, str]] = []  # (start, end, replacement)
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
-            out.append(fp_clean[i1:i2])
-        elif tag == "replace":
-            out.append(pf_clean[j1:j2] if _high(j1, j2) else fp_clean[i1:i2])
-        elif tag == "insert":
-            if _high(j1, j2):
-                out.append(pf_clean[j1:j2])
+            continue
+        if tag == "replace" and _high(j1, j2):
+            start = fp_pos[i1]
+            end = fp_pos[i2 - 1] + 1 if i2 > i1 else fp_pos[i1]
+            edits.append((start, end, pf_clean[j1:j2]))
+        elif tag == "insert" and _high(j1, j2):
+            # Insert after the i1-th character (or at the very start).
+            pos = 0 if i1 == 0 else fp_pos[i1 - 1] + 1
+            edits.append((pos, pos, pf_clean[j1:j2]))
         elif tag == "delete":
-            out.append(fp_clean[i1:i2])
-    return "".join(out)
+            pass  # keep first pass chars paraformer dropped
+    if not edits:
+        return first_pass_text
+    # Apply from right to left so earlier positions stay valid.
+    chars = list(first_pass_text)
+    for start, end, repl in sorted(edits, reverse=True):
+        chars[start:end] = repl
+    return "".join(chars)
 
 
 def detect_asr_disagreement(
