@@ -208,6 +208,40 @@ def _keep_chars(text: str) -> str:
     return "".join(ch for ch in text if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
 
 
+def _pinyin_similar(a: str, b: str) -> bool:
+    """True when two multi-char spans are near-homophones (transliteration variants).
+
+    A proper noun in a session is usually one of several near-homophone
+    transliterations (e.g. an in-game hero name). A paraformer "correction" that
+    swaps one transliteration for another is not fixing a mis-hearing — it is
+    just introducing a *second* spelling of the same entity, breaking session
+    consistency. We therefore decline such replacements: if the first pass and
+    paraformer spans share most syllables, keep the first pass spelling.
+
+    Single-character spans return False here; callers expand single-character
+    diffs with surrounding context before judging (see ``high_conf_correction``).
+    """
+    if not a or not b or a == b:
+        return False
+    if len(a) < 2 or len(b) < 2:
+        return False
+    try:
+        from pypinyin import lazy_pinyin
+
+        pa = [p for p in lazy_pinyin(a)]
+        pb = [p for p in lazy_pinyin(b)]
+    except Exception:  # pragma: no cover - optional dependency
+        return False
+    if not pa or not pb:
+        return False
+    if pa == pb:
+        return True  # identical syllables over multiple chars → transliteration variant
+    if len(pa) == len(pb):
+        same = sum(1 for x, y in zip(pa, pb) if x == y)
+        return same / len(pa) >= 0.5
+    return False
+
+
 def high_conf_correction(
     first_pass_text: str,
     paraformer_text: str,
@@ -221,8 +255,10 @@ def high_conf_correction(
     differences where paraformer's own decoder confidence is >= ``min_conf``.
     Low-confidence paraformer characters are *not* trusted (the model itself is
     unsure there), and deletions (chars paraformer dropped) are kept from the
-    first pass to avoid introducing new omissions. Edits are applied at exact
-    character positions, so the first pass's punctuation is preserved.
+    first pass to avoid introducing new omissions. Multi-character near-homophone
+    replacements (transliteration variants) are declined to keep one spelling of
+    an entity throughout the session. Edits are applied at exact character
+    positions, so the first pass's punctuation is preserved.
     """
     if not paraformer_text or not char_confs:
         return first_pass_text
@@ -240,6 +276,24 @@ def high_conf_correction(
     def _high(j1: int, j2: int) -> bool:
         return j2 > j1 and all(confs[j] >= min_conf for j in range(j1, j2))
 
+    def _is_transliteration_variant(i1: int, i2: int, j1: int, j2: int) -> bool:
+        span_a = fp_clean[i1:i2]
+        span_b = pf_clean[j1:j2]
+        if _pinyin_similar(span_a, span_b):
+            return True
+        # SequenceMatcher often splits a multi-character transliteration into a
+        # one-character replacement surrounded by equal characters. Compare a
+        # one-character difference with one shared character on either side so
+        # "卡兹克" → "卡斯克" remains one protected entity-level variant.
+        if len(span_a) == len(span_b) == 1:
+            left_a = fp_clean[max(0, i1 - 1):i1]
+            left_b = pf_clean[max(0, j1 - 1):j1]
+            right_a = fp_clean[i2:i2 + 1]
+            right_b = pf_clean[j2:j2 + 1]
+            if left_a == left_b and right_a == right_b and left_a and right_a:
+                return _pinyin_similar(left_a + span_a + right_a, left_b + span_b + right_b)
+        return False
+
     # Original positions of the CJK/alnum characters in first_pass_text.
     fp_pos = [i for i, ch in enumerate(first_pass_text) if ch.isalnum() or "\u4e00" <= ch <= "\u9fff"]
 
@@ -249,9 +303,13 @@ def high_conf_correction(
         if tag == "equal":
             continue
         if tag == "replace" and _high(j1, j2):
+            span_a = fp_clean[i1:i2]
+            span_b = pf_clean[j1:j2]
+            if _is_transliteration_variant(i1, i2, j1, j2):
+                continue  # transliteration variant — keep the first pass spelling
             start = fp_pos[i1]
             end = fp_pos[i2 - 1] + 1 if i2 > i1 else fp_pos[i1]
-            edits.append((start, end, pf_clean[j1:j2]))
+            edits.append((start, end, span_b))
         elif tag == "insert" and _high(j1, j2):
             # Insert after the i1-th character (or at the very start).
             pos = 0 if i1 == 0 else fp_pos[i1 - 1] + 1

@@ -118,3 +118,47 @@ def test_high_conf_correction_returns_original_when_no_change():
     confs = [{"char": "你", "conf": 0.9}, {"char": "好", "conf": 0.9},
              {"char": "世", "conf": 0.9}, {"char": "界", "conf": 0.9}]
     assert acoustic.high_conf_correction(fp, pf, confs) == "你好，世界。"
+
+
+def _fake_pypinyin(monkeypatch):
+    """Inject a fake pypinyin with a small syllable map for test characters."""
+    import sys
+    import types
+
+    syl = {
+        "卡": "ka", "兹": "zi", "斯": "si", "克": "ke",
+        "它": "ta", "他": "ta", "吗": "ma", "呢": "ne",
+        "你": "ni", "好": "hao", "世": "shi", "界": "jie",
+        "对": "dui", "这": "zhe", "个": "ge", "游": "you",
+        "戏": "xi", "有": "you", "什": "shen", "么": "me",
+        "看": "kan", "法": "fa", "我": "wo", "吃": "chi", "饭": "fan",
+    }
+    mod = types.ModuleType("pypinyin")
+    mod.lazy_pinyin = lambda s: [syl.get(ch, ch) for ch in s]
+    monkeypatch.setitem(sys.modules, "pypinyin", mod)
+    return mod
+
+
+def test_high_conf_correction_declines_transliteration_variant(monkeypatch):
+    _fake_pypinyin(monkeypatch)
+    # "卡兹克" vs "卡斯克" are near-homophone transliterations → keep "卡兹克".
+    fp = "把卡兹克杀了的话"
+    pf = "把卡斯克杀了的话"
+    confs = [
+        {"char": "把", "conf": 0.9}, {"char": "卡", "conf": 0.9}, {"char": "斯", "conf": 0.9},
+        {"char": "克", "conf": 0.9}, {"char": "杀", "conf": 0.9}, {"char": "了", "conf": 0.9},
+        {"char": "的", "conf": 0.9}, {"char": "话", "conf": 0.9},
+    ]
+    assert acoustic.high_conf_correction(fp, pf, confs) == "把卡兹克杀了的话"
+
+
+def test_high_conf_correction_allows_single_char_homophone(monkeypatch):
+    _fake_pypinyin(monkeypatch)
+    # Single-char homophones ("它"/"他") are still corrected.
+    fp = "它充了一千"
+    pf = "他充了一千"
+    confs = [
+        {"char": "他", "conf": 0.9}, {"char": "充", "conf": 0.9}, {"char": "了", "conf": 0.9},
+        {"char": "一", "conf": 0.9}, {"char": "千", "conf": 0.9},
+    ]
+    assert acoustic.high_conf_correction(fp, pf, confs) == "他充了一千"
