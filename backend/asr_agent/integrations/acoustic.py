@@ -35,6 +35,7 @@ PARAFORMER_MODEL = os.environ.get(
     "ASR_ACOUSTIC_MODEL",
     "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
 )
+PARAFORMER_DEVICE = os.environ.get("ASR_ACOUSTIC_DEVICE", "cpu")
 
 
 def _load_mono(path: str | Path, target_sr: int = 16000) -> tuple[np.ndarray, int]:
@@ -59,7 +60,12 @@ def _get_paraformer() -> Any:
             try:
                 from funasr import AutoModel
 
-                _PARAFORMER = AutoModel(model=PARAFORMER_MODEL, disable_update=True)
+                _PARAFORMER = AutoModel(
+                    model=PARAFORMER_MODEL,
+                    device=PARAFORMER_DEVICE,
+                    disable_update=True,
+                    disable_pbar=True,
+                )
             except Exception:  # pragma: no cover - optional dependency
                 _PARAFORMER = False
         return _PARAFORMER

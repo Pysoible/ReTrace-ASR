@@ -10,7 +10,11 @@ set -a
 set +a
 
 export ASR_AUDIO_ENABLED="${ASR_AUDIO_ENABLED:-1}"
-export ASR_ACOUSTIC_DISAGREEMENT="${ASR_ACOUSTIC_DISAGREEMENT:-1}"
+# VAD coverage is always available to the agent. The 840M second ASR is an
+# optional offline/low-throughput evidence source: enabling it on Qwen's already
+# saturated GPUs can stall the realtime transcription path.
+export ASR_ACOUSTIC_DISAGREEMENT="${ASR_ACOUSTIC_DISAGREEMENT:-0}"
+export ASR_ACOUSTIC_DEVICE="${ASR_ACOUSTIC_DEVICE:-cpu}"
 # Optional local HuggingFace embedding checkpoint for dense memory retrieval.
 # Leave empty for the dependency-free BM25 + char n-gram hybrid retriever.
 export ASR_MEMORY_EMBEDDING_MODEL="${ASR_MEMORY_EMBEDDING_MODEL:-}"
