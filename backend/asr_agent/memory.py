@@ -23,6 +23,9 @@ class MemoryPacket:
     working_beliefs: list[MemoryBelief] = field(default_factory=list)
     open_hypotheses: list[WorkingHypothesis] = field(default_factory=list)
     long_term_beliefs: list[MemoryBelief] = field(default_factory=list)
+    # Agent-confirmed entity spellings, separate from generic factual beliefs.
+    # These are only created after context + targeted-audio verification.
+    canonical_entities: list[MemoryBelief] = field(default_factory=list)
 
 
 class LongTermMemoryRepository:
@@ -97,13 +100,34 @@ class MemoryRetriever:
             durable = self._relevant_long_term(stable, session, current_turn)
         except (OSError, ValueError, json.JSONDecodeError):
             durable = []
+        canonical_entities = self._canonical_entities(session, durable)
         return MemoryPacket(
             recent_turns=session.turns[-self.recent_limit :],
             dependent_turns=dependent,
             working_beliefs=list(session.working_beliefs.values()),
             open_hypotheses=[item for item in session.open_hypotheses.values() if item.status == "active"],
             long_term_beliefs=durable[: self.long_term_limit],
+            canonical_entities=canonical_entities[: self.long_term_limit],
         )
+
+    @staticmethod
+    def _canonical_entities(session: Session, durable: list[MemoryBelief]) -> list[MemoryBelief]:
+        """Return verified, canonical entity spellings available to the agent.
+
+        Generic ``canonical_text`` beliefs can be ordinary phrase repairs, so
+        they must never become entity memory. ``canonical_entity`` beliefs are
+        created only by the resolver after context and targeted audio agree.
+        """
+        candidates = [*session.working_beliefs.values(), *durable]
+        entities = [
+            item
+            for item in candidates
+            if item.status != "superseded"
+            and item.predicate == "canonical_entity"
+            and "audio_verified" in item.evidence_kinds
+            and len(item.value.strip()) >= 2
+        ]
+        return sorted(entities, key=lambda item: item.confidence, reverse=True)
 
     @staticmethod
     def _relevant_long_term(

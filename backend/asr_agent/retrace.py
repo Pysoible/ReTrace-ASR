@@ -774,8 +774,8 @@ class ReTraceService:
         belief_id = f"belief-{uuid4().hex}"
         session.working_beliefs[belief_id] = MemoryBelief(
             belief_id=belief_id,
-            subject=f"turn:{focus.target_turn_id}:canonical_span",
-            predicate="canonical_text",
+            subject=f"turn:{focus.target_turn_id}:canonical_entity",
+            predicate="canonical_entity",
             value=focus.proposed_text,
             aliases=[focus.span],
             confidence=0.9,

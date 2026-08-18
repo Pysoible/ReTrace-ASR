@@ -89,3 +89,19 @@ def test_domain_entities_exclude_canonical_text():
     assert "是说" not in entities
     assert "是设" not in entities
     assert "皇子" in entities
+
+
+def test_canonical_entities_are_exposed_separately_with_audio_provenance():
+    from asr_agent.models import MemoryBelief
+
+    memory = MemoryPacket(canonical_entities=[
+        MemoryBelief(
+            belief_id="e1", subject="turn:t1:canonical_entity", predicate="canonical_entity",
+            value="卡兹克", aliases=["卡斯克"], confidence=0.9, status="provisional",
+            source_turn_ids=["t1"], source_session_ids=["s"], evidence_kinds=["audio_verified"],
+        )
+    ])
+
+    assert deepseek._canonical_entities(memory) == [{
+        "canonical": "卡兹克", "aliases": ["卡斯克"], "confidence": 0.9, "evidence_turn_ids": ["t1"],
+    }]

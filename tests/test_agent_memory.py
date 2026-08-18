@@ -89,3 +89,28 @@ def test_retriever_includes_dependency_turns_and_filters_unrelated_long_term(tmp
 
     assert [turn.turn_id for turn in packet.dependent_turns] == ["t1"]
     assert [item.belief_id for item in packet.long_term_beliefs] == ["relevant"]
+
+
+def test_retriever_exposes_audio_verified_canonical_entity_to_agent(tmp_path):
+    store = LongTermMemoryRepository(tmp_path)
+    canonical = MemoryBelief(
+        belief_id="champion",
+        subject="turn:t1:canonical_entity",
+        predicate="canonical_entity",
+        value="卡兹克",
+        aliases=["卡斯克"],
+        confidence=0.9,
+        status="provisional",
+        source_turn_ids=["t1"],
+        source_session_ids=["s1"],
+        evidence_kinds=["context", "audio_verified"],
+    )
+    session = Session(
+        "s1",
+        turns=[Turn("t1", "卡兹克", "卡兹克"), Turn("t2", "卡斯克", "卡斯克")],
+        working_beliefs={canonical.belief_id: canonical},
+    )
+
+    packet = MemoryRetriever(store).retrieve(session, session.turns[-1])
+
+    assert [(item.value, item.aliases) for item in packet.canonical_entities] == [("卡兹克", ["卡斯克"])]

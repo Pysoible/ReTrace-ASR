@@ -50,6 +50,11 @@ _CONTEXT_JUDGE_SYSTEM = (
     "直接体现。你应当把它们视为'此处可能听错'的线索，与语义判断结合使用：如果某个低置信度字与上下文"
     "不搭、或读起来像某个已知专有名词/领域词，则更可能是 ASR 错误，可在 focus 中针对该字所在的最短"
     "词提出候选。反之，如果低置信度字在语义上完全通顺，则不必强行修订。"
+    "user 消息里的 canonical_entities 是 agent 已经通过上下文与定向音频验证确认过的实体规范写法，"
+    "每项有 canonical、aliases 与证据 turn。它们用于保证一个 session 内同一实体只有一种写法：当"
+    "current_turn 出现 alias 或另一种近音音译，而语境指向同一实体时，应提出 canonical 作为 proposed_text，"
+    "并把原写法与 canonical 一起放入 alternatives，让后续定向音频验证决定；不得仅凭 memory 直接改字。"
+    "如果不同写法可能确实指向不同实体，或没有明确语境与声学疑点，则保持 CONSISTENT/UNCERTAIN，不要强行统一。"
     "用 beliefs 输出有原文 Turn 证据的结构化新事实：subject、predicate、value、aliases、confidence、"
     "valid_from、valid_to、evidence_turn_ids。"
     "仅在 CONFLICT 或 UNCERTAIN 且存在具体证据时给出 focus；每个 focus 必须包含 "
@@ -131,6 +136,24 @@ def _domain_entities(memory: MemoryPacket) -> list[str]:
     return entities
 
 
+def _canonical_entities(memory: MemoryPacket) -> list[dict[str, object]]:
+    """Return agent-verified entity identities, including observed aliases.
+
+    Unlike ``domain_entities``, these have an explicit audio-verification
+    provenance and must be treated as the preferred spelling when an alias or
+    acoustic alternative appears later in the same session.
+    """
+    return [
+        {
+            "canonical": belief.value,
+            "aliases": list(belief.aliases),
+            "confidence": belief.confidence,
+            "evidence_turn_ids": list(belief.source_turn_ids),
+        }
+        for belief in memory.canonical_entities
+    ]
+
+
 def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket) -> ContextJudgment:
     """Judge context semantically; malformed or unavailable models safely defer.
 
@@ -153,6 +176,7 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
         "open_hypotheses": [item.as_dict() for item in memory.open_hypotheses],
         "long_term_beliefs": [item.as_dict() for item in memory.long_term_beliefs],
         "domain_entities": _domain_entities(memory),
+        "canonical_entities": _canonical_entities(memory),
         # Acoustic uncertainty: spans where a second independent ASR disagreed
         # with the first pass. These are strong candidates for mis-hearings.
         "acoustic_disagreement": acoustic_disagreement,
