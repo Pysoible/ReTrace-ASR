@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
 import tempfile
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock, RLock
@@ -14,6 +17,127 @@ from asr_agent.models import MemoryBelief, Session, Turn, WorkingHypothesis
 
 _MEMORY_LOCKS: dict[tuple[Path, str], RLock] = {}
 _MEMORY_LOCKS_GUARD = Lock()
+
+
+def _memory_terms(text: str) -> list[str]:
+    """Tokenize Chinese/Latin text for retrieval without a segmentation model."""
+    normalized = "".join(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", text or "")).lower()
+    if not normalized:
+        return []
+    # Character unigrams retain short names; bigrams provide useful semantic-ish
+    # locality for Chinese terms without requiring a brittle word segmenter.
+    return list(normalized) + [normalized[i : i + 2] for i in range(len(normalized) - 1)]
+
+
+def _cosine(left: Counter[str], right: Counter[str]) -> float:
+    dot = sum(value * right.get(term, 0) for term, value in left.items())
+    if not dot:
+        return 0.0
+    left_norm = math.sqrt(sum(value * value for value in left.values()))
+    right_norm = math.sqrt(sum(value * value for value in right.values()))
+    return dot / (left_norm * right_norm) if left_norm and right_norm else 0.0
+
+
+class _OptionalDenseEmbedder:
+    """Optional local Transformer encoder for dense semantic retrieval.
+
+    Set ``ASR_MEMORY_EMBEDDING_MODEL`` to a local HuggingFace checkpoint. The
+    memory system keeps working when it is unset or unavailable: hybrid sparse
+    retrieval is deterministic and dependency-free, while a deployed embedding
+    model upgrades ranking with sentence-level semantics.
+    """
+
+    def __init__(self) -> None:
+        self.model_path = os.getenv("ASR_MEMORY_EMBEDDING_MODEL", "").strip()
+        self._model = None
+        self._tokenizer = None
+        self._failed = False
+
+    def encode(self, texts: list[str]) -> list[list[float]] | None:
+        if not self.model_path or self._failed:
+            return None
+        try:
+            if self._model is None or self._tokenizer is None:
+                import torch
+                from transformers import AutoModel, AutoTokenizer
+
+                self._tokenizer = AutoTokenizer.from_pretrained(self.model_path, local_files_only=True)
+                self._model = AutoModel.from_pretrained(self.model_path, local_files_only=True).eval()
+            import torch
+
+            batch = self._tokenizer(texts, padding=True, truncation=True, max_length=256, return_tensors="pt")
+            with torch.no_grad():
+                hidden = self._model(**batch).last_hidden_state
+                mask = batch["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+                pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+                vectors = torch.nn.functional.normalize(pooled, p=2, dim=1).cpu().tolist()
+            return [[float(value) for value in vector] for vector in vectors]
+        except Exception:
+            self._failed = True
+            return None
+
+
+class HybridMemoryIndex:
+    """Hybrid lexical + semantic retrieval over durable memory beliefs.
+
+    BM25 is high precision for names and aliases, char n-gram cosine recalls
+    partial Chinese overlap, and the optional dense encoder adds meaning-level
+    similarity. Entity aliases and audio provenance are re-ranked as structured
+    evidence rather than being injected blindly into the LLM prompt.
+    """
+
+    def __init__(self, beliefs: list[MemoryBelief], dense_embedder: _OptionalDenseEmbedder) -> None:
+        self.beliefs = beliefs
+        self.documents = [self._document(item) for item in beliefs]
+        self.tokens = [Counter(_memory_terms(text)) for text in self.documents]
+        self.lengths = [sum(counts.values()) for counts in self.tokens]
+        self.avg_length = sum(self.lengths) / len(self.lengths) if self.lengths else 1.0
+        self.doc_frequency = Counter(term for counts in self.tokens for term in counts)
+        vectors = dense_embedder.encode(self.documents)
+        self.dense_vectors = vectors if vectors and len(vectors) == len(beliefs) else None
+        self.dense_embedder = dense_embedder
+
+    @staticmethod
+    def _document(belief: MemoryBelief) -> str:
+        return " ".join([belief.subject, belief.predicate, belief.value, *belief.aliases])
+
+    def search(self, query: str, *, limit: int) -> list[MemoryBelief]:
+        if not self.beliefs or not query.strip():
+            return []
+        query_terms = _memory_terms(query)
+        if not query_terms:
+            return []
+        query_counts = Counter(query_terms)
+        dense_query = self.dense_embedder.encode([query]) if self.dense_vectors is not None else None
+        n_docs = len(self.beliefs)
+        scored: list[tuple[float, float, MemoryBelief]] = []
+        for index, belief in enumerate(self.beliefs):
+            bm25 = 0.0
+            for term, qtf in query_counts.items():
+                tf = self.tokens[index].get(term, 0)
+                if not tf:
+                    continue
+                df = self.doc_frequency[term]
+                idf = math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
+                denominator = tf + 1.2 * (1.0 - 0.75 + 0.75 * self.lengths[index] / self.avg_length)
+                bm25 += qtf * idf * tf * 2.2 / denominator
+            lexical = _cosine(query_counts, self.tokens[index])
+            aliases = [belief.value, *belief.aliases]
+            exact = 1.0 if any(term and term in query for term in aliases) else 0.0
+            dense = 0.0
+            if dense_query and self.dense_vectors:
+                dense = sum(a * b for a, b in zip(dense_query[0], self.dense_vectors[index]))
+            # Provenance improves trust only after lexical/semantic evidence
+            # establishes relevance; it must never retrieve an unrelated belief
+            # merely because that belief was audio-verified in the past.
+            matched = bm25 > 0.0 or lexical > 0.0 or dense > 0.0 or exact > 0.0
+            provenance = 0.15 if matched and "audio_verified" in belief.evidence_kinds else 0.0
+            # Normalize BM25 relative to query length, then combine evidence.
+            bm25_norm = bm25 / max(1.0, len(query_counts))
+            score = 0.45 * bm25_norm + 0.25 * lexical + 0.20 * dense + 0.50 * exact + provenance
+            scored.append((score, belief.confidence, belief))
+        ranked = sorted(scored, key=lambda item: (item[0], item[1]), reverse=True)
+        return [belief for score, _, belief in ranked[:limit] if score > 0.03]
 
 
 @dataclass
@@ -85,6 +209,9 @@ class MemoryRetriever:
         self.repository = repository
         self.recent_limit = recent_limit
         self.long_term_limit = long_term_limit
+        self._dense_embedder = _OptionalDenseEmbedder()
+        self._index_cache_key: tuple[tuple[str, int, str, float], ...] | None = None
+        self._index: HybridMemoryIndex | None = None
 
     def retrieve(self, session: Session, current_turn: Turn) -> MemoryPacket:
         related_ids = set(session.dependency_index.get(current_turn.turn_id, []))
@@ -129,29 +256,39 @@ class MemoryRetriever:
         ]
         return sorted(entities, key=lambda item: item.confidence, reverse=True)
 
-    @staticmethod
     def _relevant_long_term(
+        self,
         beliefs: list[MemoryBelief],
         session: Session,
         current_turn: Turn,
     ) -> list[MemoryBelief]:
-        text = current_turn.raw_text
-        working_keys = {(item.subject, item.predicate) for item in session.working_beliefs.values()}
-        hypothesis_terms = {
+        """Retrieve durable memory by hybrid semantic and lexical evidence.
+
+        The query includes the current observation plus active hypotheses. This
+        preserves the old dependency signal while replacing exact substring
+        matching with ranked recall over belief values, aliases and predicates.
+        """
+        cache_key = tuple(sorted(
+            (item.belief_id, item.updated_version, item.status, item.confidence)
+            for item in beliefs
+        ))
+        if self._index is None or self._index_cache_key != cache_key:
+            self._index = HybridMemoryIndex(beliefs, self._dense_embedder)
+            self._index_cache_key = cache_key
+        hypothesis_terms = [
             term
             for item in session.open_hypotheses.values()
             if item.status == "active"
             for term in [item.current_interpretation, item.proposed_interpretation, *item.alternatives]
-        }
-
-        def score(item: MemoryBelief) -> tuple[float, float]:
-            terms = [item.value, *item.aliases]
-            lexical = 1.0 if any(term and (term in text or term in hypothesis_terms) for term in terms) else 0.0
-            structural = 0.65 if (item.subject, item.predicate) in working_keys else 0.0
-            return max(lexical, structural), item.confidence
-
-        scored = [(score(item), item) for item in beliefs]
-        return [item for relevance, item in sorted(scored, key=lambda pair: pair[0], reverse=True) if relevance[0] > 0]
+            if term
+        ]
+        working_summary = " ".join(
+            f"{item.subject} {item.predicate} {item.value}"
+            for item in session.working_beliefs.values()
+            if item.status != "superseded"
+        )
+        query = " ".join([current_turn.current_text or current_turn.raw_text, *hypothesis_terms, working_summary])
+        return self._index.search(query, limit=self.long_term_limit)
 
 
 class MemoryConsolidator:

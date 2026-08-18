@@ -114,3 +114,40 @@ def test_retriever_exposes_audio_verified_canonical_entity_to_agent(tmp_path):
     packet = MemoryRetriever(store).retrieve(session, session.turns[-1])
 
     assert [(item.value, item.aliases) for item in packet.canonical_entities] == [("卡兹克", ["卡斯克"])]
+
+
+def test_hybrid_retriever_ranks_alias_match_above_unrelated_memory(tmp_path):
+    store = LongTermMemoryRepository(tmp_path)
+    canonical = belief("champion", "卡兹克", sessions=["s0"], kinds=["audio_verified"])
+    canonical.aliases = ["卡斯克"]
+    canonical.status = "stable"
+    unrelated = belief("other", "和平精英", sessions=["s0"], kinds=["audio_verified"])
+    unrelated.status = "stable"
+    store.save("team", [unrelated, canonical])
+    session = Session(
+        "s1",
+        memory_scope="team",
+        turns=[Turn("t1", "这局卡斯克要怎么出装", "这局卡斯克要怎么出装")],
+    )
+
+    packet = MemoryRetriever(store).retrieve(session, session.turns[0])
+
+    assert packet.long_term_beliefs[0].belief_id == "champion"
+
+
+def test_hybrid_retriever_uses_character_ngram_overlap_without_exact_phrase(tmp_path):
+    store = LongTermMemoryRepository(tmp_path)
+    relevant = belief("relevant", "网络连接异常", sessions=["s0"], kinds=["audio_verified"])
+    relevant.status = "stable"
+    unrelated = belief("unrelated", "游戏角色技能", sessions=["s0"], kinds=["audio_verified"])
+    unrelated.status = "stable"
+    store.save("team", [unrelated, relevant])
+    session = Session(
+        "s1",
+        memory_scope="team",
+        turns=[Turn("t1", "网络连接不上怎么办", "网络连接不上怎么办")],
+    )
+
+    packet = MemoryRetriever(store).retrieve(session, session.turns[0])
+
+    assert packet.long_term_beliefs[0].belief_id == "relevant"
