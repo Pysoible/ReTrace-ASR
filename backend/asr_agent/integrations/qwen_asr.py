@@ -589,17 +589,20 @@ def _coverage_signal(chunk_path: Path, text: str, *, min_chars_per_sec: float = 
     character: the agent must recover missing content with a segmented re-ASR,
     not apply a local character substitution.
     """
-    speech_sec = _speech_duration_sec(chunk_path)
+    # librosa/NumPy arithmetic may yield numpy.float64/numpy.bool_ values.
+    # Coverage is persisted in session JSON and SSE payloads, so convert every
+    # field at this boundary to a native Python JSON scalar.
+    speech_sec = float(_speech_duration_sec(chunk_path))
     char_count = len(re.sub(r"[^\w\u4e00-\u9fff]", "", text or ""))
     density = char_count / max(speech_sec, 0.1) if speech_sec else 0.0
     truncated = not text
     if text and speech_sec >= 3.0:
         truncated = density < min_chars_per_sec
     return {
-        "speech_sec": round(speech_sec, 3),
-        "char_count": char_count,
-        "char_density": round(density, 3),
-        "truncated": truncated,
+        "speech_sec": float(round(speech_sec, 3)),
+        "char_count": int(char_count),
+        "char_density": float(round(density, 3)),
+        "truncated": bool(truncated),
     }
 
 

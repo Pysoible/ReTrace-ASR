@@ -1,4 +1,5 @@
 from asr_agent.integrations.qwen_asr import (
+    _coverage_signal,
     _is_truncated,
     _speech_duration_sec,
     parse_observation,
@@ -26,6 +27,20 @@ def test_is_truncated_skips_short_speech(monkeypatch):
 
     # Too little voiced time (< 3s) → not judged, even if density is low.
     assert _is_truncated(None, "嗯") is False
+
+
+def test_coverage_signal_is_json_serializable_with_numpy_duration(monkeypatch):
+    import json
+    import numpy as np
+
+    monkeypatch.setattr("asr_agent.integrations.qwen_asr._speech_duration_sec", lambda _p: np.float64(10.0))
+
+    signal = _coverage_signal(None, "设置的呀")
+
+    assert signal["truncated"] is True
+    assert isinstance(signal["speech_sec"], float)
+    assert isinstance(signal["char_density"], float)
+    assert json.loads(json.dumps(signal))["truncated"] is True
 
 
 def test_parse_observation_accepts_json_with_uncertain_spans():
