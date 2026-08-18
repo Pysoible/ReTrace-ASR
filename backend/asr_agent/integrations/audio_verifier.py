@@ -44,6 +44,7 @@ def retranscribe_window(
     *,
     runner: Callable[..., dict[str, Any]] | None = None,
     domain_hints: list[str] | None = None,
+    recover_coverage: bool = False,
 ) -> dict[str, Any]:
     """Open-vocabulary re-ASR for a historical audio window (degenerate-turn recovery).
 
@@ -62,6 +63,7 @@ def retranscribe_window(
             start_sec=start_sec,
             end_sec=end_sec,
             domain_hints=domain_hints,
+            recover_coverage=recover_coverage,
         )
     except Exception as exc:
         return {"ok": False, "error": f"audio retranscription failed: {exc}"}
@@ -120,6 +122,7 @@ def _qwen_retranscribe_runner(
     start_sec: float,
     end_sec: float,
     domain_hints: list[str] | None = None,
+    recover_coverage: bool = False,
 ) -> dict[str, Any]:
     """Open re-ASR over a cropped window — used when the first-pass transcript is degenerate.
 
@@ -129,7 +132,6 @@ def _qwen_retranscribe_runner(
     """
     from asr_agent.integrations.qwen_asr import _PLAIN_PROMPT, _infer_one_audio
 
-    clipped = _crop_audio(audio_path, start_sec, end_sec)
     hints = [str(item).strip() for item in (domain_hints or []) if str(item).strip()]
     prompt = _PLAIN_PROMPT
     if hints:
@@ -138,8 +140,24 @@ def _qwen_retranscribe_runner(
             "本对话中可能出现以下专有名词，请优先识别为正确的名称："
             f"{'、'.join(hints[:20])}。"
         )
-    try:
-        text = _infer_one_audio(clipped, prompt)
-    finally:
-        clipped.unlink(missing_ok=True)
-    return {"text": text}
+    # A low transcript-to-speech coverage ratio is an omission failure, not a
+    # local character ambiguity. Decode short consecutive sub-windows so one
+    # early EOS cannot discard the rest of a 15-second conversational chunk.
+    windows = [(start_sec, end_sec)]
+    if recover_coverage and end_sec - start_sec > 5.5:
+        windows = []
+        cursor = start_sec
+        while cursor < end_sec:
+            next_cursor = min(end_sec, cursor + 5.0)
+            windows.append((cursor, next_cursor))
+            cursor = next_cursor
+    parts: list[str] = []
+    for window_start, window_end in windows:
+        clipped = _crop_audio(audio_path, window_start, window_end)
+        try:
+            text = _infer_one_audio(clipped, prompt).strip()
+        finally:
+            clipped.unlink(missing_ok=True)
+        if text:
+            parts.append(text)
+    return {"text": "".join(parts), "segmented": len(windows) > 1}

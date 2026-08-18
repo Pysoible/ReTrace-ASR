@@ -171,11 +171,13 @@ class ReTraceService:
             # the agent re-listens to a window the acoustic model itself flagged
             # as unreliable — audio evidence drives both *whether* to doubt and
             # *whether* to adopt the relisten, instead of the LLM judge alone.
-            has_acoustic_doubt = bool((trigger.meta.get("uncertainty") or {}).get("low_conf_chars"))
+            trigger_uncertainty = trigger.meta.get("uncertainty") or {}
+            has_acoustic_doubt = bool(trigger_uncertainty.get("low_conf_chars"))
+            has_coverage_risk = bool((trigger_uncertainty.get("coverage") or {}).get("truncated"))
             if (
                 not recovery_event
                 and not judgment.focus
-                and (judgment.outcome in {"UNCERTAIN", "CONFLICT"} or has_acoustic_doubt)
+                and (judgment.outcome in {"UNCERTAIN", "CONFLICT"} or has_acoustic_doubt or has_coverage_risk)
             ):
                 relisten_event = self._relisten_uncertain_window(
                     snapshot,
@@ -491,14 +493,19 @@ class ReTraceService:
         uncertainty = meta.get("uncertainty") or {}
         paraformer_text = str(uncertainty.get("paraformer_text") or "").strip()
         char_confs = uncertainty.get("paraformer_char_confs") or []
+        coverage = uncertainty.get("coverage") or {}
+        coverage_risk = bool(coverage.get("truncated"))
         hints: list[str] | None = None
         is_high_conf = False
-        if paraformer_text and char_confs:
+        # Omission is not a char-level ambiguity: use a segmented re-ASR to
+        # recover speech after the first model stopped early. Only non-omission
+        # windows may use paraformer's minimal high-confidence substitutions.
+        if paraformer_text and char_confs and not coverage_risk:
             from asr_agent.integrations import acoustic
 
             candidate = acoustic.high_conf_correction(raw_body, paraformer_text, char_confs)
             is_high_conf = True
-        elif paraformer_text:
+        elif paraformer_text and not coverage_risk:
             candidate = paraformer_text
         else:
             if memory is not None:
@@ -514,6 +521,7 @@ class ReTraceService:
                     start_sec=float(start_sec),
                     end_sec=float(end_sec),
                     domain_hints=hints,
+                    recover_coverage=coverage_risk,
                 )
             except Exception as exc:
                 meta["relisten_uncertain"] = {"error": f"audio re-transcription failed: {exc}"}
@@ -564,7 +572,9 @@ class ReTraceService:
         has_acoustic_doubt = bool(low_conf_chars)
         adopt = bool(hint_matches) or (
             raw_assessment.degenerate and not cand_assessment.degenerate
-        ) or ((has_acoustic_doubt or is_high_conf) and not cand_assessment.degenerate)
+        ) or (coverage_risk and len(cand_keep) > len(raw_keep) and not cand_assessment.degenerate) or (
+            (has_acoustic_doubt or is_high_conf) and not cand_assessment.degenerate
+        )
         if not adopt:
             meta["relisten_uncertain"] = {
                 "relistened": True,
@@ -586,6 +596,8 @@ class ReTraceService:
             "replacement": cand_no_ts,
             "acoustic_doubt": has_acoustic_doubt,
             "low_conf_chars": low_conf_chars,
+            "coverage_risk": coverage_risk,
+            "coverage": coverage,
         }
         return RevisionEvent(
             event_id=self._event_id(
@@ -603,7 +615,12 @@ class ReTraceService:
             after_text=after_text,
             entity_id=None,
             score=max(0.0, min(1.0, 1.0 - ratio)),
-            evidence=[f"audio:{audio_path}:{start_sec}-{end_sec}", "uncertainty:relisten", *(["acoustic:low-conf-chars"] if has_acoustic_doubt else [])],
+            evidence=[
+                f"audio:{audio_path}:{start_sec}-{end_sec}",
+                "uncertainty:relisten",
+                *(["acoustic:coverage-risk"] if coverage_risk else []),
+                *(["acoustic:low-conf-chars"] if has_acoustic_doubt else []),
+            ],
             resolver="audio-uncertainty-relisten",
             rationale="open relisten of an uncertain window recovered a different transcript",
             replacement=cand_no_ts,

@@ -405,6 +405,39 @@ def test_uncertain_relisten_adopts_when_it_surfaces_a_remembered_entity(tmp_path
     assert revision[0]["after_text"].startswith("[0.0-7.0]")
 
 
+def test_coverage_risk_uses_segmented_relisten_even_when_judge_is_consistent(tmp_path):
+    """A fluent but severely under-covered turn is an omission recovery task."""
+    calls = []
+
+    def retranscribe(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "text": "设置的呀我觉得这个游戏的人机设计是每一局规定数量的"}
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=lambda **_: ContextJudgment("CONSISTENT", 0.92),
+        audio_retranscriber=retranscribe,
+    )
+    result = service.process_turn(
+        "s",
+        "t1",
+        "[0.0-12.0] 设置的呀。",
+        source="qwen-omni",
+        meta={
+            "audio_path": "/tmp/fake.wav",
+            "start_sec": 0.0,
+            "end_sec": 12.0,
+            "uncertainty": {"coverage": {"truncated": True, "speech_sec": 10.0, "char_density": 0.4}},
+        },
+    )
+
+    turn = result["session"]["turns"][0]
+    assert calls[0]["recover_coverage"] is True
+    assert "人机设计" in turn["current_text"]
+    assert turn["meta"]["relisten_uncertain"]["coverage_risk"] is True
+    assert any("acoustic:coverage-risk" in item for item in result["revisions"][0]["evidence"])
+
+
 def test_judge_tolerates_single_object_focus_from_model(tmp_path):
     """A model returning "focus": {...} (single dict) instead of a list must not
     fail the whole judgment — it should be treated as a one-element list."""

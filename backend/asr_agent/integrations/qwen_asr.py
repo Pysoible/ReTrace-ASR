@@ -582,6 +582,27 @@ def _speech_duration_sec(chunk_path: Path) -> float:
         return 0.0
 
 
+def _coverage_signal(chunk_path: Path, text: str, *, min_chars_per_sec: float = 1.5) -> dict[str, Any]:
+    """Return auditable speech-coverage evidence for agent routing.
+
+    A fluent but tiny transcript is a different failure mode from a confused
+    character: the agent must recover missing content with a segmented re-ASR,
+    not apply a local character substitution.
+    """
+    speech_sec = _speech_duration_sec(chunk_path)
+    char_count = len(re.sub(r"[^\w\u4e00-\u9fff]", "", text or ""))
+    density = char_count / max(speech_sec, 0.1) if speech_sec else 0.0
+    truncated = not text
+    if text and speech_sec >= 3.0:
+        truncated = density < min_chars_per_sec
+    return {
+        "speech_sec": round(speech_sec, 3),
+        "char_count": char_count,
+        "char_density": round(density, 3),
+        "truncated": truncated,
+    }
+
+
 def _is_truncated(chunk_path: Path, text: str, *, min_chars_per_sec: float = 1.5) -> bool:
     """True when the transcript density is suspiciously low for the voiced time.
 
@@ -589,14 +610,7 @@ def _is_truncated(chunk_path: Path, text: str, *, min_chars_per_sec: float = 1.5
     transcribed chunk drops below ~1 char/sec. Empty transcripts are always
     considered truncated (the caller then re-listens with the plain prompt).
     """
-    if not text:
-        return True
-    speech = _speech_duration_sec(chunk_path)
-    if speech < 3.0:  # too little speech to judge reliably
-        return False
-    n_chars = len(re.sub(r"[^\w\u4e00-\u9fff]", "", text))
-    density = n_chars / max(speech, 0.1)
-    return density < min_chars_per_sec
+    return bool(_coverage_signal(chunk_path, text, min_chars_per_sec=min_chars_per_sec)["truncated"])
 
 
 def _attach_acoustic_disagreement(chunk_path: Path, text: str, uncertainty: dict[str, Any]) -> dict[str, Any]:
@@ -713,6 +727,7 @@ def stream_transcribe_audio(
             except Exception as exc:  # noqa: BLE001
                 print(f"[truncation-relisten] chunk={index} FAILED {exc!r}", flush=True)
         uncertainty = dict(observation.get("uncertainty") or {})
+        uncertainty["coverage"] = _coverage_signal(chunk_paths[index], text)
         uncertainty = _attach_acoustic_disagreement(chunk_paths[index], text, uncertainty)
         on_chunk(index, text, uncertainty, chunk_meta[index])
 
