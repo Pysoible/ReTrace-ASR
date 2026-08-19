@@ -126,3 +126,49 @@ class DecisionPolicy:
         if self.calibrator.predict(features) < self.thresholds.revise:
             return "DEFER"
         return "REVISE"
+
+
+@dataclass(frozen=True)
+class EvidenceBundle:
+    context_confidence: float = 0.0
+    audio_confidence: float = 0.0
+    audio_margin: float = 0.0
+    memory_support: float = 0.0
+    independent_sources: int = 0
+    acoustic_support: float = 0.0
+    has_audio: bool = False
+
+
+class DecisionEngine:
+    def __init__(self, policy: DecisionPolicy | None = None) -> None:
+        self.policy = policy or DecisionPolicy()
+
+    def decide(self, evidence: EvidenceBundle) -> str:
+        features = EvidenceFeatures(
+            context_confidence=evidence.context_confidence,
+            audio_confidence=evidence.audio_confidence,
+            audio_margin=evidence.audio_margin,
+            memory_support=evidence.memory_support,
+            independent_sources=evidence.independent_sources,
+            acoustic_support=evidence.acoustic_support,
+        )
+        return self.policy.decide(features, has_audio=evidence.has_audio)
+
+    def summarize(self, evidence: EvidenceBundle) -> dict[str, float | str]:
+        features = EvidenceFeatures(
+            context_confidence=evidence.context_confidence,
+            audio_confidence=evidence.audio_confidence,
+            audio_margin=evidence.audio_margin,
+            memory_support=evidence.memory_support,
+            independent_sources=evidence.independent_sources,
+            acoustic_support=evidence.acoustic_support,
+        )
+        score = self.policy.calibrator.predict(features)
+        return {
+            "decision": self.decide(evidence),
+            "probability": round(score, 4),
+            "audio_confidence": round(evidence.audio_confidence, 4),
+            "audio_margin": round(evidence.audio_margin, 4),
+            "context_confidence": round(evidence.context_confidence, 4),
+            "memory_support": round(evidence.memory_support, 4),
+        }

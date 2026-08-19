@@ -31,6 +31,8 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export VLLM_USE_V1="${VLLM_USE_V1:-0}"
 
 PY="${RETRACE_PYTHON:-/home/ma-user/anaconda3/envs/PyTorch-2.1.0/bin/python}"
+PY_ENV_ROOT="$(cd "$(dirname "$PY")/.." && pwd)"
+export LD_LIBRARY_PATH="$PY_ENV_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PYTHONPATH="/home/ma-user/ms-swift:${ROOT}/backend${PYTHONPATH:+:$PYTHONPATH}"
 
 exec "$PY" -m uvicorn asr_agent.server:app --host 0.0.0.0 --port "${PORT:-8000}" "$@"

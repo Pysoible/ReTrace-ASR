@@ -466,3 +466,139 @@ def test_judge_tolerates_single_object_focus_from_model(tmp_path):
     assert judgment.outcome == "CONFLICT"
     assert len(judgment.focus) == 1
     assert judgment.focus[0].proposed_text == "图博士"
+
+
+def test_session_summary_exposes_key_health_and_decision_metrics(tmp_path):
+    def judge(**_):
+        return ContextJudgment(
+            "CONFLICT",
+            0.9,
+            focus=[FocusProposal("t1", "图博士", "涂博士", ["图博士", "涂博士"], ["t2"])],
+        )
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=judge,
+        audio_verifier=lambda **_: {"ok": True, "scores": {"图博士": 0.05, "涂博士": 0.95}},
+    )
+
+    service.process_turn("s", "t1", "图博士来了")
+    service.process_turn("s", "t2", "负责人涂博士到了")
+
+    summary = service.summarize_session("s")
+
+    assert summary["turn_count"] == 2
+    assert summary["latest_outcome"] == "CONFLICT"
+    assert summary["open_hypotheses"] == 1
+    assert summary["revision_count"] >= 1
+    assert summary["active_hypotheses"] >= 0
+    assert summary["memory_scope"] == "default"
+    assert summary["hypothesis_status_counts"]["resolved"] >= 0
+
+
+def test_hypothesis_lifecycle_counts_distinguish_active_vs_resolved(tmp_path):
+    def judge(**_):
+        return ContextJudgment(
+            "CONFLICT",
+            0.9,
+            focus=[FocusProposal("t1", "图博士", "涂博士", ["图博士", "涂博士"], ["t2"])],
+        )
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=judge,
+        audio_verifier=lambda **_: {"ok": True, "scores": {"图博士": 0.05, "涂博士": 0.95}},
+    )
+    service.process_turn(
+        "s",
+        "t1",
+        "图博士来了",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0.0, "end_sec": 1.0},
+    )
+    service.process_turn("s", "t2", "负责人涂博士到了")
+
+    summary = service.summarize_session("s")
+    state = service.get_session("s")
+
+    assert summary["hypothesis_status_counts"]["resolved"] >= 1
+    assert summary["hypothesis_status_counts"]["active"] == 0
+    assert summary["hypothesis_status_counts"]["pending"] == 0
+    assert state["observability"]["decision_state"]["status_counts"]["resolved"] >= 1
+
+
+def test_session_tracks_formal_decision_state_lifecycle(tmp_path):
+    def judge(**_):
+        return ContextJudgment(
+            "NOVEL",
+            0.91,
+            beliefs=[BeliefProposal("实验室", "负责人", "涂博士", confidence=0.89, evidence_turn_ids=["t1"])],
+        )
+
+    service = ReTraceService(tmp_path, context_judge=judge)
+    service.process_turn("s", "t1", "实验室负责人是涂博士")
+
+    session = service.repository.load("s")
+    assert session.decision_state.accepted_facts[0]["value"] == "涂博士"
+    assert session.decision_state.pending_hypotheses == []
+    assert session.decision_state.status_counts["resolved"] == 0
+    assert session.decision_state.status_counts["active"] == 0
+
+
+def test_observability_distinguishes_pending_hypotheses_from_accepted_facts(tmp_path):
+    def judge(**_):
+        return ContextJudgment(
+            "NOVEL",
+            0.91,
+            beliefs=[BeliefProposal("实验室", "负责人", "涂博士", confidence=0.89, evidence_turn_ids=["t1"])],
+        )
+
+    service = ReTraceService(tmp_path, context_judge=judge)
+    service.process_turn("s", "t1", "实验室负责人是涂博士")
+
+    state = service.get_session("s")
+    decision_state = state["observability"]["decision_state"]
+
+    assert decision_state["pending_hypotheses"] == []
+    assert decision_state["accepted_facts"][0]["value"] == "涂博士"
+    assert decision_state["accepted_facts"][0]["subject"] == "实验室"
+
+
+def test_resolved_and_rejected_hypotheses_are_not_counted_as_open(tmp_path):
+    def judge(**_):
+        return ContextJudgment(
+            "CONFLICT",
+            0.9,
+            focus=[FocusProposal("t1", "图博士", "涂博士", ["图博士", "涂博士"], ["t2"])],
+        )
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=judge,
+        audio_verifier=lambda **_: {"ok": True, "scores": {"图博士": 0.05, "涂博士": 0.95}},
+    )
+    service.process_turn(
+        "s",
+        "t1",
+        "图博士来了",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0.0, "end_sec": 1.0},
+    )
+    result = service.process_turn("s", "t2", "负责人涂博士到了")
+
+    summary = service.summarize_session("s")
+    state = service.get_session("s")
+    history = next(iter(state["open_hypotheses"].values()))
+
+    assert summary["open_hypotheses"] == 0
+    assert summary["active_hypotheses"] == 0
+    assert state["observability"]["decision_state"]["pending_hypotheses"] == []
+    assert history["status"] == "resolved"
+    assert result["revisions"][0]["action"] == "REVISE_HISTORY"
+
+
+def test_decision_engine_uses_a_single_evidence_gate_for_revision(tmp_path):
+    from asr_agent.decision_engine import DecisionEngine, EvidenceBundle
+
+    engine = DecisionEngine()
+    assert engine.decide(EvidenceBundle(audio_confidence=0.9, audio_margin=0.25, context_confidence=0.9, memory_support=0.8, has_audio=True)) == "REVISE"
+    assert engine.decide(EvidenceBundle(audio_confidence=0.4, audio_margin=0.1, context_confidence=0.9, memory_support=0.8, has_audio=True)) == "DEFER"
+    assert engine.summarize(EvidenceBundle(audio_confidence=0.9, audio_margin=0.25, context_confidence=0.9, memory_support=0.8, has_audio=True))["decision"] == "REVISE"

@@ -183,6 +183,29 @@ class RevisionEvent:
 
 
 @dataclass
+class DecisionState:
+    accepted_facts: list[dict[str, Any]] = field(default_factory=list)
+    pending_hypotheses: list[dict[str, Any]] = field(default_factory=list)
+    status_counts: dict[str, int] = field(
+        default_factory=lambda: {"active": 0, "pending": 0, "resolved": 0, "rejected": 0, "closed": 0}
+    )
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any] | None) -> "DecisionState":
+        payload = value or {}
+        status_counts = {"active": 0, "pending": 0, "resolved": 0, "rejected": 0, "closed": 0}
+        status_counts.update(payload.get("status_counts") or {})
+        return cls(
+            accepted_facts=list(payload.get("accepted_facts") or []),
+            pending_hypotheses=list(payload.get("pending_hypotheses") or []),
+            status_counts=status_counts,
+        )
+
+
+@dataclass
 class Session:
     session_id: str
     turns: list[Turn] = field(default_factory=list)
@@ -193,9 +216,11 @@ class Session:
     working_beliefs: dict[str, MemoryBelief] = field(default_factory=dict)
     open_hypotheses: dict[str, WorkingHypothesis] = field(default_factory=dict)
     dependency_index: dict[str, list[str]] = field(default_factory=dict)
+    decision_state: DecisionState = field(default_factory=DecisionState)
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        return payload
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Session":
@@ -209,4 +234,5 @@ class Session:
             open_hypotheses={key: WorkingHypothesis.from_dict(value) for key, value in raw.get("open_hypotheses", {}).items()},
             dependency_index={key: list(value) for key, value in raw.get("dependency_index", {}).items()},
             revision_events=[RevisionEvent.from_dict(value) for value in raw.get("revision_events", [])],
+            decision_state=DecisionState.from_dict(raw.get("decision_state")),
         )

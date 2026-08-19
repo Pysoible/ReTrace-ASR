@@ -12,6 +12,7 @@ from asr_agent.context_judge import (
     ContextJudgment,
     normalize_judgment,
 )
+from asr_agent.decision_engine import DecisionEngine, EvidenceBundle
 from asr_agent.degeneration import (
     DegenerationAssessment,
     assess_transcript,
@@ -21,6 +22,7 @@ from asr_agent.degeneration import (
 from asr_agent.ledger import RevisionLedger
 from asr_agent.memory import LongTermMemoryRepository, MemoryConsolidator, MemoryRetriever
 from asr_agent.models import (
+    DecisionState,
     EvidenceRef,
     MemoryBelief,
     RevisionEvent,
@@ -60,6 +62,7 @@ class ReTraceService:
             context_judge = judge_context
         self.context_judge = context_judge
         self.resolver = resolver or EvidenceResolver(audio_verifier=audio_verifier)
+        self.decision_engine = DecisionEngine(self.resolver.policy)
         if audio_retranscriber is None:
             from asr_agent.integrations.audio_verifier import retranscribe_window
 
@@ -73,9 +76,16 @@ class ReTraceService:
     def get_session(self, session_id: str) -> dict[str, Any]:
         session = self.repository.load(session_id)
         self.ledger.replay(session)
+        session.decision_state = self._decision_state_for_session(session)
         result = session.as_dict()
         result["observability"] = self._observability(session)
         return result
+
+    def summarize_session(self, session_id: str) -> dict[str, Any]:
+        session = self.repository.load(session_id)
+        self.ledger.replay(session)
+        session.decision_state = self._decision_state_for_session(session)
+        return self._session_summary(session)
 
     def reset_session(self, session_id: str, *, memory_scope: str = "default") -> dict[str, Any]:
         return self.repository.create(Session(session_id, memory_scope=memory_scope)).as_dict()
@@ -222,6 +232,20 @@ class ReTraceService:
                     context_confidence=judgment.confidence,
                     memory_support=self._memory_support(memory.long_term_beliefs, focus.proposed_text),
                 )
+                decision_bundle = EvidenceBundle(
+                    context_confidence=judgment.confidence,
+                    audio_confidence=max(0.0, min(1.0, resolution.score or 0.0)),
+                    audio_margin=max(0.0, min(1.0, max(0.0, resolution.score or 0.0) - 0.1)),
+                    memory_support=self._memory_support(memory.long_term_beliefs, focus.proposed_text),
+                    independent_sources=len(set(focus.evidence_turn_ids)),
+                    acoustic_support=0.0,
+                    has_audio=bool((next((turn for turn in snapshot.turns if turn.turn_id == focus.target_turn_id), None) or {}).meta.get("audio_path")),
+                )
+                decision = self.decision_engine.decide(decision_bundle)
+                if decision == "DEFER" and resolution.action in {"REVISE_CURRENT", "REVISE_HISTORY"}:
+                    resolution.action = "DEFER"
+                    resolution.rationale = "decision gate rejected the revision: evidence below the calibrated threshold"
+                    resolution.score = max(0.0, min(1.0, resolution.score or 0.0))
                 hypothesis.score = resolution.score
                 if resolution.action in {"REVISE_CURRENT", "REVISE_HISTORY"}:
                     hypothesis.status = "resolved"
@@ -326,12 +350,14 @@ class ReTraceService:
                 "confidence": judgment.confidence,
                 "rationale": judgment.rationale,
             }
+            snapshot.decision_state = self._decision_state_for_session(snapshot)
             try:
                 committed = self.repository.commit(snapshot, expected_version=snapshot.version)
             except VersionConflict:
                 if attempt + 1 == max_retries:
                     raise
                 continue
+            committed.decision_state = self._decision_state_for_session(committed)
             self.memory_consolidator.consolidate(committed.memory_scope, list(committed.working_beliefs.values()))
             return {
                 "status": committed.analysis_status,
@@ -626,10 +652,49 @@ class ReTraceService:
             replacement=cand_no_ts,
         )
 
+    def _session_summary(self, session: Session) -> dict[str, Any]:
+        live_hypotheses = {
+            key: hypothesis
+            for key, hypothesis in session.open_hypotheses.items()
+            if getattr(hypothesis, "status", "active") in {"active", "pending"}
+        }
+        status_counts = {"active": 0, "pending": 0, "resolved": 0, "rejected": 0, "closed": 0}
+        for hypothesis in session.open_hypotheses.values():
+            status = getattr(hypothesis, "status", "active")
+            if status in status_counts:
+                status_counts[status] += 1
+        session.decision_state = self._decision_state_for_session(session)
+        summary = {
+            "session_id": session.session_id,
+            "memory_scope": session.memory_scope,
+            "analysis_status": session.analysis_status,
+            "turn_count": len(session.turns),
+            "revision_count": len(session.revision_events),
+            "open_hypotheses": len(live_hypotheses),
+            "active_hypotheses": len(live_hypotheses),
+            "hypothesis_status_counts": status_counts,
+            "latest_outcome": "UNKNOWN",
+            "latest_confidence": 0.0,
+            "latest_turn_id": None,
+        }
+
+        analyzed = next((turn for turn in reversed(session.turns) if turn.meta.get("context_judgment")), None)
+        if analyzed is not None:
+            judgment = dict(analyzed.meta.get("context_judgment") or {})
+            summary["latest_outcome"] = str(judgment.get("outcome", "UNKNOWN"))
+            summary["latest_confidence"] = float(judgment.get("confidence", 0.0))
+            summary["latest_turn_id"] = analyzed.turn_id
+        return summary
+
     def _observability(self, session: Session) -> dict[str, Any]:
         if not session.turns:
             return {
+                "summary": self._session_summary(session),
                 "latest_analysis": None,
+                "decision_state": {
+                    "accepted_facts": [],
+                    "pending_hypotheses": [],
+                },
                 "short_term": {
                     "recent_turns": [],
                     "dependent_turns": [],
@@ -666,8 +731,26 @@ class ReTraceService:
                 "analyzed_version": analyzed.meta.get("analyzed_session_version"),
                 "revalidated": bool(analyzed.meta.get("analysis_revalidated", False)),
             }
+        accepted_facts = [
+            {
+                "subject": belief.subject,
+                "predicate": belief.predicate,
+                "value": belief.value,
+                "confidence": belief.confidence,
+                "source_session_ids": belief.source_session_ids,
+            }
+            for belief in packet.working_beliefs
+            if belief.status != "superseded"
+        ]
+        session.decision_state = self._decision_state_for_session(session)
         return {
+            "summary": self._session_summary(session),
             "latest_analysis": latest_analysis,
+            "decision_state": {
+                "accepted_facts": session.decision_state.accepted_facts,
+                "pending_hypotheses": session.decision_state.pending_hypotheses,
+                "status_counts": session.decision_state.status_counts,
+            },
             "short_term": {
                 "recent_turns": [turn.as_dict() for turn in packet.recent_turns],
                 "dependent_turns": [turn.as_dict() for turn in packet.dependent_turns],
@@ -704,6 +787,33 @@ class ReTraceService:
             memory_scope=memory_scope,
         )
         return self.analyze_turn(session_id, turn_id, observed_version=observed["observed_version"])
+
+    def _decision_state_for_session(self, session: Session) -> DecisionState:
+        accepted_facts = []
+        for belief in session.working_beliefs.values():
+            if belief.status != "superseded":
+                accepted_facts.append(
+                    {
+                        "subject": belief.subject,
+                        "predicate": belief.predicate,
+                        "value": belief.value,
+                        "confidence": belief.confidence,
+                        "source_session_ids": belief.source_session_ids,
+                    }
+                )
+        pending_hypotheses = []
+        status_counts = {"active": 0, "pending": 0, "resolved": 0, "rejected": 0, "closed": 0}
+        for hypothesis in session.open_hypotheses.values():
+            status = getattr(hypothesis, "status", "active")
+            if status in status_counts:
+                status_counts[status] += 1
+            if status in {"active", "pending"}:
+                pending_hypotheses.append(hypothesis.as_dict())
+        return DecisionState(
+            accepted_facts=accepted_facts,
+            pending_hypotheses=pending_hypotheses,
+            status_counts=status_counts,
+        )
 
     def _apply_beliefs(self, session: Session, proposals: list[BeliefProposal]) -> None:
         by_key = {

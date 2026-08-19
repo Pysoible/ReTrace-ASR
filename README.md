@@ -26,9 +26,11 @@ Memory 分为两层：会话内短期 Memory 保存近期上下文、工作事�
 
 ```bash
 uv sync --group dev
-cd frontend && npm install && npm run build && cd ..
+./scripts/build_frontend.sh
 uv run uvicorn asr_agent.server:app --reload
 ```
+
+后端使用 `uv` 管理 Python 依赖；前端使用 Vite，需要 Node.js/npm。若项目内存在 `.tools/node`，构建脚本会自动使用它，不需要手动设置 `PATH`。也可以通过 `RETRACE_NODE_HOME` 指定其他 Node.js 安装目录。
 
 可选配置：
 
@@ -46,5 +48,5 @@ uv run uvicorn asr_agent.server:app --reload
 
 ```bash
 .venv/bin/pytest -q
-cd frontend && npm run build
+./scripts/build_frontend.sh
 ```

@@ -149,6 +149,24 @@ function selectedEvent(): RevisionEvent | undefined {
   return allEvents().at(-1);
 }
 
+function selectedTurn(): Turn | undefined {
+  if (!session?.turns.length) return undefined;
+  return session.turns.find((turn) => turn.turn_id === selectedTurnId) ?? session.turns.at(-1);
+}
+
+function selectedAnalysis(): LatestAnalysis | null {
+  const turn = selectedTurn();
+  const judgment = turn?.meta?.context_judgment;
+  if (!turn || !judgment) return null;
+  return {
+    turn_id: turn.turn_id,
+    outcome: judgment.outcome ?? 'UNKNOWN',
+    confidence: judgment.confidence ?? 0,
+    rationale: judgment.rationale ?? '',
+    revalidated: false,
+  };
+}
+
 function renderTurnBody(turn: Turn, event?: RevisionEvent): string {
   const raw = stripTime(turn.raw_text);
   const current = stripTime(turn.current_text);
@@ -182,12 +200,15 @@ function renderTurns(): string {
 
 function stageState(name: string): { state: string; detail: string } {
   const observation = Boolean(session?.turns.length);
-  const trace = session?.observability;
-  const analysis = trace?.latest_analysis;
-  const events = allEvents();
+  const turn = selectedTurn();
+  const analysis = selectedAnalysis();
+  const events = turn ? allEvents().filter((event) => event.target_turn_id === turn.turn_id || event.source_turn_id === turn.turn_id) : [];
+  const observability = session?.observability;
   if (name === 'OBSERVE') return { state: observation ? 'done' : 'waiting', detail: observation ? 'raw 与时间戳已冻结' : '等待首个 turn' };
   if (name === 'MEMORY RETRIEVE') {
-    const count = (trace?.short_term.recent_turns.length ?? 0) + (trace?.long_term.beliefs.length ?? 0);
+    const count = observability?.latest_analysis?.turn_id === turn?.turn_id
+      ? ((observability?.short_term.recent_turns.length ?? 0) + (observability?.long_term.beliefs.length ?? 0))
+      : 0;
     return { state: analysis ? 'done' : observation ? 'active' : 'waiting', detail: analysis ? `${count} 条上下文进入判断` : '等待分析' };
   }
   if (name === 'CONTEXT JUDGE') return { state: analysis ? 'done' : observation ? 'active' : 'waiting', detail: analysis ? `${analysis.outcome} · ${percent(analysis.confidence)}` : '尚无结构化判断' };
@@ -216,12 +237,13 @@ function renderMethodTrace(): string {
 }
 
 function renderAnalysis(): string {
-  const analysis = session?.observability?.latest_analysis;
+  const analysis = selectedAnalysis();
   if (!analysis) return `<div class="analysis-empty"><b>尚无 Agent 判断</b><p>输入到达后，这里显示 outcome、置信度与版本一致性。</p></div>`;
   return `<section class="analysis-summary">
     <div class="analysis-top"><span class="outcome outcome-${escapeHtml(analysis.outcome)}">${escapeHtml(analysis.outcome)}</span><b>${percent(analysis.confidence)}</b></div>
     <p>${escapeHtml(analysis.rationale || 'Agent 未返回补充说明。')}</p>
     <div class="version-row">
+      <span>TURN ${escapeHtml(analysis.turn_id)}</span>
       <span>Observed v${escapeHtml(analysis.observed_version ?? '-')}</span>
       <span>Analyzed v${escapeHtml(analysis.analyzed_version ?? '-')}</span>
       <span class="${analysis.revalidated ? 'version-alert' : ''}">${analysis.revalidated ? 'revalidated on newer state' : 'version aligned'}</span>
@@ -307,6 +329,9 @@ function renderMemory(): string {
 }
 
 function render(): void {
+  const transcriptScrollTop = document.querySelector<HTMLElement>('.transcript-paper')?.scrollTop ?? 0;
+  const agentScrollTop = document.querySelector<HTMLElement>('.agent-panel .panel-body')?.scrollTop ?? 0;
+  const pageScrollY = window.scrollY;
   const turns = session?.turns.length ?? 0;
   const revisions = transcriptEvents().length;
   const activeHypotheses = Object.values(session?.open_hypotheses ?? {}).filter((item) => item.status === 'active').length;
@@ -367,6 +392,10 @@ function render(): void {
       </div>
     </section>
   </main>`;
+
+  document.querySelector<HTMLElement>('.transcript-paper')?.scrollTo({ top: transcriptScrollTop, behavior: 'auto' });
+  document.querySelector<HTMLElement>('.agent-panel .panel-body')?.scrollTo({ top: agentScrollTop, behavior: 'auto' });
+  window.scrollTo({ top: pageScrollY, behavior: 'auto' });
 
   document.querySelectorAll<HTMLElement>('[data-turn]').forEach((item) => {
     const select = () => { selectedTurnId = item.dataset.turn || ''; selectedEventId = ''; render(); };
@@ -455,8 +484,7 @@ async function submitAudio(): Promise<void> {
         } catch {
           /* keep last session */
         }
-        selectedTurnId = payload.turn_id || session?.turns.at(-1)?.turn_id || '';
-        selectedEventId = allEvents().at(-1)?.event_id || '';
+        if (!selectedTurnId) selectedTurnId = payload.turn_id || session?.turns.at(-1)?.turn_id || '';
         status = `已处理 ${session?.turns.length ?? payload.index + 1} 个 turn · 持续分析中…`;
         render();
         return;
@@ -468,8 +496,7 @@ async function submitAudio(): Promise<void> {
           /* keep last session */
         }
         closeLiveStream();
-        selectedTurnId = session?.turns.at(-1)?.turn_id || '';
-        selectedEventId = allEvents().at(-1)?.event_id || '';
+        if (!selectedTurnId) selectedTurnId = session?.turns.at(-1)?.turn_id || '';
         status = `完成：${session?.turns.length ?? 0} turns · ${transcriptEvents().length} revisions。`;
         busy = false;
         render();
