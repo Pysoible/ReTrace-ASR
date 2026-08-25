@@ -6,6 +6,25 @@ from asr_agent.models import Session, Turn
 from asr_agent.resolver import EvidenceResolver
 
 
+def test_read_asr_config_auto_loads_project_env(monkeypatch, tmp_path):
+    repo = tmp_path / "retrace_repo"
+    repo.mkdir()
+    (repo / ".env").write_text("ASR_AUDIO_ENABLED=1\nASR_MODEL_PATH=/tmp/custom_qwen\nASR_GPU=3\n", encoding="utf-8")
+
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("ASR_AUDIO_ENABLED", raising=False)
+    monkeypatch.delenv("ASR_MODEL_PATH", raising=False)
+    monkeypatch.delenv("ASR_GPU", raising=False)
+
+    from asr_agent.integrations import qwen_asr
+
+    config = qwen_asr.read_asr_config()
+
+    assert config.enabled is True
+    assert config.model_path == "/tmp/custom_qwen"
+    assert config.gpu == "3"
+
+
 def test_judgment_rejects_a_span_not_present_in_raw_turn():
     session = Session("s", turns=[Turn("t1", "图博士来了", "图博士来了")])
     judgment = ContextJudgment(

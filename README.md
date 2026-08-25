@@ -36,6 +36,7 @@ uv run uvicorn asr_agent.server:app --reload
 
 - `DEEPSEEK_API_KEY`：启用结构化 Context Judge。
 - `ASR_AUDIO_ENABLED=1` 与 `ASR_MODEL_PATH`：启用本地 Qwen 音频转写。
+- 使用 `ASR_PROMPT_MODE=plain` 时，默认启用一次受限的候选发现，将不确定片段交给后续上下文判断和定向重听；如需关闭，可设置 `ASR_UNCERTAINTY_DISCOVERY=0`。
 
 ## API
 

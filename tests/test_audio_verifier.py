@@ -24,3 +24,29 @@ def test_audio_verifier_rejects_unknown_candidate_scores(tmp_path):
     )
 
     assert result["ok"] is False
+
+
+def test_audio_verifier_accepts_selected_candidate_index(tmp_path):
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"placeholder")
+
+    result = verify_candidates(
+        str(audio), 0.0, 1.0, ["清高的爱拉", "[DELETE]"],
+        runner=lambda **_: {"choice": 1},
+    )
+
+    assert result["ok"] is True
+    assert result["scores"]["[DELETE]"] == 1.0
+
+
+def test_audio_verifier_accepts_selected_candidate_text(tmp_path):
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"placeholder")
+
+    result = verify_candidates(
+        str(audio), 0.0, 1.0, ["清高的爱拉", "[DELETE]"],
+        runner=lambda **_: {"selected": "[DELETE]"},
+    )
+
+    assert result["ok"] is True
+    assert result["scores"]["[DELETE]"] == 1.0

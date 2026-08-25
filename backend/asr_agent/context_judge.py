@@ -32,6 +32,7 @@ class FocusProposal:
     evidence_turn_ids: list[str] = field(default_factory=list)
     rationale: str = ""
     relationship: str = "MUTUALLY_EXCLUSIVE"
+    operation: str = "REPLACE"
 
 
 @dataclass
@@ -56,6 +57,8 @@ def _as_list(value: Any) -> list[Any]:
         return value
     if isinstance(value, dict):
         return [value]
+    if isinstance(value, str):
+        return [value]
     raise ValueError(f"expected list, null or object, got {type(value).__name__}")
 
 
@@ -75,14 +78,35 @@ def _focus_from_raw(item: Any) -> FocusProposal:
         alternatives = _as_list(item.get("closed_set"))
     if not alternatives:
         alternatives = _as_list(item.get("closed_set_alternatives"))
+    if not alternatives:
+        alternatives = _as_list(item.get("candidates"))
+    proposed = (
+        item.get("proposed_text") or item.get("replacement_text") or item.get("replacement")
+        or item.get("proposed") or item.get("candidate") or item.get("corrected_text")
+    )
+    span = item.get("span") or item.get("source_span") or item.get("current_text") or item.get("source_text")
+    target_turn_id = (
+        item.get("target_turn_id") or item.get("target_turn") or item.get("target_id")
+        or item.get("turn_id")
+    )
+    evidence_turn_ids = item.get("evidence_turn_ids")
+    if evidence_turn_ids is None:
+        evidence_turn_ids = item.get("evidence_turn_id")
+    if evidence_turn_ids is None:
+        evidence_turn_ids = item.get("evidence") or item.get("supporting_turn_ids")
+    relationship = item.get("relationship") or item.get("relation") or "MUTUALLY_EXCLUSIVE"
+    operation = str(item.get("operation") or item.get("action") or "REPLACE").upper()
+    if operation == "DELETE":
+        proposed = ""
     return FocusProposal(
-        target_turn_id=str(item.get("target_turn_id") or ""),
-        span=str(item.get("span") or ""),
-        proposed_text=str(item.get("proposed_text") or ""),
+        target_turn_id=str(target_turn_id or ""),
+        span=str(span or ""),
+        proposed_text=str(proposed or ""),
         alternatives=[str(value) for value in alternatives if str(value)],
-        evidence_turn_ids=[str(turn_id) for turn_id in _as_list(item.get("evidence_turn_ids")) if str(turn_id)],
+        evidence_turn_ids=[str(turn_id) for turn_id in _as_list(evidence_turn_ids) if str(turn_id)],
         rationale=str(item.get("rationale") or ""),
-        relationship=str(item.get("relationship") or "MUTUALLY_EXCLUSIVE"),
+        relationship=str(relationship),
+        operation=operation,
     )
 
 
@@ -140,17 +164,45 @@ def normalize_judgment(
     value.confidence = min(1.0, max(0.0, float(value.confidence)))
     turns = {turn.turn_id: turn for turn in session.turns}
 
+    def _repair_focus(item: FocusProposal) -> FocusProposal:
+        """Repair a nearly valid model focus without inventing a candidate.
+
+        The judge often returns a valid span/proposed pair but omits the
+        alternatives or evidence array. Recover only those fields that are
+        mechanically grounded in the current session; otherwise normal
+        validation still rejects the item.
+        """
+        if not item.target_turn_id:
+            item.target_turn_id = next(reversed(turns), "")
+        target = turns.get(item.target_turn_id)
+        if target and item.span and item.proposed_text and not item.alternatives:
+            item.alternatives = [item.span, item.proposed_text]
+        if target:
+            valid_evidence = [turn_id for turn_id in item.evidence_turn_ids if turn_id in turns]
+            if valid_evidence:
+                item.evidence_turn_ids = valid_evidence
+            else:
+                item.evidence_turn_ids = [item.target_turn_id]
+        return item
+
     def _validate_focus(item: FocusProposal) -> None:
         target = turns.get(item.target_turn_id)
         if target is None:
             raise ValueError(f"unknown target turn: {item.target_turn_id}")
         if not item.span or (item.span not in target.raw_text and item.span not in target.current_text):
             raise ValueError(f"focus span is not present in target turn: {item.span!r}")
-        if not item.proposed_text or item.proposed_text == item.span:
+        item.operation = (item.operation or "REPLACE").upper()
+        if item.operation not in {"REPLACE", "DELETE"}:
+            raise ValueError(f"invalid focus operation: {item.operation}")
+        if item.operation == "REPLACE" and (not item.proposed_text or item.proposed_text == item.span):
             raise ValueError("proposed_text must be non-empty and different from span")
+        if item.operation == "DELETE":
+            item.proposed_text = ""
         item.alternatives = list(dict.fromkeys(str(candidate) for candidate in _as_list(item.alternatives) if str(candidate)))
-        if item.span not in item.alternatives or item.proposed_text not in item.alternatives:
+        if item.operation == "REPLACE" and (item.span not in item.alternatives or item.proposed_text not in item.alternatives):
             raise ValueError("alternatives must contain both current and proposed text")
+        if item.operation == "DELETE" and item.span not in item.alternatives:
+            item.alternatives.append(item.span)
         item.evidence_turn_ids = [str(turn_id) for turn_id in _as_list(item.evidence_turn_ids) if str(turn_id)]
         if any(turn_id not in turns for turn_id in item.evidence_turn_ids):
             raise ValueError("focus references an unknown evidence turn")
@@ -182,6 +234,7 @@ def normalize_judgment(
         valid_focus: list[FocusProposal] = []
         for item in value.focus:
             try:
+                item = _repair_focus(item)
                 _validate_focus(item)
                 valid_focus.append(item)
             except ValueError:
@@ -202,12 +255,18 @@ def normalize_judgment(
         value.beliefs = valid_beliefs
 
     if value.outcome in {"CONSISTENT", "NOVEL"} and value.focus:
-        raise ValueError(f"{value.outcome} judgment cannot propose revisions")
+        # Preserve an explicitly grounded focus even when the model labels the
+        # overall turn as consistent. The focus is still sent through the
+        # normal audio evidence gate; dropping it loses a useful correction.
+        if not strict:
+            value.outcome = "UNCERTAIN"
+        else:
+            raise ValueError(f"{value.outcome} judgment cannot propose revisions")
     return value
 
 
 class ExplicitSignalFallbackJudge:
-    """Safe fallback: react to ASR metadata, never nominate text spans itself."""
+    """Safe fallback: use only explicit ASR alternatives, never invent text."""
 
     def __init__(self, low_confidence: float = 0.55) -> None:
         self.low_confidence = low_confidence
@@ -216,6 +275,7 @@ class ExplicitSignalFallbackJudge:
         del session, memory
         signals = current_turn.meta.get("asr_signals") or {}
         confidences = signals.get("confidence") or {}
+        candidates_by_span = signals.get("text_candidates") or {}
         nbest = [str(item) for item in signals.get("nbest") or [] if str(item).strip()]
         low = any(float(score) < self.low_confidence for score in confidences.values())
         diverse_nbest = len(set(nbest)) > 1
@@ -224,10 +284,43 @@ class ExplicitSignalFallbackJudge:
         uncertainty = current_turn.meta.get("uncertainty") or {}
         disagreement = uncertainty.get("acoustic_disagreement")
         low_conf_chars = uncertainty.get("low_conf_chars")
-        if low or diverse_nbest or disagreement or low_conf_chars:
+        focus: list[FocusProposal] = []
+        for span, alternatives in candidates_by_span.items():
+            span = str(span).strip()
+            if not span or span not in current_turn.current_text:
+                continue
+            values = [str(item).strip() for item in alternatives or [] if str(item).strip()]
+            values = list(dict.fromkeys([span, *values]))
+            proposed = next((item for item in values[1:] if item != span), "")
+            if not proposed or len(values) < 2:
+                continue
+            score = min((float(confidences.get(span, 0.0)) or 0.0), 1.0)
+            if score >= self.low_confidence and not (disagreement or low_conf_chars):
+                continue
+            focus.append(
+                FocusProposal(
+                    target_turn_id=current_turn.turn_id,
+                    span=span,
+                    proposed_text=proposed,
+                    alternatives=values,
+                    evidence_turn_ids=[current_turn.turn_id],
+                    rationale="explicit ASR candidate requires targeted audio verification",
+                )
+            )
+        # Important: a transcript without any explicit ASR uncertainty is still not
+        # proof of correctness. The project explicitly treats missing judge/audio
+        # evidence as a safe *defer* state, not as a confident accept. Returning
+        # CONSISTENT here silently makes the system look more capable than it is.
+        if low or diverse_nbest or disagreement or low_conf_chars or focus:
             return ContextJudgment(
                 outcome="UNCERTAIN",
                 confidence=0.5,
                 rationale="explicit ASR uncertainty requires an external context judge",
+                focus=focus,
             )
-        return ContextJudgment(outcome="CONSISTENT", confidence=0.7, rationale="no explicit conflict signal")
+        return ContextJudgment(
+            outcome="UNCERTAIN",
+            confidence=0.4,
+            rationale="no explicit evidence or judge signal available; safe default is defer rather than false confidence",
+            focus=[],
+        )

@@ -20,10 +20,10 @@ class EvidenceFeatures:
 @dataclass(frozen=True)
 class PolicyThresholds:
     suspect: float = 0.45
-    relisten: float = 0.55
-    revise: float = 0.78
+    relisten: float = 0.45
+    revise: float = 0.55
     long_memory: float = 0.70
-    audio_margin: float = 0.15
+    audio_margin: float = 0.02
 
 
 BOOTSTRAP_THRESHOLDS = PolicyThresholds()

@@ -38,6 +38,10 @@ _OBS_PROMPT = (
     '{"text":"完整转写","uncertain_spans":[{"span":"原片段","candidates":["原片段","同音候选"],"confidence":0.0}]}。'
     "只在确有不确定时给出 uncertain_spans；候选必须包含原片段。"
 )
+_RAMC_PLAIN_PROMPT = (
+    "请将上述音频转写为文字。尽量逐字保留中文口语、重复、语气词和停顿，"
+    "不要总结、改写或补全没有听到的内容。只输出转写文本，不要输出 JSON、时间戳、标签或解释。"
+)
 _TAG_PROMPT_TMPL = (
     "下面是一段中文 ASR 转写。请标出可能听错的专有名词、品牌、人名、术语（同音/近音不确定处）。"
     '严格只输出 JSON：{{"uncertain_spans":[{{"span":"原片段","candidates":["原片段","同音候选"],"confidence":0.0}}]}}。'
@@ -50,11 +54,37 @@ def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _observation_prompt() -> str:
+    mode = os.getenv("ASR_PROMPT_MODE", "json").strip().lower()
+    if mode in {"plain", "ramc", "ramc_plain"}:
+        return _RAMC_PLAIN_PROMPT
+    return _OBS_PROMPT
+
+
 def parse_gpu_ids(gpu: str | None) -> list[str]:
     """Parse ASR_GPU like '0' or '0,1' into concrete device ids."""
     raw = (gpu or "0").replace(";", ",")
     ids = [part.strip() for part in raw.split(",") if part.strip()]
     return ids or ["0"]
+
+
+def _load_project_env() -> None:
+    env_path = Path.cwd() / ".env"
+    if not env_path.exists():
+        return
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(env_path, override=False)
+        return
+    except Exception:
+        pass
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
 def shard_indices(n_items: int, n_workers: int) -> list[list[int]]:
@@ -84,6 +114,7 @@ class AsrConfig:
 
 
 def read_asr_config() -> AsrConfig:
+    _load_project_env()
     return AsrConfig(
         enabled=_truthy(os.getenv("ASR_AUDIO_ENABLED")),
         model_path=os.getenv("ASR_MODEL_PATH", DEFAULT_MODEL_PATH),
@@ -548,17 +579,27 @@ def parse_uncertainty_tags(raw: str, text: str) -> dict[str, Any]:
 
 
 def _enrich_uncertainty(engine, request_config, chunk_path: Path, text: str, uncertainty: dict[str, Any]) -> dict[str, Any]:
-    """Keep first-pass uncertainty only.
-
-    Inventing phoneme confusables (苹果→平果) creates false hypotheses that never
-    get later evidence. Real closed sets are opened by cross-turn / candidate echo.
-    """
-    del engine, request_config, chunk_path, text
-    return uncertainty if uncertainty else {"confidence": {}, "text_candidates": {}}
+    """Discover bounded candidates after plain ASR without changing its text."""
+    del engine, request_config
+    result = dict(uncertainty or {})
+    if os.getenv("ASR_PROMPT_MODE", "json").strip().lower() not in {"plain", "ramc", "ramc_plain"}:
+        return result or {"confidence": {}, "text_candidates": {}}
+    # Keep discovery selective: plain ASR is the cheap first pass; audio calls
+    # happen only after the context judge nominates a concrete focus.
+    if not _truthy(os.getenv("ASR_UNCERTAINTY_DISCOVERY", "1")) or not text:
+        return result or {"confidence": {}, "text_candidates": {}}
+    try:
+        raw = _infer_one_audio(chunk_path, _TAG_PROMPT_TMPL.format(text=text))
+        discovered = parse_uncertainty_tags(raw, text)
+        result["confidence"] = {**result.get("confidence", {}), **discovered["confidence"]}
+        result["text_candidates"] = {**result.get("text_candidates", {}), **discovered["text_candidates"]}
+    except Exception:
+        pass
+    return result or {"confidence": {}, "text_candidates": {}}
 
 
 def _acoustic_disagreement_enabled() -> bool:
-    return _truthy(os.getenv("ASR_ACOUSTIC_DISAGREEMENT"))
+    return _truthy(os.getenv("ASR_ACOUSTIC_DISAGREEMENT", "1"))
 
 
 def _speech_duration_sec(chunk_path: Path) -> float:
@@ -735,7 +776,7 @@ def stream_transcribe_audio(
         on_chunk(index, text, uncertainty, chunk_meta[index])
 
     try:
-        _infer_chunks_streaming(chunk_paths, _OBS_PROMPT, _finish)
+        _infer_chunks_streaming(chunk_paths, _observation_prompt(), _finish)
     finally:
         cleanup_chunks(chunk_info)
     return {
@@ -782,7 +823,7 @@ def transcribe_audio(audio: str) -> dict[str, Any]:
 
     try:
         try:
-            raw_parts = _infer_chunks(None, None, chunk_paths, _OBS_PROMPT)
+            raw_parts = _infer_chunks(None, None, chunk_paths, _observation_prompt())
         except Exception as exc:
             return {"ok": False, "error": f"Qwen 转写失败: {exc}", "chunks": chunk_meta}
 

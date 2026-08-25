@@ -38,6 +38,64 @@ def test_deepseek_context_judge_returns_validated_focus(monkeypatch):
     assert result.beliefs[0].subject == "实验室"
 
 
+    def test_context_judgment_accepts_common_focus_field_aliases():
+        session = Session("s", turns=[Turn("t1", "伊卡拉来了", "伊卡拉来了"), Turn("t2", "安拉在经文中", "安拉在经文中")])
+        normalized = deepseek.normalize_judgment({
+            "outcome": "CONFLICT",
+            "confidence": 0.9,
+            "focus": [{
+                "target_turn": "t1",
+                "current_text": "伊卡拉",
+                "replacement": "安拉",
+                "closed_set": ["伊卡拉", "安拉"],
+                "evidence_turn_id": "t2",
+                "relation": "MUTUALLY_EXCLUSIVE",
+            }],
+        }, session)
+
+        assert normalized.focus[0].target_turn_id == "t1"
+        assert normalized.focus[0].span == "伊卡拉"
+        assert normalized.focus[0].proposed_text == "安拉"
+        assert normalized.focus[0].evidence_turn_ids == ["t2"]
+
+
+    def test_consistent_model_label_keeps_valid_focus_for_audio_gate():
+        session = Session("s", turns=[Turn("t1", "爱拉来了", "爱拉来了"), Turn("t2", "安拉在经文中", "安拉在经文中")])
+        normalized = deepseek.normalize_judgment({
+            "outcome": "CONSISTENT",
+            "confidence": 0.9,
+            "focus": [{
+                "target_turn_id": "t1",
+                "span": "爱拉",
+                "proposed_text": "安拉",
+                "alternatives": ["爱拉", "安拉"],
+                "evidence_turn_ids": ["t2"],
+            }],
+        }, session)
+
+        assert normalized.outcome == "UNCERTAIN"
+        assert normalized.focus[0].proposed_text == "安拉"
+
+
+    def test_prompt_requires_canonical_alias_to_become_focus():
+        assert "不要把 alias 当作已经正确" in deepseek._CONTEXT_JUDGE_SYSTEM
+        assert "必须提出该历史 turn 的 focus" in deepseek._CONTEXT_JUDGE_SYSTEM
+
+
+    def test_normalize_repairs_grounded_focus_missing_alternatives():
+        from asr_agent.context_judge import normalize_judgment
+
+        session = Session("s", turns=[Turn("t1", "攒生节来了", "攒生节来了")])
+        normalized = normalize_judgment({
+            "outcome": "UNCERTAIN",
+            "confidence": 0.6,
+            "focus": [{"target_turn_id": "t1", "span": "攒生节", "proposed_text": "宰牲节"}],
+        }, session)
+
+        assert normalized.focus[0].alternatives == ["攒生节", "宰牲节"]
+        assert normalized.focus[0].evidence_turn_ids == ["t1"]
+
+
 def test_deepseek_context_judge_safely_defers_malformed_output(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr(deepseek, "_chat_json", lambda *_, **__: {"outcome": "CONFLICT", "focus": [{"bad": "shape"}]})
@@ -46,6 +104,39 @@ def test_deepseek_context_judge_safely_defers_malformed_output(monkeypatch):
     result = deepseek.judge_context(session=Session("s", turns=[turn]), current_turn=turn, memory=MemoryPacket())
 
     assert result.outcome == "UNCERTAIN"
+    assert result.focus == []
+
+
+def test_malformed_focus_uses_independent_audio_diff_when_candidates_are_missing(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(deepseek, "_chat_json", lambda *_, **__: {"outcome": "CONFLICT", "focus": [{"bad": "shape"}]})
+    monkeypatch.setattr(
+        deepseek,
+        "retranscribe_window",
+        lambda *_, **__: {"ok": True, "text": "涂博士来了"},
+    )
+    turn = Turn(
+        "t1",
+        "图博士来了",
+        "图博士来了",
+        meta={"audio_path": "/tmp/sample.wav", "start_sec": 0.0, "end_sec": 1.0},
+    )
+
+    result = deepseek.judge_context(session=Session("s", turns=[turn]), current_turn=turn, memory=MemoryPacket())
+
+    assert result.outcome == "UNCERTAIN"
+    assert result.focus[0].span == "图"
+    assert result.focus[0].proposed_text == "涂"
+
+
+def test_audio_diff_fallback_ignores_punctuation_only_changes(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(deepseek, "_chat_json", lambda *_, **__: {"outcome": "CONFLICT", "focus": [{"bad": "shape"}]})
+    monkeypatch.setattr(deepseek, "retranscribe_window", lambda *_, **__: {"ok": True, "text": "图博士来了。"})
+    turn = Turn("t1", "图博士来了，", "图博士来了，", meta={"audio_path": "/tmp/sample.wav", "start_sec": 0.0, "end_sec": 1.0})
+
+    result = deepseek.judge_context(session=Session("s", turns=[turn]), current_turn=turn, memory=MemoryPacket())
+
     assert result.focus == []
 
 

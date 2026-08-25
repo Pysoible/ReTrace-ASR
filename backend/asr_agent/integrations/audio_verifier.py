@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -25,6 +26,13 @@ def verify_candidates(
     except Exception as exc:
         return {"ok": False, "error": f"audio verification failed: {exc}"}
     scores = payload.get("scores") if isinstance(payload, dict) else None
+    if isinstance(payload, dict) and not isinstance(scores, dict):
+        selected = payload.get("selected", payload.get("choice"))
+        if isinstance(selected, int) and 0 <= selected < len(unique):
+            scores = {candidate: (1.0 if index == selected else 0.0) for index, candidate in enumerate(unique)}
+        elif isinstance(selected, str) and selected.strip() in unique:
+            selected = selected.strip()
+            scores = {candidate: (1.0 if candidate == selected else 0.0) for candidate in unique}
     if not isinstance(scores, dict) or set(scores) != set(unique):
         return {"ok": False, "error": "verifier must score exactly the supplied candidates"}
     try:
@@ -101,7 +109,11 @@ def _qwen_runner(*, audio_path: str, start_sec: float, end_sec: float, candidate
     try:
         prompt = (
             "Listen only to this audio and compare the supplied transcript candidates. "
-            "Return strict JSON {\"scores\":{candidate:number,...}} with every and only supplied candidate. "
+            "The special candidate [DELETE] means that the focused span is not spoken and should be deleted; "
+            "score it only when the audio supports omission of that span. "
+            "Return strict JSON with either {\"scores\":{candidate:number,...}} or {\"choice\":index}. "
+            "For choice, index candidates from 0 and select exactly one supplied candidate. "
+            "Do not invent candidates. "
             f"Candidates: {json.dumps(candidates, ensure_ascii=False)}"
         )
         raw = _infer_one_audio(clipped, prompt)
@@ -112,7 +124,19 @@ def _qwen_runner(*, audio_path: str, start_sec: float, end_sec: float, candidate
     except json.JSONDecodeError:
         start, end = raw.find("{"), raw.rfind("}")
         if start >= 0 and end > start:
-            return json.loads(raw[start : end + 1])
+            try:
+                return json.loads(raw[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+        text = raw.strip()
+        if text in candidates:
+            return {"selected": text}
+        choice_match = re.search(r"(?:choice|候选|选项)\s*[:：]?\s*([0-9]+)", text, re.IGNORECASE)
+        if choice_match:
+            return {"choice": int(choice_match.group(1))}
+        matching = [candidate for candidate in candidates if candidate in text]
+        if len(matching) == 1:
+            return {"selected": matching[0]}
         raise
 
 

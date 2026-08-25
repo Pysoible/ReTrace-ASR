@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from asr_agent.integrations.audio_verifier import verify_candidates
 from asr_agent.integrations.deepseek import deepseek_status
 from asr_agent.integrations.qwen_asr import (
     asr_status,
@@ -43,6 +44,13 @@ class TurnRequest(BaseModel):
 
 class AudioTurnRequest(BaseModel):
     audio: str
+
+
+class AudioVerificationRequest(BaseModel):
+    audio: str
+    start_sec: float
+    end_sec: float
+    candidates: list[str]
 
 
 def _turn_meta(request: TurnRequest) -> dict[str, Any] | None:
@@ -184,6 +192,18 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    @app.post("/api/integrations/qwen/verify")
+    def qwen_verify(request: AudioVerificationRequest) -> dict[str, Any]:
+        result = verify_candidates(
+            request.audio,
+            request.start_sec,
+            request.end_sec,
+            request.candidates,
+        )
+        if not result.get("ok"):
+            raise HTTPException(status_code=502, detail=result.get("error") or "audio verification failed")
+        return result
+
     @app.post("/api/sessions/{session_id}/turns", status_code=202)
     def process_turn(session_id: str, request: TurnRequest) -> dict[str, Any]:
         try:
@@ -262,6 +282,16 @@ def create_app(
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             revisions.extend(result.get("revisions") or [])
+
+        # The batch path has the complete session available. One bounded final
+        # audit exposes later evidence without running another ASR pass.
+        if parts:
+            final_audit = service.analyze_turn(
+                bound_session,
+                f"t{len(parts):03d}",
+                session_complete=True,
+            )
+            revisions.extend(final_audit.get("revisions") or [])
 
         out: dict[str, Any] = {
             "session_id": bound_session,
@@ -374,15 +404,29 @@ def create_app(
         finally:
             processor.finish()
             worker.join(timeout=120)
+            try:
+                completed_session = service.get_session(bound_session)
+                completed_turns = completed_session.get("turns") or []
+                if completed_turns:
+                    service.analyze_turn(
+                        bound_session,
+                        str(completed_turns[-1]["turn_id"]),
+                        session_complete=True,
+                    )
+            except Exception as exc:
+                _publish(bound_session, {"type": "error", "message": f"完整 session 审计失败: {exc}"})
             _publish(bound_session, {"type": "done", "session_id": bound_session, "session": service.get_session(bound_session)})
             events.put(None)
             _drop_event_stream(bound_session)
 
     def _start_stream_audio_session(session_id: str, *, audio_path: str) -> dict[str, Any]:
-        bound_session = _audio_session_id(audio_path, session_id)
+        # Uploaded files can be submitted repeatedly with the same original
+        # filename. Keep each upload isolated so an older background stream
+        # cannot append late chunks into the new session's transcript.
+        bound_session = f"{_audio_session_id(audio_path, session_id)}_{uuid.uuid4().hex[:8]}"
         thread = threading.Thread(
             target=_stream_audio_session_background,
-            args=(session_id,),
+            args=(bound_session,),
             kwargs={"audio_path": audio_path},
             name=f"retrace-audio-{bound_session}",
             daemon=True,

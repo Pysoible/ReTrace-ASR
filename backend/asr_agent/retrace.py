@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Callable
@@ -10,9 +11,9 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 from asr_agent.context_judge import (
     BeliefProposal,
     ContextJudgment,
+    FocusProposal,
     normalize_judgment,
 )
-from asr_agent.decision_engine import DecisionEngine, EvidenceBundle
 from asr_agent.degeneration import (
     DegenerationAssessment,
     assess_transcript,
@@ -62,7 +63,6 @@ class ReTraceService:
             context_judge = judge_context
         self.context_judge = context_judge
         self.resolver = resolver or EvidenceResolver(audio_verifier=audio_verifier)
-        self.decision_engine = DecisionEngine(self.resolver.policy)
         if audio_retranscriber is None:
             from asr_agent.integrations.audio_verifier import retranscribe_window
 
@@ -130,6 +130,7 @@ class ReTraceService:
         turn_id: str,
         *,
         observed_version: int | None = None,
+        session_complete: bool = False,
         max_retries: int = 3,
     ) -> dict[str, Any]:
         for attempt in range(max_retries):
@@ -138,6 +139,8 @@ class ReTraceService:
             trigger = next((turn for turn in snapshot.turns if turn.turn_id == turn_id), None)
             if trigger is None:
                 raise ValueError(f"unknown turn_id: {turn_id}")
+            if session_complete:
+                trigger.meta["session_complete"] = True
             if observed_version is not None and observed_version > snapshot.version:
                 raise VersionConflict(f"observed version {observed_version} is newer than session {snapshot.version}")
             if observed_version is not None and trigger.meta.get("analyzed_observed_version") == observed_version:
@@ -169,6 +172,17 @@ class ReTraceService:
                     judgment = normalize_judgment(raw_judgment, snapshot)
                 except Exception as exc:
                     judgment = ContextJudgment("UNCERTAIN", rationale=f"context judge unavailable: {exc}")
+
+            if not judgment.focus:
+                acoustic_focus = self._acoustic_focus(trigger)
+                if acoustic_focus:
+                    judgment = ContextJudgment(
+                        "UNCERTAIN",
+                        confidence=max(judgment.confidence, 0.5),
+                        rationale="independent ASR disagreement requires targeted audio verification",
+                        focus=acoustic_focus,
+                        beliefs=judgment.beliefs,
+                    )
 
             self._apply_beliefs(snapshot, judgment.beliefs)
             events: list[RevisionEvent] = [recovery_event] if recovery_event is not None else []
@@ -232,20 +246,6 @@ class ReTraceService:
                     context_confidence=judgment.confidence,
                     memory_support=self._memory_support(memory.long_term_beliefs, focus.proposed_text),
                 )
-                decision_bundle = EvidenceBundle(
-                    context_confidence=judgment.confidence,
-                    audio_confidence=max(0.0, min(1.0, resolution.score or 0.0)),
-                    audio_margin=max(0.0, min(1.0, max(0.0, resolution.score or 0.0) - 0.1)),
-                    memory_support=self._memory_support(memory.long_term_beliefs, focus.proposed_text),
-                    independent_sources=len(set(focus.evidence_turn_ids)),
-                    acoustic_support=0.0,
-                    has_audio=bool((next((turn for turn in snapshot.turns if turn.turn_id == focus.target_turn_id), None) or {}).meta.get("audio_path")),
-                )
-                decision = self.decision_engine.decide(decision_bundle)
-                if decision == "DEFER" and resolution.action in {"REVISE_CURRENT", "REVISE_HISTORY"}:
-                    resolution.action = "DEFER"
-                    resolution.rationale = "decision gate rejected the revision: evidence below the calibrated threshold"
-                    resolution.score = max(0.0, min(1.0, resolution.score or 0.0))
                 hypothesis.score = resolution.score
                 if resolution.action in {"REVISE_CURRENT", "REVISE_HISTORY"}:
                     hypothesis.status = "resolved"
@@ -376,6 +376,27 @@ class ReTraceService:
                 "session": committed.as_dict(),
             }
         raise VersionConflict("analysis could not commit after retries")
+
+    @staticmethod
+    def _acoustic_focus(turn: Turn) -> list[FocusProposal]:
+        disagreement = (turn.meta.get("uncertainty") or {}).get("acoustic_disagreement") or []
+        focus: list[FocusProposal] = []
+        for item in disagreement:
+            span = str(item.get("span_a") or "").strip()
+            proposed = str(item.get("span_b") or "").strip()
+            if not span or not proposed or span == proposed or span not in turn.current_text:
+                continue
+            focus.append(FocusProposal(
+                target_turn_id=turn.turn_id,
+                span=span,
+                proposed_text=proposed,
+                alternatives=[span, proposed],
+                evidence_turn_ids=[turn.turn_id],
+                rationale="independent ASR transcripts disagree on this span",
+            ))
+            if len(focus) >= 3:
+                break
+        return focus
 
     def _recover_degenerate_turn(
         self,
@@ -607,6 +628,20 @@ class ReTraceService:
                 "changed": False,
                 "ratio": round(ratio, 3),
                 "rejected": "relisten differs but recovers no remembered entity nor a degenerate pass",
+            }
+            return None
+        # A normal, non-degenerate turn must not be replaced wholesale by an
+        # open re-ASR result. Such relistens are useful evidence, but a second
+        # decoding of a 30-second window can introduce more substitutions than
+        # it fixes. Targeted focus resolutions are the only path allowed to
+        # change a healthy turn; whole-window adoption is reserved for genuine
+        # truncation/degeneration recovery.
+        if not raw_assessment.degenerate and not coverage_risk:
+            meta["relisten_uncertain"] = {
+                "relistened": True,
+                "changed": False,
+                "ratio": round(ratio, 3),
+                "rejected": "normal turn requires targeted focus for revision",
             }
             return None
         # candidate may itself carry a [start-end] prefix; reuse the original

@@ -125,6 +125,261 @@ def test_text_context_alone_never_mutates_transcript(tmp_path):
     assert result["session"]["open_hypotheses"]
 
 
+def test_near_variant_name_mismatch_can_be_revised_when_audio_is_clear_enough(tmp_path):
+    def judge(*, current_turn, **_):
+        if current_turn.turn_id == "t2":
+            return ContextJudgment(
+                "CONFLICT",
+                0.92,
+                focus=[FocusProposal("t1", "卡兹克", "卡兹个", ["卡兹克", "卡兹个"], ["t2"])],
+            )
+        return ContextJudgment("CONSISTENT", 0.8)
+
+    def verify(*, candidates, **_):
+        return {"ok": True, "scores": {"卡兹克": 0.94, "卡兹个": 0.06}}
+
+    service = ReTraceService(tmp_path, context_judge=judge, audio_verifier=verify)
+    service.process_turn(
+        "s",
+        "t1",
+        "卡兹克来了",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0.0, "end_sec": 1.0},
+    )
+
+    result = service.process_turn("s", "t2", "卡兹个来了")
+
+    assert result["revisions"][0]["action"] == "REVISE_HISTORY"
+    assert result["session"]["turns"][0]["current_text"] == "卡兹个来了"
+
+
+def test_strict_revision_defers_open_candidate_when_local_evidence_is_weak(tmp_path):
+    def judge(*, current_turn, **_):
+        if current_turn.turn_id == "t2":
+            return ContextJudgment(
+                "CONFLICT",
+                0.99,
+                focus=[FocusProposal("t1", "我们今天开会讨论", "他们昨晚开会讨论", ["我们今天开会讨论", "他们昨晚开会讨论"], ["t2"])],
+            )
+        return ContextJudgment("CONSISTENT", 0.8)
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=judge,
+        audio_verifier=lambda **_: {"ok": True, "scores": {"我们": 0.32, "他们": 0.68}},
+    )
+    service.process_turn(
+        "s",
+        "t1",
+        "我们今天开会",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0, "end_sec": 1},
+    )
+
+    result = service.process_turn("s", "t2", "继续讨论这个问题")
+
+    assert result["revisions"] == []
+    assert result["session"]["turns"][0]["current_text"] == "我们今天开会"
+
+
+def test_strict_revision_accepts_open_candidate_with_decisive_evidence(tmp_path):
+    def judge(*, current_turn, **_):
+        if current_turn.turn_id == "t2":
+            return ContextJudgment(
+                "CONFLICT",
+                0.99,
+                focus=[FocusProposal("t1", "我们", "他们", ["我们", "他们"], ["t2"])],
+            )
+        return ContextJudgment("CONSISTENT", 0.8)
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=judge,
+        audio_verifier=lambda **_: {"ok": True, "scores": {"我们今天开会讨论": 0.05, "他们昨晚开会讨论": 0.95}},
+    )
+    service.process_turn(
+        "s",
+        "t1",
+        "我们今天开会讨论",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0, "end_sec": 1},
+    )
+
+    result = service.process_turn("s", "t2", "他们负责记录")
+
+    assert result["revisions"][0]["action"] == "REVISE_HISTORY"
+    assert result["session"]["turns"][0]["current_text"] == "他们昨晚开会讨论"
+
+
+def test_delete_focus_removes_an_audio_unsupported_span(tmp_path):
+    def judge(**_):
+        return {
+            "outcome": "UNCERTAIN",
+            "confidence": 0.99,
+            "focus": [{
+                "target_turn_id": "t1",
+                "span": "清高的爱拉",
+                "operation": "DELETE",
+                "proposed_text": "",
+                "alternatives": ["清高的爱拉"],
+                "evidence_turn_ids": ["t1"],
+            }],
+        }
+
+    def verify(*, candidates, **_):
+        assert candidates == ["清高的爱拉", "[DELETE]"]
+        return {"ok": True, "scores": {"清高的爱拉": 0.05, "[DELETE]": 0.95}}
+
+    service = ReTraceService(tmp_path, context_judge=judge, audio_verifier=verify)
+    result = service.process_turn(
+        "s",
+        "t1",
+        "清高的爱拉是一个说法",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0, "end_sec": 2},
+    )
+
+    assert result["revisions"][0]["action"] == "REVISE_CURRENT"
+    assert result["revisions"][0]["replacement"] == ""
+    assert result["session"]["turns"][0]["current_text"] == "是一个说法"
+
+
+def test_replace_focus_can_be_reclassified_as_delete_by_audio(tmp_path):
+    def judge(**_):
+        return ContextJudgment(
+            "CONFLICT",
+            0.99,
+            focus=[FocusProposal("t1", "清高的爱拉", "清高的安拉", ["清高的爱拉", "清高的安拉"], ["t1"])],
+        )
+
+    def verify(*, candidates, **_):
+        assert candidates == ["清高的爱拉", "清高的安拉", "[DELETE]"]
+        return {
+            "ok": True,
+            "scores": {"清高的爱拉": 0.05, "清高的安拉": 0.05, "[DELETE]": 0.90},
+        }
+
+    service = ReTraceService(tmp_path, context_judge=judge, audio_verifier=verify)
+    result = service.process_turn(
+        "s",
+        "t1",
+        "清高的爱拉是一个说法",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0, "end_sec": 2},
+    )
+
+    assert result["revisions"][0]["replacement"] == ""
+    assert result["session"]["turns"][0]["current_text"] == "是一个说法"
+
+
+def test_replace_focus_retries_delete_pair_when_three_way_scores_are_invalid(tmp_path):
+    def judge(**_):
+        return ContextJudgment(
+            "CONFLICT",
+            0.99,
+            focus=[FocusProposal("t1", "清高的爱拉", "清高的安拉", ["清高的爱拉", "清高的安拉"], ["t1"])],
+        )
+
+    def verify(*, candidates, **_):
+        if candidates == ["清高的爱拉", "清高的安拉", "[DELETE]"]:
+            return {"ok": True, "scores": {"清高的爱拉": 0.1, "清高的安拉": 0.9}}
+        assert candidates == ["清高的爱拉", "[DELETE]"]
+        return {"ok": True, "scores": {"清高的爱拉": 0.05, "[DELETE]": 0.95}}
+
+    service = ReTraceService(tmp_path, context_judge=judge, audio_verifier=verify)
+    result = service.process_turn(
+        "s",
+        "t1",
+        "清高的爱拉是一个说法",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0, "end_sec": 2},
+    )
+
+    assert result["revisions"][0]["replacement"] == ""
+    assert result["session"]["turns"][0]["current_text"] == "是一个说法"
+
+
+def test_real_t063_delete_score_flows_through_service(tmp_path):
+    def judge(**_):
+        return ContextJudgment(
+            "CONFLICT",
+            0.99,
+            focus=[FocusProposal("t1", "清高的爱拉", "清高的安拉", ["清高的爱拉", "清高的安拉"], ["t1"])],
+        )
+
+    def verify(*, candidates, **_):
+        if candidates == ["清高的爱拉", "清高的安拉", "[DELETE]"]:
+            return {"ok": True, "scores": {"清高的爱拉": 0.0, "[DELETE]": 1.0}}
+        assert candidates == ["清高的爱拉", "[DELETE]"]
+        return {"ok": True, "scores": {"清高的爱拉": 0.0, "[DELETE]": 1.0}}
+
+    service = ReTraceService(tmp_path, context_judge=judge, audio_verifier=verify)
+    result = service.process_turn(
+        "s",
+        "t1",
+        "清高的爱拉他曾经说",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 1801.984, "end_sec": 1825.344},
+    )
+
+    assert result["revisions"][0]["action"] == "REVISE_CURRENT"
+    assert result["revisions"][0]["replacement"] == ""
+    assert result["session"]["turns"][0]["current_text"] == "他曾经说"
+
+
+def test_audio_revision_rejects_unrelated_replacement_for_short_span(tmp_path):
+    def judge(*, current_turn, **_):
+        if current_turn.turn_id == "t2":
+            return ContextJudgment(
+                "CONFLICT",
+                0.98,
+                focus=[FocusProposal("t1", "是", "国济公", ["是", "国济公"], ["t2"])],
+            )
+        return ContextJudgment("CONSISTENT", 0.8)
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=judge,
+        audio_verifier=lambda **_: {"ok": True, "scores": {"是": 0.01, "国济公": 0.99}},
+    )
+    service.process_turn(
+        "s",
+        "t1",
+        "是正确的",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0, "end_sec": 1},
+    )
+
+    result = service.process_turn("s", "t2", "确认是国济公")
+
+    assert result["revisions"] == []
+    assert result["session"]["turns"][0]["current_text"] == "是正确的"
+
+
+def test_open_retranscription_without_span_alignment_is_deferred(tmp_path, monkeypatch):
+    def judge(*, current_turn, **_):
+        if current_turn.turn_id == "t2":
+            return ContextJudgment(
+                "CONFLICT",
+                0.98,
+                focus=[FocusProposal("t1", "图博士", "涂博士", ["图博士", "涂博士"], ["t2"])],
+            )
+        return ContextJudgment("CONSISTENT", 0.8)
+
+    monkeypatch.setattr(
+        "asr_agent.resolver.retranscribe_window",
+        lambda *args, **kwargs: {"ok": True, "text": "其他内容涂博士其他内容"},
+    )
+    service = ReTraceService(
+        tmp_path,
+        context_judge=judge,
+        audio_verifier=lambda **_: {"ok": False},
+    )
+    service.process_turn(
+        "s",
+        "t1",
+        "图博士来了",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0, "end_sec": 1},
+    )
+
+    result = service.process_turn("s", "t2", "负责人涂博士已经到了")
+
+    assert result["revisions"] == []
+    assert result["session"]["turns"][0]["current_text"] == "图博士来了"
+
+
 def test_default_fallback_does_not_invent_proper_nouns(tmp_path):
     service = ReTraceService(tmp_path)
     service.process_turn("s", "t1", "比如泰信商业保险，比如泰康的保险")
@@ -367,9 +622,8 @@ def test_uncertain_relisten_is_rejected_when_hotword_biases_the_model(tmp_path):
     assert turn["meta"]["relisten_uncertain"]["rejected"]
 
 
-def test_uncertain_relisten_adopts_when_it_surfaces_a_remembered_entity(tmp_path):
-    """When the relisten actually recovers a remembered domain entity verbatim,
-    the revision is adopted (contextual biasing worked)."""
+def test_uncertain_relisten_does_not_replace_a_healthy_turn(tmp_path):
+    """A remembered entity is evidence, not permission to overwrite a healthy turn."""
     def judge(*, current_turn, **_):
         if current_turn.turn_id == "t1":
             return ContextJudgment(
@@ -398,11 +652,9 @@ def test_uncertain_relisten_adopts_when_it_surfaces_a_remembered_entity(tmp_path
     )
 
     turn = result["session"]["turns"][1]
-    assert turn["current_text"] == "对，这个雷恩加尔，那这个英雄跟那个螳螂还是很有渊源的，是吧？"
-    revision = [r for r in result["revisions"] if r["resolver"] == "audio-uncertainty-relisten"]
-    assert revision
-    assert revision[0]["action"] == "REVISE_CURRENT"
-    assert revision[0]["after_text"].startswith("[0.0-7.0]")
+    assert turn["current_text"] == "[0.0-7.0] 这个连加额，那这个英雄跟那个跟螳螂还是有有渊源的是吧？"
+    assert not [r for r in result["revisions"] if r["resolver"] == "audio-uncertainty-relisten"]
+    assert turn["meta"]["relisten_uncertain"]["rejected"] == "normal turn requires targeted focus for revision"
 
 
 def test_coverage_risk_uses_segmented_relisten_even_when_judge_is_consistent(tmp_path):

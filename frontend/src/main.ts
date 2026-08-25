@@ -104,6 +104,7 @@ let status = '等待新的 ASR observation。';
 let busy = false;
 let liveEventSource: EventSource | null = null;
 let liveStreamSession = '';
+let liveSessionVersion = 0;
 // Panel collapse state: keyed by panel name, expanded by default.
 let collapsedPanels: Record<string, boolean> = {};
 
@@ -437,6 +438,13 @@ function closeLiveStream(): void {
   liveEventSource?.close();
   liveEventSource = null;
   liveStreamSession = '';
+  liveSessionVersion = 0;
+}
+
+function acceptLiveSession(next: Session | undefined): void {
+  if (!next || next.version < liveSessionVersion) return;
+  session = next;
+  liveSessionVersion = next.version;
 }
 
 async function submitAudio(): Promise<void> {
@@ -479,10 +487,9 @@ async function submitAudio(): Promise<void> {
         return;
       }
       if (payload.type === 'turn') {
-        try {
-          session = payload.session ?? (await refreshSession(boundSession));
-        } catch {
-          /* keep last session */
+        acceptLiveSession(payload.session as Session | undefined);
+        if (!session) {
+          try { acceptLiveSession(await refreshSession(boundSession)); } catch { /* keep last session */ }
         }
         if (!selectedTurnId) selectedTurnId = payload.turn_id || session?.turns.at(-1)?.turn_id || '';
         status = `已处理 ${session?.turns.length ?? payload.index + 1} 个 turn · 持续分析中…`;
@@ -490,10 +497,9 @@ async function submitAudio(): Promise<void> {
         return;
       }
       if (payload.type === 'done') {
-        try {
-          session = payload.session ?? (await refreshSession(boundSession));
-        } catch {
-          /* keep last session */
+        acceptLiveSession(payload.session as Session | undefined);
+        if (!session) {
+          try { acceptLiveSession(await refreshSession(boundSession)); } catch { /* keep last session */ }
         }
         closeLiveStream();
         if (!selectedTurnId) selectedTurnId = session?.turns.at(-1)?.turn_id || '';

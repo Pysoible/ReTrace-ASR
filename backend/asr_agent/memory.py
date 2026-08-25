@@ -205,9 +205,9 @@ class LongTermMemoryRepository:
 
 
 class MemoryRetriever:
-    def __init__(self, repository: LongTermMemoryRepository, recent_limit: int = 8, long_term_limit: int = 24) -> None:
+    def __init__(self, repository: LongTermMemoryRepository, recent_limit: int | None = None, long_term_limit: int = 24) -> None:
         self.repository = repository
-        self.recent_limit = recent_limit
+        self.recent_limit = recent_limit if recent_limit is not None else int(os.getenv("ASR_MEMORY_RECENT_LIMIT", "16"))
         self.long_term_limit = long_term_limit
         self._dense_embedder = _OptionalDenseEmbedder()
         self._index_cache_key: tuple[tuple[str, int, str, float], ...] | None = None

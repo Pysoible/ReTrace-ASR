@@ -4,13 +4,29 @@ from asr_agent.context_judge import ExplicitSignalFallbackJudge
 from asr_agent.models import Session, Turn
 
 
-def test_fallback_judge_only_uses_explicit_asr_signals():
+def test_fallback_judge_without_any_signal_is_uncertain():
     judge = ExplicitSignalFallbackJudge()
     session = Session("s", turns=[Turn("t1", "今天讨论保险方案", "今天讨论保险方案")])
 
     result = judge(session=session, current_turn=session.turns[0], memory=None)
 
-    assert result.outcome == "CONSISTENT"
+    assert result.outcome == "UNCERTAIN"
+    assert result.focus == []
+
+
+def test_fallback_judge_only_uses_explicit_asr_signals():
+    judge = ExplicitSignalFallbackJudge()
+    turn = Turn(
+        "t1",
+        "图博士来了",
+        "图博士来了",
+        meta={"asr_signals": {"confidence": {"图博士": 0.2}, "nbest": ["图博士来了", "涂博士来了"]}},
+    )
+    session = Session("s", turns=[turn])
+
+    result = judge(session=session, current_turn=turn, memory=None)
+
+    assert result.outcome == "UNCERTAIN"
     assert result.focus == []
 
 
