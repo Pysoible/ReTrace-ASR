@@ -320,6 +320,20 @@ def test_real_t063_delete_score_flows_through_service(tmp_path):
     assert result["session"]["turns"][0]["current_text"] == "他曾经说"
 
 
+def test_empty_span_context_decision_is_classified_as_audit(tmp_path):
+    service = ReTraceService(
+        tmp_path,
+        context_judge=lambda **_: ContextJudgment("CONSISTENT", 0.8),
+    )
+    result = service.process_turn("s", "t1", "正常文本")
+
+    event = result["decisions"][0]
+    assert event["action"] == "KEEP_OLD"
+    assert event["span"] == ""
+    assert event["event_kind"] == "audit"
+    assert result["revisions"] == []
+
+
 def test_audio_revision_rejects_unrelated_replacement_for_short_span(tmp_path):
     def judge(*, current_turn, **_):
         if current_turn.turn_id == "t2":

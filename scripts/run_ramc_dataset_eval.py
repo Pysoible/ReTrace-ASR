@@ -245,6 +245,8 @@ def groundtruth_comparison(
 
 def event_stats(session: dict[str, Any]) -> dict[str, Any]:
     events = [event for event in session.get("revision_events") or [] if event.get("active")]
+    audits = [event for event in events if _is_audit_event(event)]
+    revisions = [event for event in events if _is_committed_revision(event)]
     audio_events = [
         event for event in events
         if "audio" in str(event.get("resolver", "")).lower()
@@ -259,7 +261,11 @@ def event_stats(session: dict[str, Any]) -> dict[str, Any]:
         if meta.get("start_sec") is not None and meta.get("end_sec") is not None:
             relisten_seconds += max(0.0, float(meta["end_sec"]) - float(meta["start_sec"]))
     return {
-        "revision_events": len(events),
+        "decision_events": len(events),
+        "audit_events": len(audits),
+        "revision_events": len(revisions),
+        "committed_revisions": len(revisions),
+        "changed_turns": sum(turn.get("raw_text") != turn.get("current_text") for turn in session.get("turns") or []),
         "audio_verified_events": len(audio_events),
         "audio_verified_turns": len(target_turns),
         "relisten_seconds_proxy": relisten_seconds,
@@ -269,7 +275,26 @@ def event_stats(session: dict[str, Any]) -> dict[str, Any]:
 
 
 def _event_replacement(event: dict[str, Any]) -> str:
+    if event.get("action") in {"REVISE_CURRENT", "REVISE_HISTORY", "REVISE_TEXT"} and event.get("span"):
+        return norm(str(event.get("replacement") or ""))
     return norm(str(event.get("replacement") or event.get("after_text") or ""))
+
+
+def _is_audit_event(event: dict[str, Any]) -> bool:
+    return bool(
+        event.get("event_kind") == "audit"
+        or (
+            not str(event.get("span") or "").strip()
+            and str(event.get("resolver") or "") == "context-judge"
+        )
+    )
+
+
+def _is_committed_revision(event: dict[str, Any]) -> bool:
+    return bool(
+        event.get("action") in {"REVISE_CURRENT", "REVISE_HISTORY", "REVISE_TEXT", "ROLLBACK"}
+        and not _is_audit_event(event)
+    )
 
 
 def _event_has_audio_evidence(event: dict[str, Any]) -> bool:
@@ -335,10 +360,7 @@ def revision_metrics(
     """
     turns = session.get("turns") or []
     events = [event for event in session.get("revision_events") or [] if event.get("active", True)]
-    revisions = [
-        event for event in events
-        if event.get("action") in {"REVISE_CURRENT", "REVISE_HISTORY", "REVISE_TEXT"}
-    ]
+    revisions = [event for event in events if _is_committed_revision(event)]
     turn_order = {turn.get("turn_id"): index for index, turn in enumerate(turns)}
     refs = turn_references or {}
     correct = []

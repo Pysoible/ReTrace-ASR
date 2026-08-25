@@ -154,6 +154,7 @@ class RevisionEvent:
     replacement: str = ""
     session_version: int = 0
     supersedes_event_id: str | None = None
+    event_kind: str = "revision"
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -179,6 +180,7 @@ class RevisionEvent:
             replacement=str(value.get("replacement", "")),
             session_version=int(value.get("session_version", 0)),
             supersedes_event_id=value.get("supersedes_event_id"),
+            event_kind=str(value.get("event_kind", "revision")),
         )
 
 

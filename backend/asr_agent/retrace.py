@@ -911,6 +911,7 @@ class ReTraceService:
     ) -> RevisionEvent:
         target_id = target_turn_id or source_turn.turn_id
         target = next(turn for turn in session.turns if turn.turn_id == target_id)
+        event_kind = "audit" if not span and action in {"KEEP_OLD", "DEFER", "COEXIST", "ACCEPT_NEW"} else "revision"
         return RevisionEvent(
             event_id=self._event_id(session.session_id, source_turn.turn_id, observed_version, action, discriminator),
             action=action,
@@ -924,6 +925,7 @@ class ReTraceService:
             evidence=list(evidence or []),
             resolver="context-judge",
             rationale=rationale,
+            event_kind=event_kind,
         )
 
     @staticmethod

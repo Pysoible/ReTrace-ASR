@@ -108,6 +108,12 @@ def evaluate_one(
             session = {}
 
     events = [e for e in (session.get("revision_events") or []) if e.get("active")]
+    audit_events = [e for e in events if e.get("event_kind") == "audit" or (not e.get("span") and e.get("resolver") == "context-judge")]
+    committed_events = [
+        e for e in events
+        if e.get("action") in {"REVISE_CURRENT", "REVISE_HISTORY", "ROLLBACK"}
+        and e.get("event_kind") != "audit"
+    ]
     raw = _join_turns(session, "raw_text")
     cur = _join_turns(session, "current_text")
     asr_text = str(payload.get("final_text") or raw)
@@ -121,7 +127,7 @@ def evaluate_one(
             "to": e.get("replacement") or e.get("after_text"),
             "rationale": e.get("rationale"),
         }
-        for e in events
+        for e in committed_events
     ]
     return {
         "stem": stem,
@@ -130,7 +136,11 @@ def evaluate_one(
         "elapsed_sec": elapsed,
         "turns": len(session.get("turns") or []),
         "chunk_count": payload.get("chunk_count") or len(session.get("turns") or []),
-        "n_revisions": len(events),
+        "n_revisions": len(committed_events),
+        "decision_events": len(events),
+        "audit_events": len(audit_events),
+        "committed_revisions": len(committed_events),
+        "changed_turns": sum(turn.get("raw_text") != turn.get("current_text") for turn in session.get("turns") or []),
         "cer_asr": cer_asr,
         "cer_current": cer_cur,
         "cer_delta": round(cer_asr["cer"] - cer_cur["cer"], 4),
