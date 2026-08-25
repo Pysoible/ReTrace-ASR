@@ -146,7 +146,7 @@ class EvidenceResolver:
             return start_sec, end_sec
         midpoint = (position + len(span) / 2) / len(text)
         center = start_sec + midpoint * duration
-        width = min(5.0, duration)
+        width = min(max(3.0, duration * 0.22), 7.0, duration)
         return max(start_sec, center - width / 2), min(end_sec, center + width / 2)
 
     def resolve(

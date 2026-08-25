@@ -209,26 +209,42 @@ class _RemoteEngine:
 
     def __init__(self, gpu: str, cfg: AsrConfig) -> None:
         ctx = mp.get_context("spawn")
-        self.parent_conn, child_conn = ctx.Pipe(duplex=True)
         self.gpu = gpu
+        self.cfg = cfg
         self._lock = threading.Lock()
-        self.proc = ctx.Process(
+        self._ctx = ctx
+        self._start()
+
+    def _start(self) -> None:
+        self.parent_conn, child_conn = self._ctx.Pipe(duplex=True)
+        self.proc = self._ctx.Process(
             target=_gpu_worker_main,
-            args=(child_conn, gpu, _cfg_to_dict(cfg)),
+            args=(child_conn, self.gpu, _cfg_to_dict(self.cfg)),
             daemon=True,
-            name=f"retrace-asr-gpu{gpu}",
+            name=f"retrace-asr-gpu{self.gpu}",
         )
         self.proc.start()
         child_conn.close()
         status, payload = self.parent_conn.recv()
         if status != "ready":
             self.close()
-            raise RuntimeError(f"ASR worker on GPU {gpu} failed to start: {payload}")
+            raise RuntimeError(f"ASR worker on GPU {self.gpu} failed to start: {payload}")
+
+    def _restart(self) -> None:
+        self.close()
+        self._start()
 
     def infer_one(self, audio_path: Path | str, prompt: str) -> str:
         with self._lock:
-            self.parent_conn.send(("infer", str(audio_path), prompt))
-            status, payload = self.parent_conn.recv()
+            try:
+                self.parent_conn.send(("infer", str(audio_path), prompt))
+                status, payload = self.parent_conn.recv()
+            except (EOFError, OSError, BrokenPipeError) as exc:
+                try:
+                    self._restart()
+                except Exception:
+                    pass
+                raise RuntimeError(f"ASR worker on GPU {self.gpu} failed during inference") from exc
         if status != "ok":
             raise RuntimeError(str(payload))
         return str(payload or "")
