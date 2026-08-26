@@ -787,6 +787,13 @@ def stream_transcribe_audio(
             except Exception as exc:  # noqa: BLE001
                 print(f"[truncation-relisten] chunk={index} FAILED {exc!r}", flush=True)
         uncertainty = dict(observation.get("uncertainty") or {})
+        uncertainty = _enrich_uncertainty(
+            None,
+            None,
+            chunk_paths[index],
+            text,
+            uncertainty,
+        )
         uncertainty["coverage"] = _coverage_signal(chunk_paths[index], text)
         uncertainty = _attach_acoustic_disagreement(chunk_paths[index], text, uncertainty)
         on_chunk(index, text, uncertainty, chunk_meta[index])

@@ -20,6 +20,7 @@ from asr_agent.degeneration import (
     assess_repeated_tail,
     should_replace_degenerate,
     trim_degenerate_tail,
+    trim_repeated_tail,
 )
 from asr_agent.ledger import RevisionLedger
 from asr_agent.memory import LongTermMemoryRepository, MemoryConsolidator, MemoryRetriever
@@ -160,6 +161,35 @@ class ReTraceService:
                 observed_version=observed_version,
             )
             tail_degenerate = assess_repeated_tail(trigger.raw_text, min_tail_chars=24)
+            if recovery_event is None and tail_degenerate.degenerate:
+                trimmed_tail = trim_repeated_tail(trigger.raw_text, min_tail_chars=24)
+                if trimmed_tail != trigger.raw_text:
+                    after_text = trimmed_tail
+                    meta = trigger.meta
+                    meta["degeneration"] = {
+                        **(meta.get("degeneration") or {}),
+                        "detected": True,
+                        "score": tail_degenerate.score,
+                        "reasons": list(dict.fromkeys([*(meta.get("degeneration") or {}).get("reasons", []), "repeated_tail"])),
+                        "recovered": True,
+                        "trimmed": True,
+                        "replacement": after_text,
+                    }
+                    recovery_event = RevisionEvent(
+                        event_id=self._event_id(snapshot.session_id, trigger.turn_id, observed_version, "REVISE_CURRENT", "repeated-tail"),
+                        action="REVISE_CURRENT",
+                        target_turn_id=trigger.turn_id,
+                        source_turn_id=trigger.turn_id,
+                        span=trigger.raw_text,
+                        before_text=trigger.raw_text,
+                        after_text=after_text,
+                        entity_id=None,
+                        score=tail_degenerate.score,
+                        evidence=[f"audio:{trigger.meta.get('audio_path')}:{trigger.meta.get('start_sec')}-{trigger.meta.get('end_sec')}", "degeneration:repeated_tail"],
+                        resolver="audio-degeneration-recovery",
+                        rationale="repeated tail removed after open re-transcription failed to recover the turn",
+                        replacement=after_text,
+                    )
             if recovery_event is None and tail_degenerate.degenerate:
                 degeneration = DegenerationAssessment(
                     True,
@@ -437,6 +467,7 @@ class ReTraceService:
                 audio_path=str(audio_path),
                 start_sec=float(start_sec),
                 end_sec=float(end_sec),
+                recover_coverage=duration is not None and duration > 8.0,
             )
         except Exception as exc:
             meta["degeneration"]["error"] = f"audio re-transcription failed: {exc}"

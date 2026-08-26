@@ -84,6 +84,38 @@ def assess_repeated_tail(text: str, *, min_tail_chars: int = 12) -> Degeneration
             return DegenerationAssessment(True, min(1.0, 0.7 + repeats * 0.05), ("repeated_tail",))
     return DegenerationAssessment(False, 0.0)
 
+def trim_repeated_tail(text: str, *, min_tail_chars: int = 24) -> str:
+    """Remove a clearly repeated suffix while preserving the valid prefix."""
+    raw = (text or "").strip()
+    prefix_match = re.match(r"^(\[\d+(?:\.\d+)?-\d+(?:\.\d+)?\]\s*)", raw)
+    prefix = prefix_match.group(1) if prefix_match else ""
+    content = raw[len(prefix):]
+    if not content:
+        return raw
+    compact_chars: list[str] = []
+    source_positions: list[int] = []
+    for source_index, char in enumerate(content):
+        if re.fullmatch(r"[A-Za-z0-9_\u4e00-\u9fff]", char):
+            compact_chars.append(char)
+            source_positions.append(source_index)
+    compact = "".join(compact_chars)
+    for width in range(1, min(8, len(compact) // 3) + 1):
+        token = compact[-width:]
+        repeats = 0
+        index = len(compact)
+        while index >= width and compact[index - width:index] == token:
+            repeats += 1
+            index -= width
+        if repeats < 3 or repeats * width < min_tail_chars:
+            continue
+        compact_start = index
+        if compact_start > 0 and compact_start < len(source_positions):
+            original_start = source_positions[compact_start]
+            kept = content[:original_start].rstrip()
+            if kept and not assess_repeated_tail(kept, min_tail_chars=min_tail_chars).degenerate:
+                return f"{prefix}{kept}"
+    return raw
+
 
 def should_replace_degenerate(
     original: DegenerationAssessment,

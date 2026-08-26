@@ -75,3 +75,27 @@ def test_parse_uncertainty_tags_against_fixed_text():
     tagged = parse_uncertainty_tags(raw, text)
     assert tagged["confidence"]["威沃"] == 0.3
     assert "vivo" in tagged["text_candidates"]["威沃"]
+
+
+def test_streaming_asr_enriches_uncertainty_before_publishing(monkeypatch, tmp_path):
+    from asr_agent.integrations import qwen_asr
+
+    audio = tmp_path / "input.wav"
+    audio.write_bytes(b"placeholder")
+    chunk = tmp_path / "chunk.wav"
+    chunk.write_bytes(b"placeholder")
+    published = []
+
+    monkeypatch.setattr(qwen_asr, "read_asr_config", lambda: type("Config", (), {"audio_dir": str(tmp_path), "gpu_ids": ["0"]})())
+    monkeypatch.setattr(qwen_asr, "_resolve_audio", lambda *_: audio)
+    monkeypatch.setattr(qwen_asr, "_engines", lambda: [object()])
+    monkeypatch.setattr(qwen_asr, "split_audio_file", lambda *_: {"chunks": [{"index": 0, "path": str(chunk), "start_sec": 0.0, "end_sec": 2.0}], "chunk_count": 1, "duration_sec": 2.0, "chunked": True})
+    monkeypatch.setattr(qwen_asr, "cleanup_chunks", lambda *_: None)
+    monkeypatch.setattr(qwen_asr, "_infer_chunks_streaming", lambda _paths, _prompt, callback: callback(0, "威沃和小米"))
+    monkeypatch.setattr(qwen_asr, "_enrich_uncertainty", lambda *_args: {"confidence": {"威沃": 0.3}, "text_candidates": {"威沃": ["威沃", "vivo"]}})
+    monkeypatch.setattr(qwen_asr, "_coverage_signal", lambda *_args, **_kwargs: {"truncated": False})
+    monkeypatch.setattr(qwen_asr, "_attach_acoustic_disagreement", lambda _path, _text, uncertainty: uncertainty)
+
+    qwen_asr.stream_transcribe_audio(str(audio), lambda *args: published.append(args))
+
+    assert published[0][2]["text_candidates"] == {"威沃": ["威沃", "vivo"]}
