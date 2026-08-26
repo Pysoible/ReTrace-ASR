@@ -209,7 +209,7 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
     session_complete = bool((current_turn.meta or {}).get("session_complete"))
     if session_complete:
         recent_turns = memory.recent_turns[-4:]
-        history_chars = int(os.getenv("ASR_FINAL_AUDIT_DIGEST_CHARS", "72"))
+        history_chars = int(os.getenv("ASR_FINAL_AUDIT_DIGEST_CHARS", "180"))
         current_payload = {
             "turn_id": current_turn.turn_id,
             "text": re.sub(r"^\[[0-9.]+[-,~][0-9.]+\]\s*", "", current_turn.current_text or current_turn.raw_text),

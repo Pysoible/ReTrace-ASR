@@ -65,6 +65,26 @@ def assess_transcript(text: str, *, duration_sec: float | None = None) -> Degene
     return DegenerationAssessment(score >= 0.75, score, tuple(dict.fromkeys(reasons)))
 
 
+def assess_repeated_tail(text: str, *, min_tail_chars: int = 12) -> DegenerationAssessment:
+    """Detect a repetitive suffix hidden behind otherwise valid text."""
+    raw = (text or "").strip()
+    content = re.sub(r"^\[\d+(?:\.\d+)?-\d+(?:\.\d+)?\]\s*", "", raw)
+    compact = _compact(content)
+    if len(compact) < min_tail_chars:
+        return DegenerationAssessment(False, 0.0)
+    for width in range(1, min(8, len(compact) // 3) + 1):
+        token = compact[-width:]
+        repeats = 0
+        index = len(compact)
+        while index >= width and compact[index - width:index] == token:
+            repeats += 1
+            index -= width
+        tail_length = repeats * width
+        if repeats >= 3 and tail_length >= min_tail_chars:
+            return DegenerationAssessment(True, min(1.0, 0.7 + repeats * 0.05), ("repeated_tail",))
+    return DegenerationAssessment(False, 0.0)
+
+
 def should_replace_degenerate(
     original: DegenerationAssessment,
     candidate: DegenerationAssessment,

@@ -1,4 +1,5 @@
 from asr_agent.degeneration import assess_transcript, should_replace_degenerate
+from asr_agent.degeneration import assess_repeated_tail
 
 
 def test_detects_generic_repetition_without_hard_coding_filler_words():
@@ -32,3 +33,9 @@ def test_replacement_requires_a_clear_quality_improvement():
 
     assert should_replace_degenerate(original, improved) is True
     assert should_replace_degenerate(original, another_loop) is False
+
+def test_assess_repeated_tail_finds_loop_after_valid_prefix():
+    assessment = assess_repeated_tail("这是一段正常内容，然后嗯嗯嗯嗯嗯嗯嗯嗯嗯嗯嗯嗯")
+
+    assert assessment.degenerate is True
+    assert "repeated_tail" in assessment.reasons

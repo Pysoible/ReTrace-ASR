@@ -17,6 +17,7 @@ from asr_agent.context_judge import (
 from asr_agent.degeneration import (
     DegenerationAssessment,
     assess_transcript,
+    assess_repeated_tail,
     should_replace_degenerate,
     trim_degenerate_tail,
 )
@@ -158,6 +159,13 @@ class ReTraceService:
                 trigger,
                 observed_version=observed_version,
             )
+            tail_degenerate = assess_repeated_tail(trigger.raw_text, min_tail_chars=24)
+            if recovery_event is None and tail_degenerate.degenerate:
+                degeneration = DegenerationAssessment(
+                    True,
+                    max(degeneration.score, tail_degenerate.score),
+                    tuple(dict.fromkeys([*degeneration.reasons, *tail_degenerate.reasons])),
+                )
             if recovery_event is not None:
                 trigger.current_text = recovery_event.after_text
             memory = self.memory_retriever.retrieve(snapshot, trigger)
