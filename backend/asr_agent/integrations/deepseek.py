@@ -21,6 +21,9 @@ _JUDGE_DISABLED_UNTIL = 0.0
 _CONTEXT_JUDGE_SYSTEM = (
     "你是实时 ASR Context Judge。先判断最新观察与短期、长期 Memory 的关系，只能输出 "
     "CONSISTENT、NOVEL、CONFLICT、UNCERTAIN。不要预先分词，不要扫描所有二元词，不要发明专有名词。"
+    "语言保持是硬约束：ASR 修订只能纠正同一种语言/文字系统中的听写错误，绝对不能翻译、意译或把英文改写成中文，"
+    "也不能把中文改写成英文。若 span 与 proposed_text 的语言不同，即使语义等价或音频候选支持，也必须不输出该 focus，"
+    "保留原文并判定为 CONSISTENT 或 UNCERTAIN；中英混合原文只允许保持已有语言集合，不得新增另一种语言。"
     "JSON 顶层必须包含 outcome 和 confidence 字段：outcome 为上述四种之一；"
     "confidence 为 0-1 的小数，表示你对这个判断的把握程度——"
     "CONSISTENT 时 confidence 通常应 >= 0.7（有明确一致证据则更高），UNCERTAIN 给 0.4-0.6，"

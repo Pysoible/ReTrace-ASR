@@ -113,6 +113,88 @@ def test_agent_can_revise_history_when_new_context_and_audio_agree(tmp_path):
     assert result["revisions"][0]["source_turn_id"] == "t2"
 
 
+def test_revision_cannot_translate_english_to_chinese(tmp_path):
+    def judge(**_):
+        return ContextJudgment(
+            "CONFLICT",
+            0.99,
+            focus=[FocusProposal("t1", "industrial designer", "工业设计师", ["industrial designer", "工业设计师"], ["t2"])],
+        )
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=judge,
+        audio_verifier=lambda **_: {"ok": True, "scores": {"industrial designer": 0.01, "工业设计师": 0.99}},
+    )
+    service.process_turn(
+        "s",
+        "t1",
+        "My role is industrial designer",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0, "end_sec": 2},
+    )
+
+    result = service.process_turn("s", "t2", "That is her role")
+
+    assert result["revisions"] == []
+    assert result["session"]["turns"][0]["current_text"] == "My role is industrial designer"
+
+
+def test_revision_cannot_translate_chinese_to_english(tmp_path):
+    def judge(**_):
+        return ContextJudgment(
+            "CONFLICT",
+            0.99,
+            focus=[FocusProposal("t1", "工业设计师", "industrial designer", ["工业设计师", "industrial designer"], ["t2"])],
+        )
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=judge,
+        audio_verifier=lambda **_: {"ok": True, "scores": {"工业设计师": 0.01, "industrial designer": 0.99}},
+    )
+    service.process_turn(
+        "s",
+        "t1",
+        "她是工业设计师",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0, "end_sec": 2},
+    )
+
+    result = service.process_turn("s", "t2", "She is responsible for the design")
+
+    assert result["revisions"] == []
+    assert result["session"]["turns"][0]["current_text"] == "她是工业设计师"
+
+
+def test_cross_language_candidates_are_rejected_before_audio_verification(tmp_path):
+    verified = False
+
+    def verify(**_):
+        nonlocal verified
+        verified = True
+        return {"ok": True, "scores": {"工业设计师": 0.5, "industrial designer": 0.5}}
+
+    def judge(**_):
+        return ContextJudgment(
+            "CONFLICT",
+            0.99,
+            focus=[FocusProposal("t1", "工业设计师", "工业设计师", ["工业设计师", "industrial designer"], ["t2"])],
+        )
+
+    service = ReTraceService(tmp_path, context_judge=judge, audio_verifier=verify)
+    service.process_turn(
+        "s",
+        "t1",
+        "她是工业设计师",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0, "end_sec": 2},
+    )
+
+    result = service.process_turn("s", "t2", "She is responsible for the design")
+
+    assert result["revisions"] == []
+    assert verified is False
+    assert result["session"]["turns"][0]["current_text"] == "她是工业设计师"
+
+
 def test_text_context_alone_never_mutates_transcript(tmp_path):
     service = ReTraceService(tmp_path, context_judge=conflict_judge)
     service.process_turn("s", "t1", "图博士来了")
@@ -136,7 +218,7 @@ def test_near_variant_name_mismatch_can_be_revised_when_audio_is_clear_enough(tm
         return ContextJudgment("CONSISTENT", 0.8)
 
     def verify(*, candidates, **_):
-        return {"ok": True, "scores": {"卡兹克": 0.94, "卡兹个": 0.06}}
+        return {"ok": True, "scores": {"卡兹克": 0.06, "卡兹个": 0.94}}
 
     service = ReTraceService(tmp_path, context_judge=judge, audio_verifier=verify)
     service.process_turn(
@@ -193,7 +275,7 @@ def test_strict_revision_accepts_open_candidate_with_decisive_evidence(tmp_path)
     service = ReTraceService(
         tmp_path,
         context_judge=judge,
-        audio_verifier=lambda **_: {"ok": True, "scores": {"我们今天开会讨论": 0.05, "他们昨晚开会讨论": 0.95}},
+        audio_verifier=lambda **kwargs: {"ok": True, "scores": {candidate: (0.95 if candidate == "他们" else 0.05) for candidate in kwargs["candidates"]}},
     )
     service.process_turn(
         "s",
@@ -205,7 +287,7 @@ def test_strict_revision_accepts_open_candidate_with_decisive_evidence(tmp_path)
     result = service.process_turn("s", "t2", "他们负责记录")
 
     assert result["revisions"][0]["action"] == "REVISE_HISTORY"
-    assert result["session"]["turns"][0]["current_text"] == "他们昨晚开会讨论"
+    assert result["session"]["turns"][0]["current_text"] == "他们今天开会讨论"
 
 
 def test_delete_focus_removes_an_audio_unsupported_span(tmp_path):

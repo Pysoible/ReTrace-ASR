@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import re
 import time
@@ -43,11 +44,18 @@ def _cer(ref: str, hyp: str) -> dict[str, Any]:
     r, h = _norm(ref), _norm(hyp)
     edits = _edit_distance(r, h)
     n_ref = len(r)
+    overlap = sum((Counter(r) & Counter(h)).values())
+    precision = overlap / len(h) if h else 0.0
+    recall = overlap / n_ref if n_ref else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     return {
         "cer": (edits / n_ref) if n_ref else 0.0,
         "n_ref": n_ref,
         "n_hyp": len(h),
         "edits": edits,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
     }
 
 

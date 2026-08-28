@@ -11,6 +11,29 @@ JUDGMENT_OUTCOMES = {"CONSISTENT", "NOVEL", "CONFLICT", "UNCERTAIN"}
 FOCUS_RELATIONSHIPS = {"MUTUALLY_EXCLUSIVE", "COEXIST", "TEMPORAL_CHANGE"}
 
 
+def text_script_profile(text: str) -> frozenset[str]:
+    """Return the writing systems present in text relevant to language locking."""
+    profile: set[str] = set()
+    for char in text or "":
+        if "\u4e00" <= char <= "\u9fff":
+            profile.add("cjk")
+        elif char.isascii() and char.isalpha():
+            profile.add("latin")
+    return frozenset(profile)
+
+
+def language_compatible(source: str, replacement: str) -> bool:
+    """Prevent a local correction from changing the transcript language."""
+    source_profile = text_script_profile(source)
+    replacement_profile = text_script_profile(replacement)
+    return bool(replacement_profile) and replacement_profile <= source_profile
+
+
+def candidates_language_compatible(source: str, candidates: list[str]) -> bool:
+    """Require every replacement candidate to use only scripts in the source."""
+    return all(language_compatible(source, candidate) for candidate in candidates if candidate.strip())
+
+
 @dataclass
 class BeliefProposal:
     subject: str
@@ -199,6 +222,8 @@ def normalize_judgment(
         if item.operation == "DELETE":
             item.proposed_text = ""
         item.alternatives = list(dict.fromkeys(str(candidate) for candidate in _as_list(item.alternatives) if str(candidate)))
+        if item.operation == "REPLACE" and not candidates_language_compatible(item.span, item.alternatives):
+            raise ValueError("replacement candidates must preserve the transcript language")
         if item.operation == "REPLACE" and (item.span not in item.alternatives or item.proposed_text not in item.alternatives):
             raise ValueError("alternatives must contain both current and proposed text")
         if item.operation == "DELETE" and item.span not in item.alternatives:

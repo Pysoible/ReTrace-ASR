@@ -8,8 +8,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from asr_agent.calibration import DecisionPolicy, EvidenceFeatures
-from asr_agent.context_judge import FocusProposal
-from asr_agent.integrations.audio_verifier import verify_candidates
+from asr_agent.context_judge import FocusProposal, candidates_language_compatible, language_compatible
+from asr_agent.integrations.audio_verifier import retranscribe_window, verify_candidates
 from asr_agent.models import Session, Turn
 
 
@@ -103,7 +103,7 @@ class EvidenceResolver:
             return False
         if abs(len(span) - len(replacement)) > 1:
             return False
-        return difflib.SequenceMatcher(None, span, replacement).ratio() >= 0.6
+        return difflib.SequenceMatcher(None, span, replacement).ratio() >= 0.5
 
     @staticmethod
     def _acoustic_support(target: Turn, span: str) -> float:
@@ -162,12 +162,12 @@ class EvidenceResolver:
         if target is None or (focus.span not in target.raw_text and focus.span not in target.current_text):
             return Resolution("DEFER", focus.target_turn_id, focus.span, rationale="invalid target span")
         operation = (focus.operation or "REPLACE").upper()
-        if not self._is_safe_local_replacement(focus.span, focus.proposed_text, operation):
+        if operation == "REPLACE" and not language_compatible(focus.span, focus.proposed_text):
             return Resolution(
                 "DEFER",
                 target.turn_id,
                 focus.span,
-                rationale="replacement is not a plausible local edit of the focused span",
+                rationale="replacement changes the language/script of the focused transcript",
             )
         # Guard against a class of false positives where BOTH the span and the
         # proposed replacement already appear verbatim in the original raw text
@@ -208,6 +208,14 @@ class EvidenceResolver:
                 evidence=[f"context:{evidence_turn_id}" for evidence_turn_id in focus.evidence_turn_ids],
                 rationale=focus.rationale or "the fact changed over time",
             )
+        acoustic_supported = self._acoustic_support(target, focus.span) > 0.0
+        if not self._is_safe_local_replacement(focus.span, focus.proposed_text, operation) and not acoustic_supported:
+            return Resolution(
+                "DEFER",
+                target.turn_id,
+                focus.span,
+                rationale="replacement is not a plausible local edit of the focused span",
+            )
         meta = target.meta or {}
         audio_path = meta.get("audio_path")
         start_sec, end_sec = meta.get("start_sec"), meta.get("end_sec")
@@ -219,6 +227,13 @@ class EvidenceResolver:
             float(start_sec),
             float(end_sec),
         )
+        if operation == "REPLACE" and not candidates_language_compatible(focus.span, list(focus.alternatives)):
+            return Resolution(
+                "DEFER",
+                target.turn_id,
+                focus.span,
+                rationale="replacement candidates contain another language/script",
+            )
         candidates = list(focus.alternatives)
         if operation == "DELETE":
             candidates = [focus.span, self.DELETE_CANDIDATE]

@@ -32,21 +32,28 @@ _POOL_LOCK = threading.Lock()
 _RR_LOCK = threading.Lock()
 _RR_COUNTER = 0
 
-_PLAIN_PROMPT = "转写这段中文语音。只输出转写文本，不要输出 JSON、标签或解释。"
+_PLAIN_PROMPT = (
+    "Transcribe the audio verbatim in the language that is spoken. "
+    "For English speech, output English only; for Chinese speech, output Chinese only. "
+    "Never translate, interpret, summarize, or add content. Output transcript text only; no JSON, tags, or explanation."
+)
 _OBS_PROMPT = (
-    '转写这段中文语音。严格只输出 JSON：'
-    '{"text":"完整转写","uncertain_spans":[{"span":"原片段","candidates":["原片段","同音候选"],"confidence":0.0}]}。'
-    "只在确有不确定时给出 uncertain_spans；候选必须包含原片段。"
+    'Transcribe the audio verbatim in the language that is spoken. English speech must remain English; '
+    'Chinese speech must remain Chinese. Never translate or interpret. Strictly output JSON only: '
+    '{"text":"verbatim transcript","uncertain_spans":[{"span":"source span","candidates":["source span","same-language alternative"],"confidence":0.0}]}.'
+    "Only include uncertain_spans when there is genuine acoustic uncertainty. Candidates must include the source span "
+    "and must use the same language/script as that span."
 )
 _RAMC_PLAIN_PROMPT = (
-    "请将上述音频转写为文字。尽量逐字保留中文口语、重复、语气词和停顿，"
-    "不要总结、改写或补全没有听到的内容。只输出转写文本，不要输出 JSON、时间戳、标签或解释。"
+    "Transcribe the Chinese or English audio verbatim in its spoken language. Preserve spoken words, repetitions, fillers, and pauses. "
+    "English must stay English and Chinese must stay Chinese. Do not translate, summarize, rewrite, or hallucinate. "
+    "Output transcript text only; no JSON, timestamps, tags, or explanation."
 )
 _TAG_PROMPT_TMPL = (
-    "下面是一段中文 ASR 转写。请标出可能听错的专有名词、品牌、人名、术语（同音/近音不确定处）。"
-    '严格只输出 JSON：{{"uncertain_spans":[{{"span":"原片段","candidates":["原片段","同音候选"],"confidence":0.0}}]}}。'
-    "候选必须包含原片段；拿不准才标注；没有不确定则输出 {{\"uncertain_spans\":[]}}。\n"
-    "转写：{text}"
+    "Here is a Chinese or English ASR transcript. Mark only genuinely uncertain names, brands, people, or technical terms. "
+    'Output JSON only: {{"uncertain_spans":[{{"span":"source span","candidates":["source span","same-language alternative"],"confidence":0.0}}]}}. '
+    "Candidates must include the source span and use the same language/script; do not translate. If certain, output {{\"uncertain_spans\":[]}}.\n"
+    "Transcript: {text}"
 )
 
 
@@ -547,6 +554,8 @@ def _parse_uncertain_spans(text: str, spans: Any) -> dict[str, Any]:
         span = str(item.get("span") or "").strip()
         alternatives = [str(value).strip() for value in item.get("candidates") or [] if str(value).strip()]
         alternatives = list(dict.fromkeys(alternatives))
+        source_scripts = _script_profile(span)
+        alternatives = [candidate for candidate in alternatives if _script_profile(candidate) <= source_scripts]
         score_raw = item.get("confidence")
         try:
             score = float(score_raw)
@@ -565,6 +574,30 @@ def _parse_uncertain_spans(text: str, spans: Any) -> dict[str, Any]:
             confidence[span] = score
             candidates[span] = alternatives
     return {"confidence": confidence, "text_candidates": candidates}
+
+
+def _script_profile(text: str) -> frozenset[str]:
+    profile: set[str] = set()
+    for char in text or "":
+        if "\u4e00" <= char <= "\u9fff":
+            profile.add("cjk")
+        elif char.isascii() and char.isalpha():
+            profile.add("latin")
+    return frozenset(profile)
+
+
+def _filter_uncertainty_language(text: str, uncertainty: dict[str, Any]) -> dict[str, Any]:
+    filtered_confidence: dict[str, float] = {}
+    filtered_candidates: dict[str, list[str]] = {}
+    for span, raw_candidates in (uncertainty.get("text_candidates") or {}).items():
+        span = str(span).strip()
+        candidates = [str(candidate).strip() for candidate in raw_candidates or [] if str(candidate).strip()]
+        candidates = [candidate for candidate in candidates if _script_profile(candidate) <= _script_profile(span)]
+        if len(candidates) >= 2 and span in candidates:
+            filtered_candidates[span] = list(dict.fromkeys(candidates))
+            if span in (uncertainty.get("confidence") or {}):
+                filtered_confidence[span] = float(uncertainty["confidence"][span])
+    return {"confidence": filtered_confidence, "text_candidates": filtered_candidates}
 
 
 def parse_observation(raw: str) -> dict[str, Any]:
@@ -794,6 +827,7 @@ def stream_transcribe_audio(
             text,
             uncertainty,
         )
+        uncertainty = _filter_uncertainty_language(text, uncertainty)
         uncertainty["coverage"] = _coverage_signal(chunk_paths[index], text)
         uncertainty = _attach_acoustic_disagreement(chunk_paths[index], text, uncertainty)
         on_chunk(index, text, uncertainty, chunk_meta[index])
@@ -872,6 +906,9 @@ def transcribe_audio(audio: str) -> dict[str, Any]:
                 chunk_paths[index],
                 str(observation.get("text") or ""),
                 dict(observation.get("uncertainty") or {}),
+            )
+            observation["uncertainty"] = _filter_uncertainty_language(
+                str(observation.get("text") or ""), observation["uncertainty"]
             )
             observation["uncertainty"] = _attach_acoustic_disagreement(
                 chunk_paths[index],

@@ -8,6 +8,7 @@ provide; those fields are recorded as null rather than estimated as truth.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import csv
 import difflib
 import json
@@ -56,11 +57,18 @@ def cer(reference: str, hypothesis: str) -> dict[str, Any]:
     reference_clean = norm(reference)
     hypothesis_clean = norm(hypothesis)
     edits = edit_distance(reference_clean, hypothesis_clean)
+    overlap = sum((Counter(reference_clean) & Counter(hypothesis_clean)).values())
+    precision = overlap / len(hypothesis_clean) if hypothesis_clean else 0.0
+    recall = overlap / len(reference_clean) if reference_clean else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     return {
         "cer": edits / len(reference_clean) if reference_clean else 0.0,
         "edits": edits,
         "reference_chars": len(reference_clean),
         "hypothesis_chars": len(hypothesis_clean),
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
     }
 
 

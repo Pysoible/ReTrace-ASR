@@ -12,6 +12,8 @@ from asr_agent.context_judge import (
     BeliefProposal,
     ContextJudgment,
     FocusProposal,
+    language_compatible,
+    text_script_profile,
     normalize_judgment,
 )
 from asr_agent.degeneration import (
@@ -463,18 +465,32 @@ class ReTraceService:
             meta["degeneration"]["error"] = "historical audio unavailable"
             return None, assessment
         try:
-            result = self.audio_retranscriber(
-                audio_path=str(audio_path),
-                start_sec=float(start_sec),
-                end_sec=float(end_sec),
-                recover_coverage=duration is not None and duration > 8.0,
-            )
+            retranscribe_kwargs = {
+                "audio_path": str(audio_path),
+                "start_sec": float(start_sec),
+                "end_sec": float(end_sec),
+            }
+            if duration is not None and duration > 8.0:
+                retranscribe_kwargs["recover_coverage"] = True
+            result = self.audio_retranscriber(**retranscribe_kwargs)
         except Exception as exc:
             meta["degeneration"]["error"] = f"audio re-transcription failed: {exc}"
             return None, assessment
 
         payload = result if isinstance(result, dict) else {}
         candidate = str(payload.get("text") or "").strip() if payload.get("ok") else ""
+        if candidate and not language_compatible(turn.raw_text, candidate):
+            meta["degeneration"]["error"] = "re-transcription changed the transcript language"
+            return None, assessment
+        session_text = "".join(item.raw_text for item in session.turns)
+        session_profile = text_script_profile(session_text)
+        candidate_profile = text_script_profile(candidate)
+        if "latin" in session_profile and "cjk" not in session_profile and "cjk" in candidate_profile:
+            meta["degeneration"]["error"] = "re-transcription introduced Chinese into an English session"
+            return None, assessment
+        if set(assessment.reasons) == {"low_diversity"}:
+            meta["degeneration"]["error"] = "low_diversity alone is insufficient for whole-turn recovery"
+            return None, assessment
         candidate_assessment = assess_transcript(candidate, duration_sec=duration)
         meta["degeneration"]["candidate_score"] = candidate_assessment.score
         meta["degeneration"]["candidate_reasons"] = list(candidate_assessment.reasons)
@@ -621,6 +637,13 @@ class ReTraceService:
         cand_body = _strip(candidate)
         if not raw_body or not cand_body:
             return None
+        if not language_compatible(raw_body, cand_body):
+            meta["relisten_uncertain"] = {
+                "relistened": True,
+                "changed": False,
+                "rejected": "relisten changed the transcript language",
+            }
+            return None
         # Keep only meaningful characters for a diff decision.
         keep = lambda s: "".join(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", s))
         raw_keep = keep(raw_body)
@@ -656,17 +679,24 @@ class ReTraceService:
         # not itself degenerate. This is the audio-driven correction path.
         low_conf_chars = (turn.meta.get("uncertainty") or {}).get("low_conf_chars")
         has_acoustic_doubt = bool(low_conf_chars)
-        adopt = bool(hint_matches) or (
-            raw_assessment.degenerate and not cand_assessment.degenerate
-        ) or (coverage_risk and len(cand_keep) > len(raw_keep) and not cand_assessment.degenerate) or (
-            (has_acoustic_doubt or is_high_conf) and not cand_assessment.degenerate
+        recoverable_degeneration = raw_assessment.degenerate and any(
+            reason in {"duration_mismatch", "repeated_tail", "truncated"}
+            for reason in raw_assessment.reasons
+        )
+        adopt = (
+            (recoverable_degeneration and not cand_assessment.degenerate)
+            or (coverage_risk and len(cand_keep) > len(raw_keep) and not cand_assessment.degenerate)
         )
         if not adopt:
             meta["relisten_uncertain"] = {
                 "relistened": True,
                 "changed": False,
                 "ratio": round(ratio, 3),
-                "rejected": "relisten differs but recovers no remembered entity nor a degenerate pass",
+                "rejected": (
+                    "normal turn requires targeted focus for revision"
+                    if not raw_assessment.degenerate and not coverage_risk
+                    else "relisten differs but recovers no supported content"
+                ),
             }
             return None
         # A normal, non-degenerate turn must not be replaced wholesale by an
