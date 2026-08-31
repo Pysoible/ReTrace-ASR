@@ -54,3 +54,44 @@ def test_revision_metrics_support_new_actions_and_automatic_rollback():
     assert report["revision_precision"] == 1.0
     assert report["revision_recall"] == 0.5
     assert report["revision_f2"] > report["revision_recall"]
+
+
+def test_revision_metrics_stratify_historical_and_current_routes():
+    report = evaluate_revisions(
+        events=[
+            {
+                "event_id": "history-good",
+                "action": "REVISE_HISTORY",
+                "target_turn_id": "t1",
+                "source_turn_id": "t3",
+                "after_text": "历史正确",
+                "evidence": ["audio:/tmp/a.wav:0-2"],
+            },
+            {
+                "event_id": "current-bad",
+                "action": "REVISE_CURRENT",
+                "target_turn_id": "t2",
+                "source_turn_id": "t2",
+                "after_text": "当前错误",
+                "evidence": ["acoustic_disagreement:词"],
+            },
+            {
+                "event_id": "rollback-good",
+                "action": "ROLLBACK",
+                "target_turn_id": "t4",
+                "source_turn_id": "t5",
+                "after_text": "回滚正确",
+            },
+        ],
+        reference_by_turn={"t1": "历史正确", "t2": "当前正确", "t4": "回滚正确"},
+        turn_order=["t1", "t2", "t3", "t4", "t5"],
+        ambiguous_turn_count=2,
+    )
+
+    assert report["historical_revision_count"] == 1
+    assert report["current_revision_count"] == 1
+    assert report["historical_revision_precision"] == 1.0
+    assert report["current_revision_precision"] == 0.0
+    assert report["historical_resolution_latency_turns"] == 2.0
+    assert report["current_overcorrection_rate"] == 1.0
+    assert report["rollback_success_rate"] == 1.0

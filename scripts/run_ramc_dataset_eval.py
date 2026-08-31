@@ -14,6 +14,7 @@ import difflib
 import json
 import math
 import re
+import statistics
 import sys
 import time
 import urllib.error
@@ -213,6 +214,75 @@ def join_turns(session: dict[str, Any], field: str) -> str:
     return "".join(str(turn.get(field) or "") for turn in session.get("turns") or [])
 
 
+def _dedupe_append(cleaned: str, part: str, *, max_overlap: int = 64) -> str:
+    """Append normalized chunk text while removing duplicated overlap text."""
+    if not cleaned:
+        return part
+    limit = min(max_overlap, len(cleaned), len(part))
+    for width in range(limit, 0, -1):
+        if cleaned[-width:] == part[:width]:
+            return cleaned + part[width:]
+    return cleaned + part
+
+
+def join_turns_for_metrics(session: dict[str, Any], field: str) -> str:
+    """Join chunk transcripts for metrics without charging overlap twice."""
+    joined = ""
+    previous_end: float | None = None
+    for turn in session.get("turns") or []:
+        part = norm(str(turn.get(field) or ""))
+        if not part:
+            continue
+        meta = turn.get("meta") or {}
+        start, end = meta.get("start_sec"), meta.get("end_sec")
+        overlaps_previous = (
+            previous_end is not None
+            and start is not None
+            and float(start) < previous_end
+        )
+        joined = _dedupe_append(joined, part) if overlaps_previous else joined + part
+        if end is not None:
+            previous_end = max(previous_end or float(end), float(end))
+    return joined
+
+
+def _overlap_seconds(start: float, end: float, segment: dict[str, Any]) -> float:
+    return max(0.0, min(end, float(segment["end"])) - max(start, float(segment["start"])))
+
+
+def reference_by_assigned_turn(
+    turns: list[dict[str, Any]],
+    segments: list[dict[str, Any]],
+) -> tuple[dict[str, str], dict[str, int]]:
+    """Assign each reference segment to one best-overlap turn for diagnostics."""
+    assigned: dict[str, list[str]] = {str(turn.get("turn_id") or ""): [] for turn in turns}
+    ambiguous_turns: set[str] = set()
+    for segment in segments:
+        candidates: list[tuple[float, str]] = []
+        for turn in turns:
+            turn_id = str(turn.get("turn_id") or "")
+            meta = turn.get("meta") or {}
+            start, end = meta.get("start_sec"), meta.get("end_sec")
+            if start is None or end is None:
+                continue
+            amount = _overlap_seconds(float(start), float(end), segment)
+            if amount > 0:
+                candidates.append((amount, turn_id))
+        if len(candidates) > 1:
+            ambiguous_turns.update(turn_id for _amount, turn_id in candidates)
+        if candidates:
+            _amount, chosen = max(candidates, key=lambda item: item[0])
+            assigned.setdefault(chosen, []).append(str(segment.get("clean") or norm(str(segment.get("text") or ""))))
+    references = {turn_id: "".join(parts) for turn_id, parts in assigned.items()}
+    eligible = sum(1 for turn_id in assigned if assigned[turn_id])
+    unscorable = max(0, len(turns) - eligible)
+    return references, {
+        "eligible_turn_count": eligible,
+        "ambiguous_turn_count": len(ambiguous_turns),
+        "unscorable_turn_count": unscorable,
+    }
+
+
 def groundtruth_comparison(
     session: dict[str, Any],
     turn_references: dict[str, str],
@@ -261,6 +331,15 @@ def event_stats(session: dict[str, Any]) -> dict[str, Any]:
         or any("audio" in str(item).lower() for item in event.get("evidence") or [])
     ]
     target_turns = {event.get("target_turn_id") for event in audio_events if event.get("target_turn_id")}
+    turns = session.get("turns") or []
+    sentinel_observed_turns = 0
+    sentinel_signal_turns = 0
+    for turn in turns:
+        uncertainty = (turn.get("meta") or {}).get("uncertainty") or {}
+        observed = any(key in uncertainty for key in ("paraformer_text", "paraformer_char_confs", "acoustic_disagreement", "low_conf_chars"))
+        signaled = bool(uncertainty.get("acoustic_disagreement") or uncertainty.get("low_conf_chars"))
+        sentinel_observed_turns += int(observed)
+        sentinel_signal_turns += int(signaled)
     relisten_seconds = 0.0
     for turn in session.get("turns") or []:
         if turn.get("turn_id") not in target_turns:
@@ -268,6 +347,23 @@ def event_stats(session: dict[str, Any]) -> dict[str, Any]:
         meta = turn.get("meta") or {}
         if meta.get("start_sec") is not None and meta.get("end_sec") is not None:
             relisten_seconds += max(0.0, float(meta["end_sec"]) - float(meta["start_sec"]))
+    whole_turn_recovery_count = 0
+    repeated_tail_cleanup_count = 0
+    local_revision_count = 0
+    for event in revisions:
+        evidence_text = " ".join(str(item) for item in event.get("evidence") or [])
+        event_text = " ".join(
+            str(event.get(key) or "")
+            for key in ("event_id", "resolver", "rationale", "reason")
+        )
+        is_whole_turn = bool(
+            norm(str(event.get("span") or ""))
+            and norm(str(event.get("span") or "")) == norm(str(event.get("before_text") or ""))
+        )
+        is_repeated_tail = "repeated_tail" in evidence_text or "repeated-tail" in event_text
+        whole_turn_recovery_count += int(is_whole_turn)
+        repeated_tail_cleanup_count += int(is_repeated_tail)
+        local_revision_count += int(not is_whole_turn and event.get("action") != "ROLLBACK")
     return {
         "decision_events": len(events),
         "audit_events": len(audits),
@@ -279,7 +375,37 @@ def event_stats(session: dict[str, Any]) -> dict[str, Any]:
         "relisten_seconds_proxy": relisten_seconds,
         "rollback_count": sum(event.get("action") == "ROLLBACK" for event in events),
         "defer_count": sum(event.get("action") == "DEFER" for event in events),
+        "acoustic_sentinel_observed_turns": sentinel_observed_turns,
+        "acoustic_sentinel_signal_turns": sentinel_signal_turns,
+        "acoustic_sentinel_time_seconds": None,
+        "whole_turn_recovery_count": whole_turn_recovery_count,
+        "local_revision_count": local_revision_count,
+        "repeated_tail_cleanup_count": repeated_tail_cleanup_count,
     }
+
+
+def _has_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text or "")
+
+
+def _has_latin(text: str) -> bool:
+    return any(("a" <= char.lower() <= "z") for char in text or "")
+
+
+def language_mismatch_count(
+    session: dict[str, Any],
+    turn_references: dict[str, str],
+) -> int:
+    count = 0
+    for turn in session.get("turns") or []:
+        turn_id = str(turn.get("turn_id") or "")
+        reference = turn_references.get(turn_id, "")
+        current = str(turn.get("current_text") or "")
+        if _has_latin(reference) and not _has_cjk(reference) and _has_cjk(current):
+            count += 1
+        elif _has_cjk(reference) and not _has_latin(reference) and _has_latin(current):
+            count += 1
+    return count
 
 
 def _event_replacement(event: dict[str, Any]) -> str:
@@ -390,6 +516,7 @@ def revision_metrics(
         event for event in revisions
         if turn_order.get(event.get("source_turn_id"), -1) > turn_order.get(event.get("target_turn_id"), -1)
     ]
+    current = [event for event in revisions if event not in historical]
     raw = "".join(str(turn.get("raw_text") or "") for turn in turns)
     pairs: list[tuple[str, str]] = []
     for turn in turns:
@@ -410,8 +537,22 @@ def revision_metrics(
     correct_count = len(correct)
     audio_revision_count = sum(_event_has_audio_evidence(event) for event in revisions)
     historical_correct_count = sum(event in correct for event in historical)
+    current_correct_count = sum(event in correct for event in current)
+    historical_precision = historical_correct_count / len(historical) if historical else None
+    current_precision = current_correct_count / len(current) if current else None
+    historical_delay = [
+        turn_order[str(event["source_turn_id"])] - turn_order[str(event["target_turn_id"])]
+        for event in historical
+        if str(event.get("source_turn_id")) in turn_order and str(event.get("target_turn_id")) in turn_order
+    ]
+    rollbacks = [event for event in events if event.get("action") == "ROLLBACK"]
+    rollback_successes = sum(
+        norm(str(event.get("after_text") or "")) == refs.get(str(event.get("target_turn_id")), "")
+        for event in rollbacks
+    )
+    stats = event_stats(session)
     return {
-        "HRA": historical_correct_count / len(historical) if historical else None,
+        "HRA": historical_precision,
         "Revision Precision": correct_count / revision_count if revision_count else 0.0,
         "False Revision Rate": (revision_count - correct_count) / revision_count if revision_count else 0.0,
         "CCR": len(matched_pairs) / len(gold_pairs) if gold_pairs else 0.0,
@@ -421,7 +562,21 @@ def revision_metrics(
         "_detail": {
             "committed_revisions": revision_count,
             "correct_revisions_proxy": correct_count,
+            "historical_revision_count": len(historical),
+            "current_revision_count": len(current),
+            "historical_correct_revisions_proxy": historical_correct_count,
+            "current_correct_revisions_proxy": current_correct_count,
+            "historical_revision_precision": historical_precision,
+            "current_revision_precision": current_precision,
+            "historical_overcorrection_rate": 1 - historical_precision if historical_precision is not None else None,
+            "current_overcorrection_rate": 1 - current_precision if current_precision is not None else None,
+            "historical_resolution_latency_turns": statistics.mean(historical_delay) if historical_delay else None,
+            "rollback_success_rate": rollback_successes / len(rollbacks) if rollbacks else None,
             "audio_evidence_revisions": audio_revision_count,
+            "acoustic_sentinel_observed_turns": stats["acoustic_sentinel_observed_turns"],
+            "acoustic_sentinel_signal_turns": stats["acoustic_sentinel_signal_turns"],
+            "acoustic_sentinel_time_seconds": None,
+            "component_time_note": "The live endpoint reports end-to-end elapsed time; first-pass and sentinel wall-clock timings require server-side instrumentation and remain null.",
             "near_variant_gold_pairs_proxy": sorted(gold_pairs),
             "near_variant_predicted_pairs": sorted(predicted_pairs),
             "near_variant_matched_pairs": sorted(matched_pairs),
@@ -449,28 +604,30 @@ def evaluate_one(base_url: str, wav: Path, txt: Path, output_root: Path, timeout
             timeout,
         )
         session = payload.get("session") or {}
-        raw = str(payload.get("final_text") or join_turns(session, "raw_text"))
-        current = join_turns(session, "current_text")
+        raw_display = join_turns(session, "raw_text")
+        current_display = join_turns(session, "current_text")
+        raw = join_turns_for_metrics(session, "raw_text")
+        current = join_turns_for_metrics(session, "current_text")
         duration = audio_duration(wav)
         elapsed = time.time() - started
         raw_metrics = cer(reference, raw)
         current_metrics = cer(reference, current)
         stats = event_stats(session)
         groundtruth_segments = reference_segments(txt)
-        turn_references = {
-            str(turn.get("turn_id")): reference_for_turn(turn, groundtruth_segments)
-            for turn in session.get("turns") or []
-        }
+        turn_references, reference_diagnostics = reference_by_assigned_turn(session.get("turns") or [], groundtruth_segments)
         requested_metrics = revision_metrics(session, reference, duration, turn_references)
         comparison = groundtruth_comparison(session, turn_references)
+        mismatch_count = language_mismatch_count(session, turn_references)
         metrics = {
             "audio_id": stem,
+            "metric_kind": "diagnostic_cer",
+            "official_scoring": False,
             "duration_seconds": duration,
             "elapsed_seconds": round(elapsed, 3),
             "rtf": round(elapsed / duration, 4) if duration else None,
             "raw_asr": raw_metrics,
             "final": current_metrics,
-            "final_wer": current_metrics["cer"],
+            "final_wer": None,
             "final_char_f1": token_f1(reference, current),
             "final_embedding_similarity": embedding_similarity(reference, current),
             "final_menli_tacl2023": official_menli(reference, current),
@@ -486,12 +643,18 @@ def evaluate_one(base_url: str, wav: Path, txt: Path, output_root: Path, timeout
             "overcorrection_rate": None,
             "rollback_success_rate": None,
             "revision_delay_turns": None,
-            "notes": ["RAMC TXT groundtruth is treated as the human-correct reference; each revision is scored against the timestamp-overlapping target-turn reference."],
+            "language_mismatch_count": mismatch_count,
+            **reference_diagnostics,
+            "notes": [
+                "RAMC TXT groundtruth is treated as the human-correct reference.",
+                "Global transcript CER is diagnostic and de-duplicates adjacent overlapped ASR chunks.",
+                "final_wer is null because this script does not compute word error rate.",
+            ],
         }
         (sample_dir / "raw_result.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         (sample_dir / "reference.txt").write_text(reference, encoding="utf-8")
-        (sample_dir / "raw_asr.txt").write_text(raw, encoding="utf-8")
-        (sample_dir / "final_transcript.txt").write_text(current, encoding="utf-8")
+        (sample_dir / "raw_asr.txt").write_text(raw_display, encoding="utf-8")
+        (sample_dir / "final_transcript.txt").write_text(current_display, encoding="utf-8")
         (sample_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
         result.update({"status": "ok", **metrics})
     except Exception as exc:  # noqa: BLE001
@@ -512,6 +675,13 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if (value := (row.get("requested_metrics") or {}).get(name)) is not None
         ]
         return sum(values) / len(values) if values else None
+    def detail_mean(name: str) -> float | None:
+        values = [
+            float(value)
+            for row in valid
+            if (value := ((row.get("requested_metrics") or {}).get("_detail") or {}).get(name)) is not None
+        ]
+        return sum(values) / len(values) if values else None
     return {
         "samples_total": len(rows),
         "samples_ok": len(valid),
@@ -524,6 +694,15 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "audio_verified_events_total": sum(row.get("audio_verified_events", 0) for row in valid),
         "relisten_seconds_proxy_total": sum(row.get("relisten_seconds_proxy", 0.0) for row in valid),
         "rollback_count_total": sum(row.get("rollback_count", 0) for row in valid),
+        "acoustic_sentinel_observed_turns_total": sum(row.get("acoustic_sentinel_observed_turns", 0) for row in valid),
+        "acoustic_sentinel_signal_turns_total": sum(row.get("acoustic_sentinel_signal_turns", 0) for row in valid),
+        "whole_turn_recovery_count_total": sum(row.get("whole_turn_recovery_count", 0) for row in valid),
+        "local_revision_count_total": sum(row.get("local_revision_count", 0) for row in valid),
+        "repeated_tail_cleanup_count_total": sum(row.get("repeated_tail_cleanup_count", 0) for row in valid),
+        "eligible_turn_count_total": sum(row.get("eligible_turn_count", 0) for row in valid),
+        "ambiguous_turn_count_total": sum(row.get("ambiguous_turn_count", 0) for row in valid),
+        "unscorable_turn_count_total": sum(row.get("unscorable_turn_count", 0) for row in valid),
+        "language_mismatch_count_total": sum(row.get("language_mismatch_count", 0) for row in valid),
         "mean_rtf": sum(row.get("rtf", 0.0) or 0.0 for row in valid) / len(valid) if valid else None,
         "gold_label_metrics": "not available from transcript-only RAMC annotations",
         "metric_errors": dict(_METRIC_ERRORS),
@@ -539,6 +718,18 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "Near-Variant Proper Noun F1",
             )
         },
+        "route_metrics": {
+            name: detail_mean(name)
+            for name in (
+                "historical_revision_precision",
+                "current_revision_precision",
+                "historical_overcorrection_rate",
+                "current_overcorrection_rate",
+                "historical_resolution_latency_turns",
+                "rollback_success_rate",
+            )
+        },
+        "component_time_note": "Component-level Qwen and Paraformer timings are not emitted by the current live endpoint; only end-to-end RTF is comparable until server instrumentation is added.",
     }
 
 
@@ -586,14 +777,35 @@ def main() -> None:
     summary = {"dataset_root": str(args.dataset_root), "output_root": str(args.output_root), "metrics": aggregate(rows), "files": rows}
     (args.output_root / "dataset_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     with (args.output_root / "dataset_metrics.csv").open("w", newline="", encoding="utf-8") as stream:
-        fields = ["audio_id", "status", "duration_seconds", "elapsed_seconds", "rtf", "raw_cer", "final_cer", "cer_absolute_gain", "cer_relative_gain", "revision_events", "audio_verified_events", "relisten_seconds_proxy", "rollback_count", "error"]
+        fields = [
+            "audio_id", "status", "duration_seconds", "elapsed_seconds", "rtf",
+            "raw_cer", "final_cer", "cer_absolute_gain", "cer_relative_gain",
+            "revision_events", "audio_verified_events", "relisten_seconds_proxy", "rollback_count",
+            "historical_revision_count", "current_revision_count",
+            "historical_revision_precision", "current_revision_precision",
+            "historical_overcorrection_rate", "current_overcorrection_rate",
+            "historical_resolution_latency_turns", "rollback_success_rate",
+            "acoustic_sentinel_observed_turns", "acoustic_sentinel_signal_turns",
+            "whole_turn_recovery_count", "local_revision_count", "repeated_tail_cleanup_count",
+            "eligible_turn_count", "ambiguous_turn_count", "unscorable_turn_count", "language_mismatch_count",
+            "error",
+        ]
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         for row in rows:
+            detail = (row.get("requested_metrics") or {}).get("_detail") or {}
             writer.writerow({
                 "audio_id": row.get("audio_id"), "status": row.get("status"), "duration_seconds": row.get("duration_seconds"), "elapsed_seconds": row.get("elapsed_seconds"), "rtf": row.get("rtf"),
                 "raw_cer": (row.get("raw_asr") or {}).get("cer"), "final_cer": (row.get("final") or {}).get("cer"), "cer_absolute_gain": row.get("cer_absolute_gain"), "cer_relative_gain": row.get("cer_relative_gain"),
-                "revision_events": row.get("revision_events"), "audio_verified_events": row.get("audio_verified_events"), "relisten_seconds_proxy": row.get("relisten_seconds_proxy"), "rollback_count": row.get("rollback_count"), "error": row.get("error", ""),
+                "revision_events": row.get("revision_events"), "audio_verified_events": row.get("audio_verified_events"), "relisten_seconds_proxy": row.get("relisten_seconds_proxy"), "rollback_count": row.get("rollback_count"),
+                "historical_revision_count": detail.get("historical_revision_count"), "current_revision_count": detail.get("current_revision_count"),
+                "historical_revision_precision": detail.get("historical_revision_precision"), "current_revision_precision": detail.get("current_revision_precision"),
+                "historical_overcorrection_rate": detail.get("historical_overcorrection_rate"), "current_overcorrection_rate": detail.get("current_overcorrection_rate"),
+                "historical_resolution_latency_turns": detail.get("historical_resolution_latency_turns"), "rollback_success_rate": detail.get("rollback_success_rate"),
+                "acoustic_sentinel_observed_turns": row.get("acoustic_sentinel_observed_turns"), "acoustic_sentinel_signal_turns": row.get("acoustic_sentinel_signal_turns"),
+                "whole_turn_recovery_count": row.get("whole_turn_recovery_count"), "local_revision_count": row.get("local_revision_count"), "repeated_tail_cleanup_count": row.get("repeated_tail_cleanup_count"),
+                "eligible_turn_count": row.get("eligible_turn_count"), "ambiguous_turn_count": row.get("ambiguous_turn_count"), "unscorable_turn_count": row.get("unscorable_turn_count"), "language_mismatch_count": row.get("language_mismatch_count"),
+                "error": row.get("error", ""),
             })
     print(json.dumps(summary["metrics"], ensure_ascii=False, indent=2), flush=True)
 

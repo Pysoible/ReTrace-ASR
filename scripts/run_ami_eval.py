@@ -247,6 +247,17 @@ def speaker_attribution(rttm: list[dict[str, Any]], start: float, end: float) ->
     }
 
 
+def ambiguous_reference_segments(segments: list[dict[str, Any]]) -> bool:
+    """True when assigned reference text still contains overlapping speakers."""
+    for left_index, left in enumerate(segments):
+        for right in segments[left_index + 1:]:
+            if left.get("speaker") == right.get("speaker"):
+                continue
+            if overlap(float(left["start"]), float(left["end"]), right) > 0:
+                return True
+    return False
+
+
 def rttm_speakers(rttm: list[dict[str, Any]]) -> list[str]:
     return sorted({str(segment["speaker"]) for segment in rttm})
 
@@ -325,6 +336,9 @@ def evaluate(
         raise ValueError("multi_speaker mode requires --rttm")
     rows = []
     assignments = assign_segments_to_turns(segments, turns)
+    eligible_turn_count = 0
+    ambiguous_turn_count = 0
+    unscorable_turn_count = 0
     raw_reference, current_reference = [], []
     raw_hypothesis, current_hypothesis = [], []
     raw_speaker_hypotheses: dict[str, list[str]] = {speaker_id: [] for speaker_id in rttm_speakers(rttm)}
@@ -339,6 +353,7 @@ def evaluate(
         raw = str(turn.get("raw_text") or "")
         current = str(turn.get("current_text") or "")
         active_segments = [segments[index] for index in assignments[turn_index]]
+        ambiguous = ambiguous_reference_segments(active_segments)
         if mode == "multi_speaker":
             for segment in sorted(active_segments, key=lambda item: item["start"]):
                 speaker_references.setdefault(segment["speaker"], []).append(segment["text"])
@@ -356,11 +371,20 @@ def evaluate(
             current_speaker_hypotheses.setdefault(assigned_speaker, []).append(current)
         if mode == "multi_speaker":
             attribution_rows.append({"turn_id": turn.get("turn_id"), **attribution})
+            ambiguous = ambiguous or bool(attribution.get("ambiguous")) or float(attribution.get("parallel_overlap_ratio") or 0.0) > 0.0
+        if not reference:
+            unscorable_turn_count += 1
+        elif ambiguous:
+            ambiguous_turn_count += 1
+            unscorable_turn_count += 1
+        else:
+            eligible_turn_count += 1
         rows.append({
             "turn_id": turn.get("turn_id"),
             "start_sec": start,
             "end_sec": end,
             "speaker": selected_speaker,
+            "ambiguous": ambiguous,
             "reference": reference,
             "raw": raw,
             "current": current,
@@ -380,9 +404,14 @@ def evaluate(
         "reference": str(stm_path),
         "effective_reference": str(effective_stm_path),
         "reference_mode": mode,
+        "metric_kind": "diagnostic_chunk_aligned",
+        "official_scoring": False,
         "fixed_speaker": speaker,
         "rttm": str(rttm_path) if rttm_path else None,
         "turns_scored": len(rows),
+        "eligible_turn_count": eligible_turn_count,
+        "ambiguous_turn_count": ambiguous_turn_count,
+        "unscorable_turn_count": unscorable_turn_count,
         "speakers_in_stm": sorted({segment["speaker"] for segment in segments}),
         "raw_asr": raw_metrics,
         "final": current_metrics,
