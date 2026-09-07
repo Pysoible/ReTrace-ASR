@@ -283,15 +283,21 @@ class ReTraceService:
                 and not judgment.focus
                 and (judgment.outcome in {"UNCERTAIN", "CONFLICT"} or has_acoustic_doubt or has_coverage_risk)
             ):
-                relisten_event = self._relisten_uncertain_window(
+                relisten_result = self._relisten_uncertain_window(
                     snapshot,
                     trigger,
                     observed_version=observed_version,
                     memory=memory,
                 )
-                if relisten_event is not None:
-                    events.append(relisten_event)
-                    trigger.current_text = relisten_event.after_text
+                if isinstance(relisten_result, RevisionEvent):
+                    events.append(relisten_result)
+                    trigger.current_text = relisten_result.after_text
+                elif relisten_result:
+                    candidate_pool.extend(relisten_result)
+                    judgment.focus = [
+                        candidate_to_focus(item)
+                        for item in deduplicate_candidates(candidate_pool)
+                    ]
             audit_events: list[RevisionEvent] = []
             deferred = judgment.outcome == "UNCERTAIN" and not judgment.focus
             if not judgment.focus:
@@ -666,7 +672,7 @@ class ReTraceService:
         *,
         observed_version: int | None,
         memory: Any | None = None,
-    ) -> RevisionEvent | None:
+    ) -> RevisionEvent | list[CorrectionCandidate] | None:
         """Open-vocabulary relisten when the judge is uncertain but gave no focus.
 
         If the model flagged the turn as UNCERTAIN/CONFLICT without pinpointing a
@@ -773,6 +779,40 @@ class ReTraceService:
         # clearly recovers a degenerate first pass.
         raw_assessment = assess_transcript(raw_body)
         cand_assessment = assess_transcript(cand_body)
+        if not coverage_risk and not raw_assessment.degenerate:
+            local_candidates: list[CorrectionCandidate] = []
+            matcher = difflib.SequenceMatcher(None, raw_body, cand_body, autojunk=False)
+            for tag, left_start, left_end, right_start, right_end in matcher.get_opcodes():
+                if tag != "replace":
+                    continue
+                span = raw_body[left_start:left_end].strip()
+                replacement = cand_body[right_start:right_end].strip()
+                if (
+                    not span
+                    or not replacement
+                    or len(span) > 12
+                    or len(replacement) > 12
+                    or not language_compatible(span, replacement)
+                ):
+                    continue
+                local_candidates.append(CorrectionCandidate(
+                    target_turn_id=turn.turn_id,
+                    span=span,
+                    candidate=replacement,
+                    source="relisten_open",
+                    evidence_turn_ids=[turn.turn_id],
+                    rationale="bounded audio relisten differs at this local span",
+                    semantic_confidence=0.0,
+                    audio_start_sec=float(start_sec),
+                    audio_end_sec=float(end_sec),
+                ))
+            meta["relisten_uncertain"] = {
+                "relistened": True,
+                "changed": False,
+                "ratio": round(ratio, 3),
+                "candidate_count": len(local_candidates),
+            }
+            return local_candidates or None
         paraformer_keep = keep(paraformer_text)
         coverage_supported = bool(
             coverage_risk
@@ -796,7 +836,6 @@ class ReTraceService:
             (recoverable_degeneration and not cand_assessment.degenerate)
             or (
                 coverage_risk
-                and coverage_supported
                 and len(cand_keep) > len(raw_keep)
                 and not cand_assessment.degenerate
             )
@@ -809,8 +848,6 @@ class ReTraceService:
                 "rejected": (
                     "normal turn requires targeted focus for revision"
                     if not raw_assessment.degenerate and not coverage_risk
-                    else "coverage recovery lacks independent ASR support"
-                    if coverage_risk and not coverage_supported
                     else "relisten differs but recovers no supported content"
                 ),
             }

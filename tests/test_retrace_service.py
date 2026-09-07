@@ -750,7 +750,34 @@ def test_uncertain_relisten_does_not_replace_a_healthy_turn(tmp_path):
     turn = result["session"]["turns"][1]
     assert turn["current_text"] == "[0.0-7.0] 这个连加额，那这个英雄跟那个跟螳螂还是有有渊源的是吧？"
     assert not [r for r in result["revisions"] if r["resolver"] == "audio-uncertainty-relisten"]
-    assert turn["meta"]["relisten_uncertain"]["rejected"] == "normal turn requires targeted focus for revision"
+    assert turn["meta"]["relisten_uncertain"]["candidate_count"] >= 1
+
+
+def test_healthy_turn_relisten_difference_uses_candidate_resolver(tmp_path):
+    verifier_calls = []
+
+    def verify(**kwargs):
+        verifier_calls.append(kwargs)
+        return {
+            "ok": True,
+            "scores": {item: (0.96 if item == "男装" else 0.03 if item == "南庄" else 0.01) for item in kwargs["candidates"]},
+        }
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=lambda **_: ContextJudgment("UNCERTAIN", 0.95),
+        audio_retranscriber=lambda **_: {"ok": True, "text": "我负责男装部门"},
+        audio_verifier=verify,
+    )
+
+    result = service.process_turn(
+        "s", "t1", "我负责南庄部门", source="qwen-omni",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0.0, "end_sec": 2.0},
+    )
+
+    assert verifier_calls
+    assert result["session"]["turns"][0]["current_text"] == "我负责男装部门"
+    assert "candidate_source:relisten_open" in result["revisions"][0]["evidence"]
 
 
 def test_coverage_risk_uses_segmented_relisten_even_when_judge_is_consistent(tmp_path):
