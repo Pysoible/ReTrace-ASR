@@ -9,6 +9,12 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from asr_agent.context_judge import ContextJudgment, ExplicitSignalFallbackJudge, FocusProposal, normalize_judgment
+from asr_agent.correction_candidates import (
+    CorrectionCandidate,
+    candidate_to_focus,
+    deduplicate_candidates,
+    focus_to_candidate,
+)
 from asr_agent.integrations.domainterms import domainterms_root, ensure_importable
 from asr_agent.integrations.audio_verifier import retranscribe_window
 from asr_agent.memory import MemoryPacket
@@ -25,6 +31,8 @@ _CONTEXT_JUDGE_SYSTEM = (
     "也不能把中文改写成英文。若 span 与 proposed_text 的语言不同，即使语义等价或音频候选支持，也必须不输出该 focus，"
     "保留原文并判定为 CONSISTENT 或 UNCERTAIN；中英混合原文只允许保持已有语言集合，不得新增另一种语言。"
     "JSON 顶层必须包含 outcome 和 confidence 字段：outcome 为上述四种之一；"
+    "若提出修订候选，可使用 focus 或顶层 candidates；candidates 每项必须包含 target_turn_id、span、"
+    "candidate、evidence_turn_ids、rationale 和 source。历史中不存在正确写法时 source 必须为 semantic_open。"
     "confidence 为 0-1 的小数，表示你对这个判断的把握程度——"
     "CONSISTENT 时 confidence 通常应 >= 0.7（有明确一致证据则更高），UNCERTAIN 给 0.4-0.6，"
     "CONFLICT/NOVEL 时 confidence 表示证据强度（> 0.6 才建议修订）。不要省略 confidence，不要填 0。"
@@ -77,7 +85,7 @@ _CONTEXT_JUDGE_SYSTEM = (
     "词提出候选。反之，如果低置信度字在语义上完全通顺，则不必强行修订。"
     "user 消息里的 canonical_entities 是 agent 已经通过上下文与定向音频验证确认过的实体规范写法，"
     "每项有 canonical、aliases 与证据 turn。它们用于保证一个 session 内同一实体只有一种写法：当"
-    "current_turn 或 recent_turns 中出现 alias 或另一种近音音译，而语境指向同一实体时，必须提出该历史"
+    "current_turn 或 recent_turns 中出现 alias 或另一种近音音译，而语境指向同一实体时，必须提出该历史 "
     "turn 的 focus，把 canonical 作为 proposed_text，并把原写法与 canonical 一起放入 alternatives；"
     "不要把 alias 当作已经正确，也不要只在 rationale 中说明。必须让后续定向音频验证决定，不能仅凭 memory 直接改字。"
     "如果不同写法可能确实指向不同实体，或没有明确语境与声学疑点，则保持 CONSISTENT/UNCERTAIN，不要强行统一。"
@@ -342,38 +350,43 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
             raise ValueError("context judge must return a JSON object")
         _fill_judgment_confidence(result)
         judgment = normalize_judgment(result, session)
-        if not judgment.focus:
-            open_candidates = result.get("candidates") or result.get("candidate_pool") or []
-            open_focus = []
-            for candidate in open_candidates if isinstance(open_candidates, list) else []:
-                if not isinstance(candidate, dict):
-                    continue
-                span = str(candidate.get("span") or candidate.get("source_span") or "").strip()
-                proposed = str(candidate.get("candidate") or candidate.get("proposed_text") or "").strip()
-                target_turn_id = str(candidate.get("target_turn_id") or current_turn.turn_id)
-                evidence_turn_ids = [
-                    str(turn_id)
-                    for turn_id in (candidate.get("evidence_turn_ids") or [target_turn_id])
-                    if str(turn_id)
-                ]
-                if not span or not proposed or not any(
-                    turn.turn_id == target_turn_id
-                    and (span in turn.raw_text or span in turn.current_text)
-                    for turn in session.turns
-                ):
-                    continue
-                open_focus.append({
-                    "target_turn_id": target_turn_id,
-                    "span": span,
-                    "proposed_text": proposed,
-                    "alternatives": list(dict.fromkeys([span, proposed, *(candidate.get("alternatives") or [])])),
-                    "evidence_turn_ids": evidence_turn_ids,
-                    "rationale": candidate.get("rationale") or "semantic-open candidate",
-                    "relationship": candidate.get("relationship") or "MUTUALLY_EXCLUSIVE",
-                    "source": candidate.get("source") or "semantic_open",
-                })
-            if open_focus:
-                judgment = normalize_judgment({**result, "focus": open_focus}, session)
+        normalized_candidates = [focus_to_candidate(focus, session) for focus in judgment.focus]
+        open_candidates = result.get("candidates") or result.get("candidate_pool") or []
+        for candidate in open_candidates if isinstance(open_candidates, list) else []:
+            if not isinstance(candidate, dict):
+                continue
+            span = str(candidate.get("span") or candidate.get("source_span") or "").strip()
+            proposed = str(candidate.get("candidate") or candidate.get("proposed_text") or "").strip()
+            operation = str(candidate.get("operation") or "REPLACE").upper()
+            target_turn_id = str(candidate.get("target_turn_id") or current_turn.turn_id)
+            evidence_turn_ids = [
+                str(turn_id)
+                for turn_id in (candidate.get("evidence_turn_ids") or [target_turn_id])
+                if str(turn_id)
+            ]
+            if not span or (operation != "DELETE" and not proposed) or not any(
+                turn.turn_id == target_turn_id
+                and (span in turn.raw_text or span in turn.current_text)
+                for turn in session.turns
+            ):
+                continue
+            normalized_candidates.append(CorrectionCandidate(
+                target_turn_id=target_turn_id,
+                span=span,
+                candidate=proposed,
+                source=str(candidate.get("source") or "semantic_open"),
+                evidence_turn_ids=evidence_turn_ids,
+                rationale=str(candidate.get("rationale") or "semantic-open candidate"),
+                semantic_confidence=judgment.confidence,
+                relationship=str(candidate.get("relationship") or "MUTUALLY_EXCLUSIVE"),
+                operation=operation,
+                alternatives=[
+                    str(item)
+                    for item in (candidate.get("alternatives") or [])
+                    if str(item)
+                ],
+            ))
+        judgment.focus = [candidate_to_focus(item) for item in deduplicate_candidates(normalized_candidates)]
         if judgment.outcome in {"CONFLICT", "UNCERTAIN"} and not judgment.focus:
             homophone_candidates = payload.get("homophone_candidates") or []
             focused = _resolve_homophone_focus(

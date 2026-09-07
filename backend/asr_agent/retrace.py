@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import json
-import os
 import re
 from pathlib import Path
 from typing import Any, Callable
@@ -16,6 +15,12 @@ from asr_agent.context_judge import (
     language_compatible,
     text_script_profile,
     normalize_judgment,
+)
+from asr_agent.correction_candidates import (
+    CorrectionCandidate,
+    candidate_to_focus,
+    deduplicate_candidates,
+    focus_to_candidate,
 )
 from asr_agent.degeneration import (
     DegenerationAssessment,
@@ -214,21 +219,17 @@ class ReTraceService:
                 except Exception as exc:
                     judgment = ContextJudgment("UNCERTAIN", rationale=f"context judge unavailable: {exc}")
 
-            if not judgment.focus and judgment.outcome != "CONFLICT":
-                acoustic_focus = self._acoustic_focus(trigger)
-                if acoustic_focus:
-                    judgment = ContextJudgment(
-                        "UNCERTAIN",
-                        confidence=max(judgment.confidence, 0.5),
-                        rationale="independent ASR disagreement requires targeted audio verification",
-                        focus=acoustic_focus,
-                        beliefs=judgment.beliefs,
-                    )
-
-            direct_context_event = None
+            candidate_pool = [focus_to_candidate(focus, snapshot) for focus in judgment.focus]
+            candidate_pool.extend(
+                focus_to_candidate(focus, snapshot)
+                for focus in self._acoustic_focus(trigger)
+            )
             trigger_uncertainty = trigger.meta.get("uncertainty") or {}
             has_acoustic_disagreement = bool(trigger_uncertainty.get("acoustic_disagreement"))
-            if judgment.outcome == "CONFLICT" or (judgment.outcome == "UNCERTAIN" and has_acoustic_disagreement):
+            if not judgment.focus and (
+                judgment.outcome == "CONFLICT"
+                or (judgment.outcome == "UNCERTAIN" and has_acoustic_disagreement)
+            ):
                 try:
                     from asr_agent.integrations.deepseek import _homophone_candidates
 
@@ -236,69 +237,35 @@ class ReTraceService:
                     by_span: dict[str, list[dict[str, str]]] = {}
                     for candidate in candidates:
                         by_span.setdefault(candidate["span"], []).append(candidate)
-                    body = trigger.current_text or trigger.raw_text
                     for span, matches in by_span.items():
                         matches = [
                             match for match in matches
                             if not any(particle in match["candidate"] for particle in ("啊", "呀", "吧", "呢", "啦"))
                         ]
-                        if len(matches) != 1 or span not in body:
+                        if len(matches) != 1 or span not in (trigger.current_text or trigger.raw_text):
                             continue
-                        replacement = matches[0]["candidate"]
-                        meta = trigger.meta or {}
-                        audio_path = meta.get("audio_path")
-                        start_sec, end_sec = meta.get("start_sec"), meta.get("end_sec")
-                        if not audio_path or start_sec is None or end_sec is None:
-                            continue
-                        try:
-                            audio = self.resolver.audio_verifier(
-                                audio_path=str(audio_path),
-                                start_sec=float(start_sec),
-                                end_sec=float(end_sec),
-                                candidates=[span, replacement],
-                            )
-                            scores = audio.get("scores") if isinstance(audio, dict) and audio.get("ok") else None
-                            if not isinstance(scores, dict) or set(scores) != {span, replacement}:
-                                continue
-                            ordered = sorted(
-                                ((key, max(0.0, float(value))) for key, value in scores.items()),
-                                key=lambda item: item[1],
-                                reverse=True,
-                            )
-                            if ordered[0][0] != replacement or ordered[0][1] < 0.85:
-                                continue
-                            if ordered[0][1] - ordered[1][1] < 0.30:
-                                continue
-                        except (TypeError, ValueError, OSError):
-                            continue
-                        after_text = body.replace(span, replacement)
-                        direct_context_event = RevisionEvent(
-                            event_id=self._event_id(snapshot.session_id, trigger.turn_id, observed_version, "REVISE_CURRENT", "direct-context"),
-                            action="REVISE_CURRENT",
+                        match = matches[0]
+                        candidate_pool.append(CorrectionCandidate(
                             target_turn_id=trigger.turn_id,
-                            source_turn_id=trigger.turn_id,
-                            span="",
-                            before_text=body,
-                            after_text=after_text,
-                            entity_id=None,
-                            score=judgment.confidence,
-                            evidence=[
-                                "candidate_source:history_homophone",
-                                *[f"evidence_turn:{turn_id}" for turn_id in matches[0].get("evidence_turn_ids", [])],
-                                f"context_homophone:{span}->{replacement}",
-                                f"audio_verified:{ordered[0][1]:.3f}/{ordered[1][1]:.3f}",
-                            ],
-                            resolver="direct-context-correction",
-                            rationale="context conflict and decisive closed-set local audio verification",
-                            replacement="",
-                        )
-                        trigger.current_text = after_text
-                        break
+                            span=span,
+                            candidate=match["candidate"],
+                            source="history_homophone",
+                            evidence_turn_ids=list(match.get("evidence_turn_ids") or []),
+                            rationale="context conflict exposes a same-pronunciation history candidate",
+                            semantic_confidence=judgment.confidence,
+                            audio_start_sec=(trigger.meta or {}).get("start_sec"),
+                            audio_end_sec=(trigger.meta or {}).get("end_sec"),
+                        ))
                 except Exception:
-                    direct_context_event = None
+                    pass
+
+            judgment.focus = [candidate_to_focus(item) for item in deduplicate_candidates(candidate_pool)]
+            if judgment.focus and judgment.outcome not in {"CONFLICT", "UNCERTAIN"}:
+                judgment.outcome = "UNCERTAIN"
+                judgment.confidence = max(judgment.confidence, 0.5)
 
             self._apply_beliefs(snapshot, judgment.beliefs)
-            events: list[RevisionEvent] = [event for event in (recovery_event, direct_context_event) if event is not None]
+            events: list[RevisionEvent] = [event for event in (recovery_event,) if event is not None]
             # Open-vocabulary relisten fallback: when the judge is uncertain (or
             # conflicted) but could not point at a specific span, go back to the
             # audio and re-transcribe the window. This catches garbled proper
@@ -316,16 +283,23 @@ class ReTraceService:
                 and not judgment.focus
                 and (judgment.outcome in {"UNCERTAIN", "CONFLICT"} or has_acoustic_doubt or has_coverage_risk)
             ):
-                relisten_event = self._relisten_uncertain_window(
+                relisten_result = self._relisten_uncertain_window(
                     snapshot,
                     trigger,
                     observed_version=observed_version,
                     memory=memory,
                 )
-                if relisten_event is not None:
-                    events.append(relisten_event)
-                    trigger.current_text = relisten_event.after_text
+                if isinstance(relisten_result, RevisionEvent):
+                    events.append(relisten_result)
+                    trigger.current_text = relisten_result.after_text
+                elif relisten_result:
+                    candidate_pool.extend(relisten_result)
+                    judgment.focus = [
+                        candidate_to_focus(item)
+                        for item in deduplicate_candidates(candidate_pool)
+                    ]
             audit_events: list[RevisionEvent] = []
+            candidate_audits: list[RevisionEvent] = []
             deferred = judgment.outcome == "UNCERTAIN" and not judgment.focus
             if not judgment.focus:
                 action = {"NOVEL": "ACCEPT_NEW", "CONSISTENT": "KEEP_OLD"}.get(judgment.outcome, "DEFER")
@@ -359,6 +333,47 @@ class ReTraceService:
                     context_confidence=judgment.confidence,
                     memory_support=self._memory_support(memory.long_term_beliefs, focus.proposed_text),
                 )
+                candidate_id = self._event_id(
+                    session_id,
+                    focus.target_turn_id,
+                    observed_version,
+                    "CANDIDATE",
+                    f"{focus_index}:{focus.span}:{focus.proposed_text}",
+                )
+                candidate_stage = (
+                    "committed"
+                    if resolution.action in {"REVISE_CURRENT", "REVISE_HISTORY"}
+                    else "rejected"
+                    if resolution.action == "KEEP_OLD"
+                    else "deferred"
+                )
+                candidate_evidence = [
+                    f"candidate_source:{focus.source}",
+                    *[f"evidence_turn:{item}" for item in focus.evidence_turn_ids],
+                    f"verifier_attempted:{str(resolution.verifier_attempted).lower()}",
+                ]
+                if resolution.verifier_succeeded:
+                    candidate_evidence.append(
+                        f"audio_verified:{resolution.audio_confidence:.3f}/{resolution.audio_margin:.3f}"
+                    )
+                candidate_audits.append(RevisionEvent(
+                    event_id=candidate_id,
+                    action=resolution.action,
+                    target_turn_id=resolution.target_turn_id,
+                    source_turn_id=trigger.turn_id,
+                    span=resolution.span,
+                    before_text=next(turn.current_text for turn in snapshot.turns if turn.turn_id == resolution.target_turn_id),
+                    after_text=next(turn.current_text for turn in snapshot.turns if turn.turn_id == resolution.target_turn_id),
+                    entity_id=None,
+                    score=resolution.score,
+                    evidence=candidate_evidence,
+                    resolver="candidate-pipeline",
+                    rationale=resolution.rationale,
+                    replacement=focus.proposed_text,
+                    event_kind="candidate_audit",
+                    candidate_id=candidate_id,
+                    candidate_stage=candidate_stage,
+                ))
                 hypothesis.score = resolution.score
                 if resolution.action in {"REVISE_CURRENT", "REVISE_HISTORY"}:
                     hypothesis.status = "resolved"
@@ -367,7 +382,8 @@ class ReTraceService:
                         (
                             event
                             for event in reversed(self.ledger.active_events(snapshot))
-                            if event.target_turn_id == target.turn_id
+                            if event.event_kind == "revision"
+                            and event.target_turn_id == target.turn_id
                             and event.span == resolution.replacement
                             and event.replacement == resolution.span
                         ),
@@ -457,7 +473,7 @@ class ReTraceService:
                     if evidence_turn_id not in snapshot.dependency_index[focus.target_turn_id]:
                         snapshot.dependency_index[focus.target_turn_id].append(evidence_turn_id)
 
-            self.ledger.append_many(snapshot, [*audit_events, *events], event_version=snapshot.version + 1)
+            self.ledger.append_many(snapshot, [*audit_events, *candidate_audits, *events], event_version=snapshot.version + 1)
             snapshot.analysis_status = "deferred" if deferred else "idle"
             trigger.meta["analyzed_observed_version"] = observed_version
             trigger.meta["analyzed_session_version"] = snapshot.version + 1
@@ -478,7 +494,7 @@ class ReTraceService:
             self.memory_consolidator.consolidate(committed.memory_scope, list(committed.working_beliefs.values()))
             return {
                 "status": committed.analysis_status,
-                "decisions": [event.as_dict() for event in [*audit_events, *events]],
+                "decisions": [event.as_dict() for event in [*audit_events, *candidate_audits, *events]],
                 "revisions": [
                     event.as_dict()
                     for event in events
@@ -699,7 +715,7 @@ class ReTraceService:
         *,
         observed_version: int | None,
         memory: Any | None = None,
-    ) -> RevisionEvent | None:
+    ) -> RevisionEvent | list[CorrectionCandidate] | None:
         """Open-vocabulary relisten when the judge is uncertain but gave no focus.
 
         If the model flagged the turn as UNCERTAIN/CONFLICT without pinpointing a
@@ -806,6 +822,40 @@ class ReTraceService:
         # clearly recovers a degenerate first pass.
         raw_assessment = assess_transcript(raw_body)
         cand_assessment = assess_transcript(cand_body)
+        if not coverage_risk and not raw_assessment.degenerate:
+            local_candidates: list[CorrectionCandidate] = []
+            matcher = difflib.SequenceMatcher(None, raw_body, cand_body, autojunk=False)
+            for tag, left_start, left_end, right_start, right_end in matcher.get_opcodes():
+                if tag != "replace":
+                    continue
+                span = raw_body[left_start:left_end].strip()
+                replacement = cand_body[right_start:right_end].strip()
+                if (
+                    not span
+                    or not replacement
+                    or len(span) > 12
+                    or len(replacement) > 12
+                    or not language_compatible(span, replacement)
+                ):
+                    continue
+                local_candidates.append(CorrectionCandidate(
+                    target_turn_id=turn.turn_id,
+                    span=span,
+                    candidate=replacement,
+                    source="relisten_open",
+                    evidence_turn_ids=[turn.turn_id],
+                    rationale="bounded audio relisten differs at this local span",
+                    semantic_confidence=0.0,
+                    audio_start_sec=float(start_sec),
+                    audio_end_sec=float(end_sec),
+                ))
+            meta["relisten_uncertain"] = {
+                "relistened": True,
+                "changed": False,
+                "ratio": round(ratio, 3),
+                "candidate_count": len(local_candidates),
+            }
+            return local_candidates or None
         paraformer_keep = keep(paraformer_text)
         coverage_supported = bool(
             coverage_risk
@@ -829,7 +879,6 @@ class ReTraceService:
             (recoverable_degeneration and not cand_assessment.degenerate)
             or (
                 coverage_risk
-                and coverage_supported
                 and len(cand_keep) > len(raw_keep)
                 and not cand_assessment.degenerate
             )
@@ -842,8 +891,6 @@ class ReTraceService:
                 "rejected": (
                     "normal turn requires targeted focus for revision"
                     if not raw_assessment.degenerate and not coverage_risk
-                    else "coverage recovery lacks independent ASR support"
-                    if coverage_risk and not coverage_supported
                     else "relisten differs but recovers no supported content"
                 ),
             }
@@ -1058,7 +1105,7 @@ class ReTraceService:
 
     @staticmethod
     def _can_fast_keep_turn(meta: dict[str, Any] | None) -> bool:
-        if os.getenv("ASR_FAST_NORMAL_TURNS", "1").strip().lower() in {"0", "false", "no", "off"}:
+        if os.getenv("ASR_FAST_NORMAL_TURNS", "0").strip().lower() in {"0", "false", "no", "off"}:
             return False
         uncertainty = (meta or {}).get("uncertainty") or {}
         if (meta or {}).get("session_complete"):

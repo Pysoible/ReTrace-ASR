@@ -113,62 +113,106 @@ def test_judge_accepts_semantic_open_candidate_not_found_in_history(monkeypatch)
     assert result.focus[0].source == "semantic_open"
 
 
-    def test_context_judgment_accepts_common_focus_field_aliases():
-        session = Session("s", turns=[Turn("t1", "伊卡拉来了", "伊卡拉来了"), Turn("t2", "安拉在经文中", "安拉在经文中")])
-        normalized = deepseek.normalize_judgment({
+def test_judge_accepts_top_level_delete_candidate(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(
+        deepseek,
+        "_chat_json",
+        lambda *_, **__: {
             "outcome": "CONFLICT",
-            "confidence": 0.9,
-            "focus": [{
-                "target_turn": "t1",
-                "current_text": "伊卡拉",
-                "replacement": "安拉",
-                "closed_set": ["伊卡拉", "安拉"],
-                "evidence_turn_id": "t2",
-                "relation": "MUTUALLY_EXCLUSIVE",
-            }],
-        }, session)
-
-        assert normalized.focus[0].target_turn_id == "t1"
-        assert normalized.focus[0].span == "伊卡拉"
-        assert normalized.focus[0].proposed_text == "安拉"
-        assert normalized.focus[0].evidence_turn_ids == ["t2"]
-
-
-    def test_consistent_model_label_keeps_valid_focus_for_audio_gate():
-        session = Session("s", turns=[Turn("t1", "爱拉来了", "爱拉来了"), Turn("t2", "安拉在经文中", "安拉在经文中")])
-        normalized = deepseek.normalize_judgment({
-            "outcome": "CONSISTENT",
-            "confidence": 0.9,
-            "focus": [{
+            "confidence": 0.95,
+            "candidates": [{
                 "target_turn_id": "t1",
-                "span": "爱拉",
-                "proposed_text": "安拉",
-                "alternatives": ["爱拉", "安拉"],
-                "evidence_turn_ids": ["t2"],
+                "span": "啊啊",
+                "candidate": "",
+                "operation": "DELETE",
+                "source": "semantic_open",
+                "evidence_turn_ids": ["t1"],
+                "rationale": "局部音频确认该片段是幻觉",
             }],
-        }, session)
+        },
+    )
+    turn = Turn("t1", "开始啊啊继续", "开始啊啊继续")
 
-        assert normalized.outcome == "UNCERTAIN"
-        assert normalized.focus[0].proposed_text == "安拉"
+    result = deepseek.judge_context(
+        session=Session("s", turns=[turn]),
+        current_turn=turn,
+        memory=MemoryPacket(),
+    )
+
+    assert result.focus[0].operation == "DELETE"
+    assert result.focus[0].span == "啊啊"
+    assert result.focus[0].proposed_text == ""
 
 
-    def test_prompt_requires_canonical_alias_to_become_focus():
-        assert "不要把 alias 当作已经正确" in deepseek._CONTEXT_JUDGE_SYSTEM
-        assert "必须提出该历史 turn 的 focus" in deepseek._CONTEXT_JUDGE_SYSTEM
+def test_focus_candidate_absent_from_history_is_marked_semantic_open(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(deepseek, "_chat_json", lambda *_, **__: {
+        "outcome": "CONFLICT",
+        "confidence": 0.9,
+        "focus": [{
+            "target_turn_id": "t1",
+            "span": "南庄",
+            "proposed_text": "男装",
+            "alternatives": ["南庄", "男装"],
+            "evidence_turn_ids": ["t1"],
+        }],
+    })
+    turn = Turn("t1", "我负责南庄部门", "我负责南庄部门")
+
+    result = deepseek.judge_context(session=Session("s", turns=[turn]), current_turn=turn, memory=MemoryPacket())
+
+    assert result.focus[0].source == "semantic_open"
 
 
-    def test_normalize_repairs_grounded_focus_missing_alternatives():
-        from asr_agent.context_judge import normalize_judgment
+def test_focus_and_candidate_pool_are_deduplicated(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    proposal = {
+        "target_turn_id": "t1", "span": "南庄", "proposed_text": "男装",
+        "alternatives": ["南庄", "男装"], "evidence_turn_ids": ["t1"],
+    }
+    monkeypatch.setattr(deepseek, "_chat_json", lambda *_, **__: {
+        "outcome": "CONFLICT", "confidence": 0.9,
+        "focus": [proposal], "candidates": [{**proposal, "candidate": "男装"}],
+    })
+    turn = Turn("t1", "我负责南庄部门", "我负责南庄部门")
 
-        session = Session("s", turns=[Turn("t1", "攒生节来了", "攒生节来了")])
-        normalized = normalize_judgment({
-            "outcome": "UNCERTAIN",
-            "confidence": 0.6,
-            "focus": [{"target_turn_id": "t1", "span": "攒生节", "proposed_text": "宰牲节"}],
-        }, session)
+    result = deepseek.judge_context(session=Session("s", turns=[turn]), current_turn=turn, memory=MemoryPacket())
 
-        assert normalized.focus[0].alternatives == ["攒生节", "宰牲节"]
-        assert normalized.focus[0].evidence_turn_ids == ["t1"]
+    assert len(result.focus) == 1
+    assert result.focus[0].source == "semantic_open"
+
+
+def test_context_judgment_accepts_common_focus_field_aliases():
+    session = Session("s", turns=[Turn("t1", "伊卡拉来了", "伊卡拉来了"), Turn("t2", "安拉在经文中", "安拉在经文中")])
+    normalized = deepseek.normalize_judgment({
+        "outcome": "CONFLICT", "confidence": 0.9,
+        "focus": [{"target_turn": "t1", "current_text": "伊卡拉", "replacement": "安拉", "closed_set": ["伊卡拉", "安拉"], "evidence_turn_id": "t2", "relation": "MUTUALLY_EXCLUSIVE"}],
+    }, session)
+    assert normalized.focus[0].target_turn_id == "t1"
+    assert normalized.focus[0].span == "伊卡拉"
+    assert normalized.focus[0].proposed_text == "安拉"
+    assert normalized.focus[0].evidence_turn_ids == ["t2"]
+
+
+def test_consistent_model_label_keeps_valid_focus_for_audio_gate():
+    session = Session("s", turns=[Turn("t1", "爱拉来了", "爱拉来了"), Turn("t2", "安拉在经文中", "安拉在经文中")])
+    normalized = deepseek.normalize_judgment({"outcome": "CONSISTENT", "confidence": 0.9, "focus": [{"target_turn_id": "t1", "span": "爱拉", "proposed_text": "安拉", "alternatives": ["爱拉", "安拉"], "evidence_turn_ids": ["t2"]}]}, session)
+    assert normalized.outcome == "UNCERTAIN"
+    assert normalized.focus[0].proposed_text == "安拉"
+
+
+def test_prompt_requires_canonical_alias_to_become_focus():
+    assert "不要把 alias 当作已经正确" in deepseek._CONTEXT_JUDGE_SYSTEM
+    assert "必须提出该历史 turn 的 focus" in deepseek._CONTEXT_JUDGE_SYSTEM
+
+
+def test_normalize_repairs_grounded_focus_missing_alternatives():
+    from asr_agent.context_judge import normalize_judgment
+    session = Session("s", turns=[Turn("t1", "攒生节来了", "攒生节来了")])
+    normalized = normalize_judgment({"outcome": "UNCERTAIN", "confidence": 0.6, "focus": [{"target_turn_id": "t1", "span": "攒生节", "proposed_text": "宰牲节"}]}, session)
+    assert normalized.focus[0].alternatives == ["攒生节", "宰牲节"]
+    assert normalized.focus[0].evidence_turn_ids == ["t1"]
 
 
 def test_deepseek_context_judge_safely_defers_malformed_output(monkeypatch):

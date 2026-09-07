@@ -58,6 +58,26 @@ def test_rollback_restores_raw_text_without_mutating_prior_event():
     assert rollback.resolver == "automatic-rollback"
 
 
+def test_candidate_audit_cannot_be_used_as_a_rollback_target():
+    ledger = RevisionLedger()
+    audit = revision_event("candidate-1")
+    audit.event_kind = "candidate_audit"
+    session = Session(
+        "s",
+        turns=[Turn("t1", "泰信方案", "泰信方案")],
+        revision_events=[audit],
+    )
+
+    with pytest.raises(ValueError):
+        ledger.rollback(
+            session,
+            "candidate-1",
+            source_turn_id="t3",
+            reason="candidate audits are not transcript revisions",
+            event_version=2,
+        )
+
+
 def test_append_many_assigns_one_event_version_without_changing_session_version():
     ledger = RevisionLedger()
     session = Session(

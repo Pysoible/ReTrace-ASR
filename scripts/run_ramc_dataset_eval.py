@@ -326,7 +326,7 @@ def event_stats(session: dict[str, Any]) -> dict[str, Any]:
     audits = [event for event in events if _is_audit_event(event)]
     revisions = [event for event in events if _is_committed_revision(event)]
     audio_events = [
-        event for event in events
+        event for event in revisions
         if "audio" in str(event.get("resolver", "")).lower()
         or any("audio" in str(item).lower() for item in event.get("evidence") or [])
     ]
@@ -416,7 +416,7 @@ def _event_replacement(event: dict[str, Any]) -> str:
 
 def _is_audit_event(event: dict[str, Any]) -> bool:
     return bool(
-        event.get("event_kind") == "audit"
+        event.get("event_kind") in {"audit", "candidate_audit"}
         or (
             not str(event.get("span") or "").strip()
             and str(event.get("resolver") or "") == "context-judge"
@@ -427,7 +427,7 @@ def _is_audit_event(event: dict[str, Any]) -> bool:
 def _is_committed_revision(event: dict[str, Any]) -> bool:
     return bool(
         event.get("action") in {"REVISE_CURRENT", "REVISE_HISTORY", "REVISE_TEXT", "ROLLBACK"}
-        and not _is_audit_event(event)
+        and event.get("event_kind", "revision") == "revision"
     )
 
 

@@ -104,7 +104,9 @@ def evaluate_sample(sample_dir: Path, reference_path: Path, horizon: int) -> dic
     positions = {turn["turn_id"]: index for index, turn in enumerate(turns)}
     revisions = [
         event for event in session.get("revision_events") or []
-        if event.get("active", True) and event.get("action") in {"REVISE_CURRENT", "REVISE_HISTORY", "REVISE_TEXT"}
+        if event.get("active", True)
+        and event.get("event_kind", "revision") == "revision"
+        and event.get("action") in {"REVISE_CURRENT", "REVISE_HISTORY", "REVISE_TEXT"}
     ]
     historical = [event for event in revisions if positions.get(event.get("source_turn_id"), -1) > positions.get(event.get("target_turn_id"), -1)]
     correct_revisions = [event for event in revisions if event_correct(event, refs_by_turn)]

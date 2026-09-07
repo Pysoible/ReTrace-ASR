@@ -25,6 +25,8 @@ class Resolution:
     audio_verified: bool = False
     audio_confidence: float = 0.0
     audio_margin: float = 0.0
+    verifier_attempted: bool = False
+    verifier_succeeded: bool = False
 
 
 class EvidenceResolver:
@@ -137,6 +139,8 @@ class EvidenceResolver:
             return 0.0
         span_end = pos + len(span)
         for item in disagreement:
+            if str(item.get("span_a") or "").strip() == span and item.get("offset_a") is None:
+                return 1.0
             start = int(item.get("offset_a") or 0)
             end = start + len(str(item.get("span_a") or ""))
             if start < span_end and pos < end:  # any character-level overlap
@@ -219,13 +223,6 @@ class EvidenceResolver:
             )
         acoustic_supported = self._acoustic_support(target, focus.span) > 0.0
         homophone_candidate = operation == "REPLACE" and self._is_same_pronunciation(focus.span, focus.proposed_text)
-        if operation == "REPLACE" and focus.source == "semantic_open" and not acoustic_supported:
-            return Resolution(
-                "DEFER",
-                target.turn_id,
-                focus.span,
-                rationale="semantic-open candidate requires independent acoustic support before revision",
-            )
         if (
             not self._is_safe_local_replacement(focus.span, focus.proposed_text, operation)
             and not acoustic_supported
@@ -268,7 +265,7 @@ class EvidenceResolver:
                 candidates=candidates,
             )
         except Exception as exc:
-            return Resolution("DEFER", target.turn_id, focus.span, rationale=f"audio verifier failed: {exc}")
+            return Resolution("DEFER", target.turn_id, focus.span, rationale=f"audio verifier failed: {exc}", verifier_attempted=True)
         scores = audio.get("scores") if isinstance(audio, dict) and audio.get("ok") else None
         if operation == "REPLACE" and (not isinstance(scores, dict) or set(scores) != set(candidates)):
             delete_candidates = [focus.span, self.DELETE_CANDIDATE]
@@ -295,20 +292,20 @@ class EvidenceResolver:
                         candidates=candidates,
                     )
                 except Exception as exc:
-                    return Resolution("DEFER", target.turn_id, focus.span, rationale=f"audio verifier failed: {exc}")
+                    return Resolution("DEFER", target.turn_id, focus.span, rationale=f"audio verifier failed: {exc}", verifier_attempted=True)
                 scores = audio.get("scores") if isinstance(audio, dict) and audio.get("ok") else None
         if not isinstance(scores, dict) or set(scores) != set(candidates):
-            return Resolution("DEFER", target.turn_id, focus.span, rationale="invalid closed-set audio result")
+            return Resolution("DEFER", target.turn_id, focus.span, rationale="invalid closed-set audio result", verifier_attempted=True)
         normalized = {key: max(0.0, float(value)) for key, value in scores.items()}
         ordered = sorted(normalized.items(), key=lambda item: item[1], reverse=True)
         top = ordered[0][1] if ordered else 0.0
         proposed_key = self.DELETE_CANDIDATE if operation == "DELETE" else focus.proposed_text
         proposed_score = normalized.get(proposed_key, -1.0)
         if not ordered:
-            return Resolution("KEEP_OLD", target.turn_id, focus.span, score=0.0)
+            return Resolution("KEEP_OLD", target.turn_id, focus.span, score=0.0, verifier_attempted=True, verifier_succeeded=True)
         effective_operation = "DELETE" if ordered[0][0] == self.DELETE_CANDIDATE else operation
         if effective_operation == "REPLACE" and focus.proposed_text not in normalized:
-            return Resolution("KEEP_OLD", target.turn_id, focus.span, score=top, rationale="replacement candidate was not acoustically verified")
+            return Resolution("KEEP_OLD", target.turn_id, focus.span, score=top, rationale="replacement candidate was not acoustically verified", audio_confidence=top, verifier_attempted=True, verifier_succeeded=True)
         near_variant = effective_operation == "REPLACE" and self._is_near_variant(focus.span, focus.proposed_text)
 
         # For a near-variant proper noun, the decisive question is whether the
@@ -318,11 +315,11 @@ class EvidenceResolver:
         # divergent candidates.
         if ordered[0][0] != proposed_key and effective_operation != "DELETE":
             if not near_variant:
-                return Resolution("KEEP_OLD", target.turn_id, focus.span, score=top)
+                return Resolution("KEEP_OLD", target.turn_id, focus.span, score=top, audio_confidence=top, verifier_attempted=True, verifier_succeeded=True)
             if proposed_score < 0.0:
-                return Resolution("KEEP_OLD", target.turn_id, focus.span, score=top)
+                return Resolution("KEEP_OLD", target.turn_id, focus.span, score=top, audio_confidence=top, verifier_attempted=True, verifier_succeeded=True)
             if top - proposed_score > 0.25:
-                return Resolution("KEEP_OLD", target.turn_id, focus.span, score=top)
+                return Resolution("KEEP_OLD", target.turn_id, focus.span, score=top, audio_confidence=top, verifier_attempted=True, verifier_succeeded=True)
 
         margin = top - (ordered[1][1] if len(ordered) > 1 else 0.0)
         strict_revision = self._strict_revision_enabled()
@@ -363,13 +360,17 @@ class EvidenceResolver:
                 focus.span,
                 score=top,
                 rationale="strict revision mode requires decisive local audio and context evidence",
+                audio_confidence=top,
+                audio_margin=margin,
+                verifier_attempted=True,
+                verifier_succeeded=True,
             )
         if top < self.policy.thresholds.relisten:
-            return Resolution("DEFER", target.turn_id, focus.span, score=top, rationale="audio confidence below relisten threshold")
+            return Resolution("DEFER", target.turn_id, focus.span, score=top, rationale="audio confidence below relisten threshold", audio_confidence=top, audio_margin=margin, verifier_attempted=True, verifier_succeeded=True)
         if margin < effective_margin_threshold and not near_variant:
-            return Resolution("DEFER", target.turn_id, focus.span, score=top, rationale="audio margin too small for a safe revision")
+            return Resolution("DEFER", target.turn_id, focus.span, score=top, rationale="audio margin too small for a safe revision", audio_confidence=top, audio_margin=margin, verifier_attempted=True, verifier_succeeded=True)
         if self.policy.calibrator.predict(features) < effective_revise_threshold:
-            return Resolution("DEFER", target.turn_id, focus.span, score=top, rationale="evidence below adjusted revision policy")
+            return Resolution("DEFER", target.turn_id, focus.span, score=top, rationale="evidence below adjusted revision policy", audio_confidence=top, audio_margin=margin, verifier_attempted=True, verifier_succeeded=True)
         action = "REVISE_CURRENT" if target.turn_id == source_turn.turn_id else "REVISE_HISTORY"
         evidence = [f"context:{evidence_turn_id}" for evidence_turn_id in focus.evidence_turn_ids]
         evidence.append(f"audio:{audio_path}:{start_sec}-{end_sec}")
@@ -388,4 +389,6 @@ class EvidenceResolver:
             audio_verified=True,
             audio_confidence=top,
             audio_margin=margin,
+            verifier_attempted=True,
+            verifier_succeeded=True,
         )

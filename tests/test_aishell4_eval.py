@@ -82,20 +82,25 @@ def test_miss_analysis_counts_unreferenced_expansion_as_harmful_revision():
 def test_miss_analysis_reports_candidate_pipeline_metrics():
     session = {
         "turns": [],
-        "revision_events": [{
-            "active": True,
-            "action": "REVISE_CURRENT",
-            "evidence": ["candidate_source:semantic_open", "audio_verified:1.0/0.0"],
-        }],
+        "revision_events": [
+            {"active": True, "event_kind": "candidate_audit", "action": "REVISE_CURRENT", "candidate_id": "c1", "candidate_stage": "committed", "evidence": ["candidate_source:semantic_open", "verifier_attempted:true", "audio_verified:1.0/0.0"]},
+            {"active": True, "event_kind": "candidate_audit", "action": "DEFER", "candidate_id": "c2", "candidate_stage": "deferred", "evidence": ["candidate_source:semantic_open", "verifier_attempted:true"]},
+            {"active": True, "event_kind": "candidate_audit", "action": "DEFER", "candidate_id": "c3", "candidate_stage": "rejected", "evidence": ["candidate_source:history_homophone", "verifier_attempted:false"]},
+        ],
     }
 
     analysis = retrace_miss_analysis(session, [])
 
     assert analysis["candidate_pipeline"] == {
         "candidate_recall": None,
-        "candidate_proposals": 1,
-        "candidate_to_verifier_rate": 1.0,
-        "verified_candidate_rate": 1.0,
+        "candidate_proposals": 3,
+        "validated_candidates": 3,
+        "verifier_attempts": 2,
+        "verified_candidates": 1,
+        "candidate_to_verifier_rate": 2 / 3,
+        "verified_candidate_rate": 1 / 2,
         "committed_revision_count": 1,
+        "deferred_candidate_count": 1,
+        "rejected_candidate_count": 1,
         "note": "candidate_recall requires post-inference reference alignment and is intentionally not used online",
     }

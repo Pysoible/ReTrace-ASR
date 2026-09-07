@@ -56,6 +56,35 @@ def test_revision_metrics_support_new_actions_and_automatic_rollback():
     assert report["revision_f2"] > report["revision_recall"]
 
 
+def test_revision_metrics_ignore_candidate_audit_events():
+    report = evaluate_revisions(
+        events=[
+            {
+                "event_id": "candidate-1",
+                "event_kind": "candidate_audit",
+                "action": "REVISE_CURRENT",
+                "target_turn_id": "t1",
+                "source_turn_id": "t1",
+                "after_text": "修正后",
+            },
+            {
+                "event_id": "revision-1",
+                "event_kind": "revision",
+                "action": "REVISE_CURRENT",
+                "target_turn_id": "t1",
+                "source_turn_id": "t1",
+                "after_text": "修正后",
+            },
+        ],
+        reference_by_turn={"t1": "修正后"},
+        turn_order=["t1"],
+        ambiguous_turn_count=1,
+    )
+
+    assert report["committed_revisions"] == 1
+    assert report["correct_revisions"] == 1
+
+
 def test_revision_metrics_stratify_historical_and_current_routes():
     report = evaluate_revisions(
         events=[
