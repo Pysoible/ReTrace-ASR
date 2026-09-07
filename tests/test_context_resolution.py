@@ -192,6 +192,163 @@ def test_resolver_still_revises_when_proposed_is_not_already_in_the_turn():
     assert result.replacement == "涂博士"
 
 
+def test_resolver_verifies_same_pronunciation_context_candidate():
+    target = Turn(
+        "t1",
+        "搞下去，让他红红火火的。我这南庄那说两句啊呃，南庄啊那个。",
+        "搞下去，让他红红火火的。我这南庄那说两句啊呃，南庄啊那个。",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0, "end_sec": 14},
+    )
+    session = Session("s", turns=[target, Turn("t2", "男装女装", "男装女装")])
+    focus = FocusProposal("t1", "南庄", "男装", ["南庄", "男装"], ["t2"])
+
+    resolver = EvidenceResolver(
+        audio_verifier=lambda **kwargs: {
+            "ok": True,
+            "scores": {candidate: (0.95 if candidate == "男装" else 0.05) for candidate in kwargs["candidates"]},
+        }
+    )
+
+    result = resolver.resolve(session, target, focus, context_confidence=0.9)
+
+    assert result.action == "REVISE_CURRENT"
+    assert result.replacement == "男装"
+    assert "context_homophone:南庄->男装" in result.evidence
+
+
+def test_direct_context_revision_survives_ledger_replay_for_repeated_span(tmp_path):
+    from asr_agent.context_judge import ContextJudgment
+    from asr_agent.retrace import ReTraceService
+
+    audio_path = tmp_path / "turn.wav"
+    audio_path.touch()
+    service = ReTraceService(
+        tmp_path,
+        context_judge=lambda **_: ContextJudgment("CONFLICT", 0.9),
+        audio_verifier=lambda **_: {"ok": True, "scores": {"南庄": 0.0, "男装": 1.0}},
+    )
+    service.process_turn("s", "t1", "男装女装商场", source="text")
+    result = service.process_turn(
+        "s", "t2", "我这南庄那说两句啊呃，南庄啊那个。", source="text",
+        meta={"audio_path": str(audio_path), "start_sec": 0, "end_sec": 2},
+    )
+
+    assert result["session"]["turns"][1]["current_text"] == "我这男装那说两句啊呃，男装啊那个。"
+    revision = next(event for event in result["revisions"] if event["action"] == "REVISE_CURRENT")
+    assert "candidate_source:history_homophone" in revision["evidence"]
+
+
+def test_direct_context_revision_keeps_text_without_audio_evidence(tmp_path):
+    from asr_agent.context_judge import ContextJudgment
+    from asr_agent.retrace import ReTraceService
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=lambda **_: ContextJudgment("CONFLICT", 0.99),
+    )
+    service.process_turn("s", "t1", "男装女装商场", source="text")
+    result = service.process_turn("s", "t2", "我这南庄那说两句。", source="text")
+
+    assert result["session"]["turns"][1]["current_text"] == "我这南庄那说两句。"
+
+
+def test_direct_context_revision_keeps_text_for_ambiguous_audio(tmp_path):
+    from asr_agent.context_judge import ContextJudgment
+    from asr_agent.retrace import ReTraceService
+
+    audio_path = tmp_path / "turn.wav"
+    audio_path.touch()
+    service = ReTraceService(
+        tmp_path,
+        context_judge=lambda **_: ContextJudgment("CONFLICT", 0.99),
+        audio_verifier=lambda **_: {"ok": True, "scores": {"南庄": 0.52, "男装": 0.48}},
+    )
+    service.process_turn("s", "t1", "男装女装商场", source="text")
+    result = service.process_turn(
+        "s", "t2", "我这南庄那说两句。", source="text",
+        meta={"audio_path": str(audio_path), "start_sec": 0, "end_sec": 2},
+    )
+
+    assert result["session"]["turns"][1]["current_text"] == "我这南庄那说两句。"
+
+
+def test_uncertain_acoustic_signal_can_commit_unique_context_homophone(tmp_path):
+    from asr_agent.context_judge import ContextJudgment
+    from asr_agent.retrace import ReTraceService
+
+    audio_path = tmp_path / "turn.wav"
+    audio_path.touch()
+    service = ReTraceService(
+        tmp_path,
+        context_judge=lambda **_: ContextJudgment("UNCERTAIN", 0.55),
+        audio_verifier=lambda **_: {"ok": True, "scores": {"南庄": 0.0, "男装": 1.0}},
+    )
+    service.process_turn("s", "t1", "男装女装商场", source="text")
+    result = service.process_turn(
+        "s", "t2", "我这南庄那说两句。", source="text",
+        meta={
+            "audio_path": str(audio_path),
+            "start_sec": 0,
+            "end_sec": 2,
+            "uncertainty": {"acoustic_disagreement": [{"span_a": "南庄", "span_b": "男装"}]},
+        },
+    )
+
+    assert result["session"]["turns"][1]["current_text"] == "我这男装那说两句。"
+
+
+def test_semantic_open_candidate_without_independent_acoustic_signal_is_deferred(tmp_path):
+    from asr_agent.context_judge import FocusProposal
+    from asr_agent.resolver import EvidenceResolver
+    from asr_agent.models import Session, Turn
+
+    audio_path = tmp_path / "turn.wav"
+    audio_path.touch()
+    target = Turn(
+        "t1",
+        "这个绿植被品包括。",
+        "这个绿植被品包括。",
+        meta={"audio_path": str(audio_path), "start_sec": 0, "end_sec": 2},
+    )
+    focus = FocusProposal(
+        target_turn_id="t1",
+        span="绿植被品",
+        proposed_text="绿植品种",
+        alternatives=["绿植被品", "绿植品种"],
+        evidence_turn_ids=["t1"],
+        source="semantic_open",
+    )
+    resolver = EvidenceResolver(
+        audio_verifier=lambda **_: {"ok": True, "scores": {"绿植被品": 0.05, "绿植品种": 0.95, "[DELETE]": 0.0}},
+    )
+
+    result = resolver.resolve(
+        Session("s", turns=[target]),
+        target,
+        focus,
+        context_confidence=0.95,
+    )
+
+    assert result.action == "DEFER"
+    assert "independent acoustic" in result.rationale
+
+
+def test_acoustic_focus_keeps_current_turn_as_evidence():
+    from asr_agent.retrace import ReTraceService
+
+    turn = Turn(
+        "t1",
+        "我这南庄那说两句。",
+        "我这南庄那说两句。",
+        meta={"uncertainty": {"acoustic_disagreement": [{"span_a": "南庄", "span_b": "男装"}]}},
+    )
+
+    focus = ReTraceService._acoustic_focus(turn)
+
+    assert focus[0].target_turn_id == "t1"
+    assert focus[0].evidence_turn_ids == ["t1"]
+
+
 def test_acoustic_support_is_one_when_span_falls_in_disagreement_region():
     """A focused span inside an acoustic-disagreement region (where two ASRs
     disagreed) gets acoustic_support=1.0 — the audio is genuinely ambiguous

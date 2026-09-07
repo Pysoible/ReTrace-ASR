@@ -8,7 +8,7 @@ import time
 from difflib import SequenceMatcher
 from typing import Any
 
-from asr_agent.context_judge import ContextJudgment, ExplicitSignalFallbackJudge, normalize_judgment
+from asr_agent.context_judge import ContextJudgment, ExplicitSignalFallbackJudge, FocusProposal, normalize_judgment
 from asr_agent.integrations.domainterms import domainterms_root, ensure_importable
 from asr_agent.integrations.audio_verifier import retranscribe_window
 from asr_agent.memory import MemoryPacket
@@ -61,6 +61,9 @@ _CONTEXT_JUDGE_SYSTEM = (
     "视为后文证据，并优先审计更早的历史 turn。若历史 turn 有具体的语义冲突、领域实体候选或声学"
     "线索，focus 的 target_turn_id 必须指向更早的 turn，evidence_turn_ids 必须包含当前或更晚的证据 turn；"
     "不要把同一疑点重新指向当前 turn。"
+    "user 消息里的 homophone_candidates 只是从历史 ASR 文本提取的同音候选，不代表正确答案，也不按出现次数决定。"
+    "你必须先判断 current_turn 是否符合完整上下文；只有当前词语语义突兀、而某个同音候选明显更符合当前主题和句法时，"
+    "才输出 CONFLICT 或 UNCERTAIN 以及 focus。候选仍必须交给后续局部音频验证，不能仅凭同音或历史出现直接修改。"
     "对于普通口语短语（例如‘过冬’、‘共都’这类局部词），优先依据当前句子的直接语义和相邻词判断，"
     "不要强行替换成领域专有名词；只有候选在完整句子中更自然且音频验证支持时才提出该候选。"
     "user 消息里的 acoustic_disagreement 是声学层面的独立信号：它列出了第二个独立 ASR 与首遍转写"
@@ -179,6 +182,87 @@ def _canonical_entities(memory: MemoryPacket) -> list[dict[str, object]]:
     ]
 
 
+def _homophone_candidates(session: Session, current_turn: Turn, limit: int = 64) -> list[dict[str, Any]]:
+    """Provide same-pronunciation history candidates to the semantic judge."""
+    try:
+        from pypinyin import lazy_pinyin
+    except ImportError:
+        return []
+    current = re.sub(r"^\[\d+(?:\.\d+)?[-~]\d+(?:\.\d+)?\]\s*", "", current_turn.current_text or current_turn.raw_text)
+    historical_turns = [
+        (
+            turn.turn_id,
+            re.sub(r"^\[\d+(?:\.\d+)?[-~]\d+(?:\.\d+)?\]\s*", "", turn.current_text or turn.raw_text),
+        )
+        for turn in session.turns
+        if turn.turn_id != current_turn.turn_id
+    ]
+    candidates: dict[tuple[str, str], dict[str, Any]] = {}
+    for width in range(2, 5):
+        for index in range(len(current) - width + 1):
+            span = current[index:index + width]
+            if not all("\u4e00" <= char <= "\u9fff" for char in span):
+                continue
+            pronunciation = tuple(lazy_pinyin(span))
+            for turn_id, historical in historical_turns:
+                for candidate_index in range(len(historical) - width + 1):
+                    candidate = historical[candidate_index:candidate_index + width]
+                    if candidate != span and all("\u4e00" <= char <= "\u9fff" for char in candidate) and tuple(lazy_pinyin(candidate)) == pronunciation:
+                        key = (span, candidate)
+                        item = candidates.setdefault(
+                            key,
+                            {"span": span, "candidate": candidate, "evidence_turn_ids": []},
+                        )
+                        if turn_id not in item["evidence_turn_ids"]:
+                            item["evidence_turn_ids"].append(turn_id)
+    return list(candidates.values())[:limit]
+
+
+def _resolve_homophone_focus(
+    session: Session,
+    current_turn: Turn,
+    candidates: list[dict[str, str]],
+) -> Any:
+    """Ask the semantic judge to choose a concrete candidate after a conflict.
+
+    The first judgment is intentionally broad. When it detects a conflict but
+    omits focus, this narrow follow-up prevents a valid conflict from becoming a
+    no-op while keeping candidate selection semantic rather than frequency-based.
+    """
+    if not candidates or not _api_key():
+        return None
+    payload = {
+        "current_turn": {
+            "turn_id": current_turn.turn_id,
+            "text": current_turn.current_text or current_turn.raw_text,
+        },
+        "homophone_candidates": candidates,
+        "instruction": (
+            "当前文本与上下文已判定存在冲突。请逐个判断候选是否符合完整上下文和句法。"
+            "如果某个候选明显更合理，只能从 homophone_candidates 中选一个，输出合法 JSON："
+            "{\"outcome\":\"CONFLICT\",\"confidence\":0-1,\"focus\":[{"
+            "\"target_turn_id\":\"当前 turn_id\",\"span\":\"原文 span\","
+            "\"proposed_text\":\"候选 candidate\",\"alternatives\":[\"原文 span\",\"候选 candidate\"],"
+            "\"evidence_turn_ids\":[\"支持候选的历史 turn_id\"],"
+            "\"relationship\":\"MUTUALLY_EXCLUSIVE\",\"rationale\":\"语境理由\"}]}。"
+            "如果没有候选明显符合，focus 必须为空。不要使用候选出现次数作为理由。"
+        ),
+    }
+    try:
+        result = _chat_json([
+            {"role": "system", "content": _CONTEXT_JUDGE_SYSTEM},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ], max_tokens=int(os.getenv("ASR_HOMOPHONE_JUDGE_MAX_TOKENS", "500")))
+        if isinstance(result, str):
+            result = _extract_json(result)
+        if isinstance(result, dict):
+            _fill_judgment_confidence(result)
+            return normalize_judgment(result, session)
+    except Exception:
+        return None
+    return None
+
+
 def _session_history_digest(session: Session, *, chars_per_turn: int = 120) -> list[dict[str, str]]:
     """Expose the whole session cheaply enough for long-audio auditing."""
     digest: list[dict[str, str]] = []
@@ -237,6 +321,7 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
         "long_term_beliefs": [item.as_dict() for item in memory.long_term_beliefs[-12:]],
         "domain_entities": _domain_entities(memory),
         "canonical_entities": _canonical_entities(memory),
+        "homophone_candidates": _homophone_candidates(session, current_turn),
         # Acoustic uncertainty: spans where a second independent ASR disagreed
         # with the first pass. These are strong candidates for mis-hearings.
         "acoustic_disagreement": acoustic_disagreement,
@@ -256,7 +341,68 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
         if not isinstance(result, dict):
             raise ValueError("context judge must return a JSON object")
         _fill_judgment_confidence(result)
-        return normalize_judgment(result, session)
+        judgment = normalize_judgment(result, session)
+        if not judgment.focus:
+            open_candidates = result.get("candidates") or result.get("candidate_pool") or []
+            open_focus = []
+            for candidate in open_candidates if isinstance(open_candidates, list) else []:
+                if not isinstance(candidate, dict):
+                    continue
+                span = str(candidate.get("span") or candidate.get("source_span") or "").strip()
+                proposed = str(candidate.get("candidate") or candidate.get("proposed_text") or "").strip()
+                target_turn_id = str(candidate.get("target_turn_id") or current_turn.turn_id)
+                evidence_turn_ids = [
+                    str(turn_id)
+                    for turn_id in (candidate.get("evidence_turn_ids") or [target_turn_id])
+                    if str(turn_id)
+                ]
+                if not span or not proposed or not any(
+                    turn.turn_id == target_turn_id
+                    and (span in turn.raw_text or span in turn.current_text)
+                    for turn in session.turns
+                ):
+                    continue
+                open_focus.append({
+                    "target_turn_id": target_turn_id,
+                    "span": span,
+                    "proposed_text": proposed,
+                    "alternatives": list(dict.fromkeys([span, proposed, *(candidate.get("alternatives") or [])])),
+                    "evidence_turn_ids": evidence_turn_ids,
+                    "rationale": candidate.get("rationale") or "semantic-open candidate",
+                    "relationship": candidate.get("relationship") or "MUTUALLY_EXCLUSIVE",
+                    "source": candidate.get("source") or "semantic_open",
+                })
+            if open_focus:
+                judgment = normalize_judgment({**result, "focus": open_focus}, session)
+        if judgment.outcome in {"CONFLICT", "UNCERTAIN"} and not judgment.focus:
+            homophone_candidates = payload.get("homophone_candidates") or []
+            focused = _resolve_homophone_focus(
+                session,
+                current_turn,
+                homophone_candidates,
+            )
+            if focused is not None and focused.focus:
+                return focused
+            if judgment.outcome == "CONFLICT" and len(homophone_candidates) == 1:
+                candidate = homophone_candidates[0]
+                return ContextJudgment(
+                    "CONFLICT",
+                    confidence=judgment.confidence,
+                    rationale="context conflict with one same-pronunciation candidate; local audio verification required",
+                    focus=[FocusProposal(
+                        target_turn_id=current_turn.turn_id,
+                        span=candidate["span"],
+                        proposed_text=candidate["candidate"],
+                        alternatives=[candidate["span"], candidate["candidate"]],
+                        evidence_turn_ids=[
+                            turn_id for turn_id in candidate.get("evidence_turn_ids", [])
+                            if any(turn.turn_id == turn_id for turn in session.turns)
+                        ] or [current_turn.turn_id],
+                        rationale="the only same-pronunciation candidate must be checked against local audio",
+                        source="history_homophone",
+                    )],
+                )
+        return judgment
     except Exception as exc:
         # A transport/model outage is not fixed by sending the same large
         # request again. Avoid doubling latency for every chunk in a long file.

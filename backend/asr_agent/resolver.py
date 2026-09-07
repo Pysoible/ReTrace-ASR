@@ -106,6 +106,15 @@ class EvidenceResolver:
         return difflib.SequenceMatcher(None, span, replacement).ratio() >= 0.5
 
     @staticmethod
+    def _is_same_pronunciation(left: str, right: str) -> bool:
+        try:
+            from pypinyin import lazy_pinyin
+        except ImportError:
+            return False
+        left, right = left.strip(), right.strip()
+        return bool(left and right and lazy_pinyin(left) == lazy_pinyin(right))
+
+    @staticmethod
     def _acoustic_support(target: Turn, span: str) -> float:
         """1.0 when ``span`` falls inside an acoustic-disagreement region.
 
@@ -209,7 +218,19 @@ class EvidenceResolver:
                 rationale=focus.rationale or "the fact changed over time",
             )
         acoustic_supported = self._acoustic_support(target, focus.span) > 0.0
-        if not self._is_safe_local_replacement(focus.span, focus.proposed_text, operation) and not acoustic_supported:
+        homophone_candidate = operation == "REPLACE" and self._is_same_pronunciation(focus.span, focus.proposed_text)
+        if operation == "REPLACE" and focus.source == "semantic_open" and not acoustic_supported:
+            return Resolution(
+                "DEFER",
+                target.turn_id,
+                focus.span,
+                rationale="semantic-open candidate requires independent acoustic support before revision",
+            )
+        if (
+            not self._is_safe_local_replacement(focus.span, focus.proposed_text, operation)
+            and not acoustic_supported
+            and not homophone_candidate
+        ):
             return Resolution(
                 "DEFER",
                 target.turn_id,
@@ -354,6 +375,8 @@ class EvidenceResolver:
         evidence.append(f"audio:{audio_path}:{start_sec}-{end_sec}")
         if acoustic_support:
             evidence.append(f"acoustic_disagreement:{focus.span}")
+        if homophone_candidate:
+            evidence.append(f"context_homophone:{focus.span}->{focus.proposed_text}")
         return Resolution(
             action,
             target.turn_id,

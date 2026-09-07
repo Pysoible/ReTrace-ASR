@@ -56,6 +56,7 @@ class FocusProposal:
     rationale: str = ""
     relationship: str = "MUTUALLY_EXCLUSIVE"
     operation: str = "REPLACE"
+    source: str = "legacy"
 
 
 @dataclass
@@ -119,6 +120,7 @@ def _focus_from_raw(item: Any) -> FocusProposal:
         evidence_turn_ids = item.get("evidence") or item.get("supporting_turn_ids")
     relationship = item.get("relationship") or item.get("relation") or "MUTUALLY_EXCLUSIVE"
     operation = str(item.get("operation") or item.get("action") or "REPLACE").upper()
+    source = str(item.get("source") or "legacy")
     if operation == "DELETE":
         proposed = ""
     return FocusProposal(
@@ -130,6 +132,7 @@ def _focus_from_raw(item: Any) -> FocusProposal:
         rationale=str(item.get("rationale") or ""),
         relationship=str(relationship),
         operation=operation,
+        source=source,
     )
 
 

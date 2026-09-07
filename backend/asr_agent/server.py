@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import queue
 import re
 import threading
@@ -86,6 +87,71 @@ def _audio_session_id(audio_path: str, requested: str | None = None) -> str:
     stem = Path(name).stem or "audio"
     safe = re.sub(r"[^A-Za-z0-9_\u4e00-\u9fff-]+", "_", stem).strip("_") or "audio"
     return f"audio_{safe[:96]}"
+
+
+def _groundtruth_roots(root: Path) -> list[Path]:
+    """Return local reference roots, including the sibling AMI dataset."""
+    return [root, root.parent, root.parent.parent]
+
+
+def _groundtruth_hints(session_id: str, turns: list[dict[str, Any]]) -> set[str]:
+    hints = {Path(str((turn.get("meta") or {}).get("audio_path") or "")).stem.lower() for turn in turns}
+    hints.discard("")
+    hints.add(session_id.lower())
+    hints.update(
+        hint.split("_", 1)[1]
+        for hint in list(hints)
+        if re.match(r"^[0-9a-f]{16,}_", hint)
+    )
+    return hints
+
+
+def _groundtruth_audio_stems(turns: list[dict[str, Any]]) -> set[str]:
+    stems: set[str] = set()
+    for turn in turns:
+        audio_path = str((turn.get("meta") or {}).get("audio_path") or "")
+        if not audio_path:
+            continue
+        stem = Path(audio_path).stem.lower()
+        stems.add(stem)
+        if re.match(r"^[0-9a-f]{16,}_", stem):
+            stems.add(stem.split("_", 1)[1])
+    return stems
+
+
+def _groundtruth_recording_hints(session_id: str, turns: list[dict[str, Any]]) -> set[str]:
+    hints = _groundtruth_hints(session_id, turns)
+    for hint in list(hints):
+        if "_" in hint:
+            hints.add(hint.split("_", 1)[0])
+    return {hint for hint in hints if hint}
+
+
+def _groundtruth_match_keys(value: str) -> set[str]:
+    value = value.lower().strip()
+    keys = {value}
+    # AliMeeting references may be generated for a different clip duration,
+    # e.g. R0015_M0135_3min.ref.json for a R0015_M0135_5min.wav upload.
+    keys.update(re.sub(r"_(?:\d+(?:\.\d+)?)(?:min|sec|s)$", "", value) for _ in [0])
+    return {key for key in keys if key}
+
+
+def _parse_stm_reference(path: Path) -> list[dict[str, Any]]:
+    utterances = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) < 6:
+            continue
+        text = re.sub(r"<sil>", "", fields[5], flags=re.IGNORECASE).strip()
+        if not text or text in {"<ignore_time_segment_in_scoring>", "[*]", "[+]"}:
+            continue
+        utterances.append({
+            "start": float(fields[3]),
+            "end": float(fields[4]),
+            "spk": fields[2],
+            "text": text,
+        })
+    return utterances
 
 
 # --- Streaming audio-session events (Server-Sent Events) -------------------
@@ -251,7 +317,14 @@ def create_app(
 
         uncertainties = list(asr.get("uncertainties") or [])
         nbest_by_chunk = list(asr.get("nbest") or [])
+        routed_by_chunk: dict[int, list[dict[str, Any]]] = {}
+        for item in asr.get("routed_speaker_segments") or []:
+            try:
+                routed_by_chunk.setdefault(int(item.get("chunk_index", -1)), []).append(item)
+            except (TypeError, ValueError):
+                continue
         revisions: list[dict[str, Any]] = []
+        processed_turn_ids: list[str] = []
         for index, text in enumerate(parts):
             turn_id = f"t{index + 1:03d}"
             chunk = chunk_meta[index] if index < len(chunk_meta) else {}
@@ -260,8 +333,8 @@ def create_app(
             start = chunk.get("start_sec")
             end = chunk.get("end_sec")
             display = text.strip()
-            if start is not None and end is not None and display:
-                display = f"[{float(start):.1f}-{float(end):.1f}] {display}"
+            if not display:
+                continue
             try:
                 result = service.process_turn(
                     bound_session,
@@ -277,18 +350,24 @@ def create_app(
                         "start_sec": start,
                         "end_sec": end,
                         "uncertainty": uncertainty,
+                        "speaker_segments": uncertainty.get("speaker_segments") or [],
+                        "speakers": chunk.get("speakers") or [],
+                        "overlap": bool(chunk.get("overlap")),
+                        "routing": chunk.get("routing"),
+                        "routed_speaker_segments": routed_by_chunk.get(index, []),
                     },
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+            processed_turn_ids.append(turn_id)
             revisions.extend(result.get("revisions") or [])
 
         # The batch path has the complete session available. One bounded final
         # audit exposes later evidence without running another ASR pass.
-        if parts:
+        if processed_turn_ids:
             final_audit = service.analyze_turn(
                 bound_session,
-                f"t{len(parts):03d}",
+            processed_turn_ids[-1],
                 session_complete=True,
             )
             revisions.extend(final_audit.get("revisions") or [])
@@ -298,7 +377,7 @@ def create_app(
             "session": service.get_session(bound_session),
             "revisions": revisions,
             "asr": asr,
-            "turn_count": len(parts),
+            "turn_count": len(processed_turn_ids),
             "mode": mode,
         }
         return out
@@ -313,6 +392,7 @@ def create_app(
             session_id,
             audio_path=audio_path,
             asr=asr,
+            source="moss" if asr.get("backend") == "moss-transcribe-diarize" else "qwen-omni",
         )
 
     def _stream_audio_session_background(
@@ -347,8 +427,6 @@ def create_app(
             start = chunk.get("start_sec")
             end = chunk.get("end_sec")
             display = (text or "").strip()
-            if start is not None and end is not None and display:
-                display = f"[{float(start):.1f}-{float(end):.1f}] {display}"
             if not display:
                 _publish(bound_session, {"type": "turn", "index": index, "turn_id": turn_id, "text": "", "session": service.get_session(bound_session)})
                 return
@@ -367,6 +445,11 @@ def create_app(
                         "start_sec": start,
                         "end_sec": end,
                         "uncertainty": uncertainty,
+                        "speaker_segments": uncertainty.get("speaker_segments") or [],
+                        "routed_speaker_segments": uncertainty.get("routed_speaker_segments") or [],
+                        "speakers": chunk.get("speakers") or [],
+                        "overlap": bool(chunk.get("overlap")),
+                        "routing": chunk.get("routing"),
                     },
                 )
             except Exception as exc:
@@ -399,6 +482,21 @@ def create_app(
         try:
             summary = stream_transcribe_audio(audio_path, _on_chunk)
             _publish(bound_session, {"type": "asr_done", "chunk_count": summary.get("chunk_count"), "duration_sec": summary.get("duration_sec")})
+            from asr_agent.integrations.qwen_asr import _infer_speaker_segments, _truthy, parse_rttm, read_asr_config
+            if summary.get("rttm") and _truthy(os.getenv("ASR_STREAM_SPEAKER_ROUTING", "0")):
+                _publish(bound_session, {"type": "speaker_asr_started", "session": service.get_session(bound_session)})
+                processor.finish()
+                worker.join(timeout=120)
+                intervals = parse_rttm(Path(summary["rttm"]))
+                routed = _infer_speaker_segments(Path(audio_path), intervals, read_asr_config())
+                for index, turn in enumerate(service.get_session(bound_session).get("turns") or []):
+                    start = float((turn.get("meta") or {}).get("start_sec") or 0)
+                    end = float((turn.get("meta") or {}).get("end_sec") or 0)
+                    segments = [item for item in routed if start <= item["start_sec"] < end]
+                    if segments:
+                        service.update_turn_metadata(bound_session, str(turn["turn_id"]), {"routed_speaker_segments": segments})
+                        _publish(bound_session, {"type": "speaker_update", "turn_id": turn["turn_id"], "session": service.get_session(bound_session)})
+                    _publish(bound_session, {"type": "speaker_asr_finished", "session": service.get_session(bound_session)})
         except Exception as exc:
             _publish(bound_session, {"type": "error", "message": f"音频转写失败: {exc}"})
         finally:
@@ -485,6 +583,84 @@ def create_app(
     @app.get("/api/sessions/{session_id}")
     def get_session(session_id: str) -> dict[str, Any]:
         return {"session": service.get_session(session_id)}
+
+    @app.get("/api/sessions/{session_id}/groundtruth")
+    def get_groundtruth(session_id: str) -> dict[str, Any]:
+        """Return time-aligned reference utterances for frontend inspection."""
+        current = service.get_session(session_id)
+        turns = current.get("turns") or []
+        hints = _groundtruth_hints(session_id, turns)
+        audio_stems = _groundtruth_audio_stems(turns)
+        recording_hints = _groundtruth_recording_hints(session_id, turns)
+        hint_keys = {key for hint in hints | recording_hints for key in _groundtruth_match_keys(hint)}
+        candidates = [
+            path
+            for base in _groundtruth_roots(root)
+            for directory in (base / "alimeeting_eval", base / "retrace_state" / "alimeeting_eval")
+            if directory.is_dir()
+            for path in directory.glob("*.ref.json")
+        ]
+        ai_shell_reference_dirs = [
+            Path(os.getenv("ASR_AISHELL4_REFERENCE_DIR", "")) if os.getenv("ASR_AISHELL4_REFERENCE_DIR") else None,
+            Path("/home/ma-user/work/dataset/sjk_data/sdr_data/AI-SHELL-4/test/textgrid2txt"),
+        ]
+        candidates.extend(
+            path
+            for directory in ai_shell_reference_dirs
+            if directory is not None and directory.is_dir()
+            for path in directory.glob("*.txt")
+            if path.is_file()
+        )
+        exact_audio_candidates = [
+            path for path in sorted(set(candidates))
+            if path.stem.lower() in audio_stems
+        ]
+        reference_path = exact_audio_candidates[0] if exact_audio_candidates else next(
+            (path for path in sorted(set(candidates)) if any(
+                path.stem.lower() in hint or hint in path.stem.lower() for hint in hint_keys
+            )),
+            None,
+        )
+        if reference_path is not None:
+            try:
+                payload = json.loads(reference_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = None
+            utterances = payload.get("utterances") if isinstance(payload, dict) else None
+            if isinstance(utterances, list):
+                return {"available": True, "source": str(reference_path), "source_type": "AliMeeting_JSON", "stem": payload.get("stem"), "utterances": utterances}
+
+        if reference_path is not None and reference_path.suffix.lower() == ".txt":
+            utterances = []
+            for line in reference_path.read_text(encoding="utf-8").splitlines():
+                fields = line.split("\t", 3)
+                if len(fields) < 4:
+                    continue
+                try:
+                    start, end = float(fields[0]), float(fields[1])
+                except ValueError:
+                    continue
+                text = re.sub(r"<[^>]+>", "", fields[3]).strip()
+                if text:
+                    utterances.append({"start": start, "end": end, "spk": fields[2], "text": text})
+            return {"available": True, "source": str(reference_path), "source_type": "AI-SHELL-4_TextGrid", "stem": reference_path.stem, "utterances": utterances}
+
+        stm_candidates = [
+            path
+            for base in _groundtruth_roots(root)
+            for path in (base / "AMI" / "STM").glob("*.stm")
+            if path.is_file()
+        ]
+        stm_path = next((path for path in sorted(set(stm_candidates)) if path.stem.lower() in hint_keys), None)
+        if stm_path is None:
+            return {"available": False, "source": None, "utterances": []}
+        return {
+            "available": True,
+            "source": str(stm_path),
+            "source_type": "AMI_STM",
+            "stem": stm_path.stem,
+            "utterances": _parse_stm_reference(stm_path),
+        }
 
     frontend = Path(__file__).parents[2] / "frontend" / "dist"
     if frontend.exists():

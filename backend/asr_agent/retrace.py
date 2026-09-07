@@ -1,6 +1,7 @@
 """Agent-first orchestration for realtime, revisable ASR sessions."""
 from __future__ import annotations
 
+import os
 import json
 import os
 import re
@@ -213,7 +214,7 @@ class ReTraceService:
                 except Exception as exc:
                     judgment = ContextJudgment("UNCERTAIN", rationale=f"context judge unavailable: {exc}")
 
-            if not judgment.focus:
+            if not judgment.focus and judgment.outcome != "CONFLICT":
                 acoustic_focus = self._acoustic_focus(trigger)
                 if acoustic_focus:
                     judgment = ContextJudgment(
@@ -224,8 +225,80 @@ class ReTraceService:
                         beliefs=judgment.beliefs,
                     )
 
+            direct_context_event = None
+            trigger_uncertainty = trigger.meta.get("uncertainty") or {}
+            has_acoustic_disagreement = bool(trigger_uncertainty.get("acoustic_disagreement"))
+            if judgment.outcome == "CONFLICT" or (judgment.outcome == "UNCERTAIN" and has_acoustic_disagreement):
+                try:
+                    from asr_agent.integrations.deepseek import _homophone_candidates
+
+                    candidates = _homophone_candidates(snapshot, trigger)
+                    by_span: dict[str, list[dict[str, str]]] = {}
+                    for candidate in candidates:
+                        by_span.setdefault(candidate["span"], []).append(candidate)
+                    body = trigger.current_text or trigger.raw_text
+                    for span, matches in by_span.items():
+                        matches = [
+                            match for match in matches
+                            if not any(particle in match["candidate"] for particle in ("啊", "呀", "吧", "呢", "啦"))
+                        ]
+                        if len(matches) != 1 or span not in body:
+                            continue
+                        replacement = matches[0]["candidate"]
+                        meta = trigger.meta or {}
+                        audio_path = meta.get("audio_path")
+                        start_sec, end_sec = meta.get("start_sec"), meta.get("end_sec")
+                        if not audio_path or start_sec is None or end_sec is None:
+                            continue
+                        try:
+                            audio = self.resolver.audio_verifier(
+                                audio_path=str(audio_path),
+                                start_sec=float(start_sec),
+                                end_sec=float(end_sec),
+                                candidates=[span, replacement],
+                            )
+                            scores = audio.get("scores") if isinstance(audio, dict) and audio.get("ok") else None
+                            if not isinstance(scores, dict) or set(scores) != {span, replacement}:
+                                continue
+                            ordered = sorted(
+                                ((key, max(0.0, float(value))) for key, value in scores.items()),
+                                key=lambda item: item[1],
+                                reverse=True,
+                            )
+                            if ordered[0][0] != replacement or ordered[0][1] < 0.85:
+                                continue
+                            if ordered[0][1] - ordered[1][1] < 0.30:
+                                continue
+                        except (TypeError, ValueError, OSError):
+                            continue
+                        after_text = body.replace(span, replacement)
+                        direct_context_event = RevisionEvent(
+                            event_id=self._event_id(snapshot.session_id, trigger.turn_id, observed_version, "REVISE_CURRENT", "direct-context"),
+                            action="REVISE_CURRENT",
+                            target_turn_id=trigger.turn_id,
+                            source_turn_id=trigger.turn_id,
+                            span="",
+                            before_text=body,
+                            after_text=after_text,
+                            entity_id=None,
+                            score=judgment.confidence,
+                            evidence=[
+                                "candidate_source:history_homophone",
+                                *[f"evidence_turn:{turn_id}" for turn_id in matches[0].get("evidence_turn_ids", [])],
+                                f"context_homophone:{span}->{replacement}",
+                                f"audio_verified:{ordered[0][1]:.3f}/{ordered[1][1]:.3f}",
+                            ],
+                            resolver="direct-context-correction",
+                            rationale="context conflict and decisive closed-set local audio verification",
+                            replacement="",
+                        )
+                        trigger.current_text = after_text
+                        break
+                except Exception:
+                    direct_context_event = None
+
             self._apply_beliefs(snapshot, judgment.beliefs)
-            events: list[RevisionEvent] = [recovery_event] if recovery_event is not None else []
+            events: list[RevisionEvent] = [event for event in (recovery_event, direct_context_event) if event is not None]
             # Open-vocabulary relisten fallback: when the judge is uncertain (or
             # conflicted) but could not point at a specific span, go back to the
             # audio and re-transcribe the window. This catches garbled proper
@@ -322,7 +395,11 @@ class ReTraceService:
                             after_text=after_text,
                             entity_id=None,
                             score=resolution.score,
-                            evidence=resolution.evidence,
+                            evidence=[
+                                f"candidate_source:{focus.source}",
+                                *[f"evidence_turn:{turn_id}" for turn_id in focus.evidence_turn_ids],
+                                *resolution.evidence,
+                            ],
                             resolver="agent-context-audio",
                             rationale=resolution.rationale,
                             replacement=resolution.replacement,
@@ -433,6 +510,61 @@ class ReTraceService:
                 alternatives=[span, proposed],
                 evidence_turn_ids=[turn.turn_id],
                 rationale="independent ASR transcripts disagree on this span",
+                source="acoustic_diff",
+            ))
+            if len(focus) >= 3:
+                break
+        return focus
+
+    @staticmethod
+    def _context_homophone_focus(session: Session, turn: Turn) -> list[FocusProposal]:
+        """Find repeated in-session Chinese homophones as verification candidates.
+
+        This is candidate discovery only: the replacement is still decided by
+        the resolver's local closed-set audio verification. Requiring a repeated
+        historical phrase prevents arbitrary dictionary-style rewrites.
+        """
+        try:
+            from pypinyin import lazy_pinyin
+        except ImportError:
+            return []
+        current = re.sub(r"^\[\d+(?:\.\d+)?[-~]\d+(?:\.\d+)?\]\s*", "", turn.current_text or turn.raw_text)
+        current_spans = {
+            current[index:index + width]
+            for width in range(2, 5)
+            for index in range(len(current) - width + 1)
+            if all("\u4e00" <= char <= "\u9fff" for char in current[index:index + width])
+        }
+        occurrences: dict[str, list[str]] = {}
+        for historical in session.turns:
+            if historical.turn_id == turn.turn_id:
+                continue
+            text = re.sub(r"^\[\d+(?:\.\d+)?[-~]\d+(?:\.\d+)?\]\s*", "", historical.current_text or historical.raw_text)
+            for width in range(2, 5):
+                for index in range(len(text) - width + 1):
+                    candidate = text[index:index + width]
+                    if all("\u4e00" <= char <= "\u9fff" for char in candidate):
+                        occurrences.setdefault(candidate, []).append(historical.turn_id)
+        focus: list[FocusProposal] = []
+        for span in sorted(current_spans, key=lambda value: (len(value), value)):
+            span_pinyin = lazy_pinyin(span)
+            candidates = [
+                (candidate, ids)
+                for candidate, ids in occurrences.items()
+                if len(ids) >= 2
+                and candidate != span
+                and lazy_pinyin(candidate) == span_pinyin
+            ]
+            if not candidates:
+                continue
+            candidate, evidence_ids = max(candidates, key=lambda item: (len(item[1]), len(item[0])))
+            focus.append(FocusProposal(
+                target_turn_id=turn.turn_id,
+                span=span,
+                proposed_text=candidate,
+                alternatives=[span, candidate],
+                evidence_turn_ids=list(dict.fromkeys(evidence_ids)),
+                rationale="repeated session term is a same-pronunciation candidate; verify against local audio",
             ))
             if len(focus) >= 3:
                 break
@@ -458,6 +590,9 @@ class ReTraceService:
             "recovered": False,
         }
         if not assessment.degenerate:
+            return None, assessment
+        if set(assessment.reasons) == {"duration_mismatch"}:
+            meta["degeneration"]["error"] = "duration mismatch requires independent coverage evidence"
             return None, assessment
 
         audio_path = meta.get("audio_path")
@@ -671,6 +806,13 @@ class ReTraceService:
         # clearly recovers a degenerate first pass.
         raw_assessment = assess_transcript(raw_body)
         cand_assessment = assess_transcript(cand_body)
+        paraformer_keep = keep(paraformer_text)
+        coverage_supported = bool(
+            coverage_risk
+            and paraformer_keep
+            and len(paraformer_keep) > len(raw_keep)
+            and difflib.SequenceMatcher(None, cand_keep, paraformer_keep).ratio() >= 0.7
+        )
         hint_matches = [h for h in (hints or []) if h and h in cand_body]
         # Exception: when the second ASR itself flagged low-confidence characters
         # (char-level acoustic confidence), we have independent acoustic evidence
@@ -685,7 +827,12 @@ class ReTraceService:
         )
         adopt = (
             (recoverable_degeneration and not cand_assessment.degenerate)
-            or (coverage_risk and len(cand_keep) > len(raw_keep) and not cand_assessment.degenerate)
+            or (
+                coverage_risk
+                and coverage_supported
+                and len(cand_keep) > len(raw_keep)
+                and not cand_assessment.degenerate
+            )
         )
         if not adopt:
             meta["relisten_uncertain"] = {
@@ -695,6 +842,8 @@ class ReTraceService:
                 "rejected": (
                     "normal turn requires targeted focus for revision"
                     if not raw_assessment.degenerate and not coverage_risk
+                    else "coverage recovery lacks independent ASR support"
+                    if coverage_risk and not coverage_supported
                     else "relisten differs but recovers no supported content"
                 ),
             }
@@ -746,6 +895,7 @@ class ReTraceService:
             entity_id=None,
             score=max(0.0, min(1.0, 1.0 - ratio)),
             evidence=[
+                "candidate_source:relisten_open",
                 f"audio:{audio_path}:{start_sec}-{end_sec}",
                 "uncertainty:relisten",
                 *(["acoustic:coverage-risk"] if coverage_risk else []),
@@ -890,7 +1040,51 @@ class ReTraceService:
             meta=meta,
             memory_scope=memory_scope,
         )
+        fast_meta = {**(meta or {}), "confidence": confidence or {}, "text_candidates": text_candidates or {}}
+        if source == "moss" and self._can_fast_keep_turn(fast_meta):
+            committed = self.repository.update(
+                session_id,
+                lambda session: self._mark_fast_kept_turn(session, turn_id),
+            )
+            return {
+                "status": committed.analysis_status,
+                "decisions": [],
+                "revisions": [],
+                "judgment": {"outcome": "CONSISTENT", "confidence": 1.0, "rationale": "fast normal-turn path"},
+                "revalidated": False,
+                "session": committed.as_dict(),
+            }
         return self.analyze_turn(session_id, turn_id, observed_version=observed["observed_version"])
+
+    @staticmethod
+    def _can_fast_keep_turn(meta: dict[str, Any] | None) -> bool:
+        if os.getenv("ASR_FAST_NORMAL_TURNS", "1").strip().lower() in {"0", "false", "no", "off"}:
+            return False
+        uncertainty = (meta or {}).get("uncertainty") or {}
+        if (meta or {}).get("session_complete"):
+            return False
+        if (meta or {}).get("text_candidates") or (meta or {}).get("confidence"):
+            return False
+        if uncertainty.get("acoustic_disagreement") or uncertainty.get("low_conf_chars"):
+            return False
+        if uncertainty.get("acoustic_error") or (uncertainty.get("quality") or {}).get("suspect"):
+            return False
+        if (uncertainty.get("coverage") or {}).get("truncated"):
+            return False
+        return not bool((meta or {}).get("degeneration", {}).get("detected"))
+
+    @staticmethod
+    def _mark_fast_kept_turn(session: Session, turn_id: str) -> None:
+        session.analysis_status = "idle"
+        turn = next(turn for turn in session.turns if turn.turn_id == turn_id)
+        turn.meta["analyzed_observed_version"] = session.version
+        turn.meta["analyzed_session_version"] = session.version + 1
+        turn.meta["analysis_revalidated"] = False
+        turn.meta["context_judgment"] = {
+            "outcome": "CONSISTENT",
+            "confidence": 1.0,
+            "rationale": "fast normal-turn path",
+        }
 
     def _decision_state_for_session(self, session: Session) -> DecisionState:
         accepted_facts = []

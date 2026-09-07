@@ -38,6 +38,81 @@ def test_deepseek_context_judge_returns_validated_focus(monkeypatch):
     assert result.beliefs[0].subject == "实验室"
 
 
+def test_conflict_with_one_homophone_candidate_creates_focus(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(deepseek, "_chat_json", lambda *_, **__: {"outcome": "CONFLICT", "confidence": 0.9})
+    monkeypatch.setattr(
+        deepseek,
+        "_homophone_candidates",
+        lambda *_: [{"span": "南庄", "candidate": "男装", "evidence_turn_ids": ["t0"]}],
+    )
+    turn = Turn("t1", "我这南庄那说两句", "我这南庄那说两句")
+    result = deepseek.judge_context(
+        session=Session("s", turns=[Turn("t0", "男装女装", "男装女装"), turn]),
+        current_turn=turn,
+        memory=MemoryPacket(),
+    )
+
+    assert result.outcome == "CONFLICT"
+    assert result.focus[0].span == "南庄"
+    assert result.focus[0].proposed_text == "男装"
+    assert result.focus[0].evidence_turn_ids == ["t0"]
+    assert result.focus[0].source == "history_homophone"
+
+
+def test_homophone_candidates_keep_turn_boundaries_and_source_evidence():
+    current = Turn("t3", "我这南庄那说两句", "我这南庄那说两句")
+    session = Session(
+        "s",
+        turns=[
+            Turn("t1", "男", "男"),
+            Turn("t2", "装", "装"),
+            Turn("t3", current.raw_text, current.current_text),
+        ],
+    )
+
+    candidates = deepseek._homophone_candidates(session, current)
+
+    assert not any(item["candidate"] == "男装" for item in candidates)
+
+    session.turns[0].current_text = "男装女装"
+    candidates = deepseek._homophone_candidates(session, current)
+
+    match = next(item for item in candidates if item["span"] == "南庄" and item["candidate"] == "男装")
+    assert match["evidence_turn_ids"] == ["t1"]
+
+
+def test_judge_accepts_semantic_open_candidate_not_found_in_history(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(
+        deepseek,
+        "_chat_json",
+        lambda *_, **__: {
+            "outcome": "CONFLICT",
+            "confidence": 0.9,
+            "candidates": [{
+                "target_turn_id": "t1",
+                "span": "南庄",
+                "candidate": "男装",
+                "source": "semantic_open",
+                "evidence_turn_ids": ["t1"],
+                "rationale": "当前正在讨论服装部门",
+            }],
+        },
+    )
+    turn = Turn("t1", "我负责南庄部门", "我负责南庄部门")
+
+    result = deepseek.judge_context(
+        session=Session("s", turns=[turn]),
+        current_turn=turn,
+        memory=MemoryPacket(),
+    )
+
+    assert result.focus[0].span == "南庄"
+    assert result.focus[0].proposed_text == "男装"
+    assert result.focus[0].source == "semantic_open"
+
+
     def test_context_judgment_accepts_common_focus_field_aliases():
         session = Session("s", turns=[Turn("t1", "伊卡拉来了", "伊卡拉来了"), Turn("t2", "安拉在经文中", "安拉在经文中")])
         normalized = deepseek.normalize_judgment({
