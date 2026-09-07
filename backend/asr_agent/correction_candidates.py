@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from asr_agent.context_judge import FocusProposal
+from asr_agent.models import Session
 
 
 @dataclass
@@ -18,6 +19,8 @@ class CorrectionCandidate:
     audio_required: bool = True
     audio_start_sec: float | None = None
     audio_end_sec: float | None = None
+    relationship: str = "MUTUALLY_EXCLUSIVE"
+    operation: str = "REPLACE"
 
     def key(self) -> tuple[str, str, str]:
         return self.target_turn_id, self.span, self.candidate
@@ -40,6 +43,8 @@ def deduplicate_candidates(candidates: list[CorrectionCandidate]) -> list[Correc
                 audio_required=candidate.audio_required,
                 audio_start_sec=candidate.audio_start_sec,
                 audio_end_sec=candidate.audio_end_sec,
+                relationship=candidate.relationship,
+                operation=candidate.operation,
             )
             continue
         sources = list(dict.fromkeys([*existing.source.split("|"), *candidate.source.split("|")]))
@@ -54,6 +59,32 @@ def deduplicate_candidates(candidates: list[CorrectionCandidate]) -> list[Correc
     return list(merged.values())
 
 
+def focus_to_candidate(focus: FocusProposal, session: Session) -> CorrectionCandidate:
+    source = focus.source or "legacy"
+    if source == "legacy":
+        appears_in_history = any(
+            turn.turn_id != focus.target_turn_id
+            and (focus.proposed_text in turn.raw_text or focus.proposed_text in turn.current_text)
+            for turn in session.turns
+            if focus.proposed_text
+        )
+        source = "history_homophone" if appears_in_history else "semantic_open"
+    target = next((turn for turn in session.turns if turn.turn_id == focus.target_turn_id), None)
+    meta = target.meta if target is not None else {}
+    return CorrectionCandidate(
+        target_turn_id=focus.target_turn_id,
+        span=focus.span,
+        candidate=focus.proposed_text,
+        source=source,
+        evidence_turn_ids=list(focus.evidence_turn_ids),
+        rationale=focus.rationale,
+        audio_start_sec=meta.get("start_sec"),
+        audio_end_sec=meta.get("end_sec"),
+        relationship=focus.relationship,
+        operation=focus.operation,
+    )
+
+
 def candidate_to_focus(candidate: CorrectionCandidate) -> FocusProposal:
     return FocusProposal(
         target_turn_id=candidate.target_turn_id,
@@ -63,4 +94,6 @@ def candidate_to_focus(candidate: CorrectionCandidate) -> FocusProposal:
         evidence_turn_ids=list(candidate.evidence_turn_ids),
         rationale=candidate.rationale,
         source=candidate.source,
+        relationship=candidate.relationship,
+        operation=candidate.operation,
     )
