@@ -1058,7 +1058,7 @@ class ReTraceService:
 
     @staticmethod
     def _can_fast_keep_turn(meta: dict[str, Any] | None) -> bool:
-        if os.getenv("ASR_FAST_NORMAL_TURNS", "1").strip().lower() in {"0", "false", "no", "off"}:
+        if os.getenv("ASR_FAST_NORMAL_TURNS", "0").strip().lower() in {"0", "false", "no", "off"}:
             return False
         uncertainty = (meta or {}).get("uncertainty") or {}
         if (meta or {}).get("session_complete"):

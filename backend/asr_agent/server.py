@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
 import queue
@@ -249,7 +250,17 @@ def create_app(
 
     @app.get("/api/integrations/status")
     def integrations_status() -> dict[str, Any]:
-        return {"qwen_asr": asr_status(), "deepseek": deepseek_status()}
+        disabled = {"0", "false", "no", "off"}
+        return {
+            "qwen_asr": asr_status(),
+            "deepseek": deepseek_status(),
+            "retrace_policy": {
+                "fast_normal_turns": os.getenv("ASR_FAST_NORMAL_TURNS", "0").strip().lower() not in disabled,
+                "strict_revision": os.getenv("ASR_STRICT_REVISION", "1").strip().lower() not in disabled,
+                "acoustic_disagreement": os.getenv("ASR_ACOUSTIC_DISAGREEMENT", "1").strip().lower() not in disabled,
+                "homophone_discovery_available": importlib.util.find_spec("pypinyin") is not None,
+            },
+        }
 
     @app.post("/api/integrations/qwen/preload")
     def qwen_preload() -> dict[str, Any]:

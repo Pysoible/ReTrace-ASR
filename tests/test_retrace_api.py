@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 from pathlib import Path
 
+from asr_agent import server
 from asr_agent.server import create_app
 
 
@@ -23,6 +24,32 @@ def test_integrations_status_endpoint(tmp_path):
     body = response.json()
     assert "qwen_asr" in body
     assert "enabled" in body["qwen_asr"]
+    assert body["retrace_policy"] == {
+        "fast_normal_turns": False,
+        "strict_revision": True,
+        "acoustic_disagreement": True,
+        "homophone_discovery_available": True,
+    }
+
+
+def test_moss_backend_result_marks_audio_turn_source(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "transcribe_audio",
+        lambda _audio: {
+            "ok": True,
+            "backend": "moss-transcribe-diarize",
+            "chunks_text": ["测试文本"],
+            "chunks": [{"start_sec": 0.0, "end_sec": 1.0}],
+            "uncertainties": [{}],
+        },
+    )
+
+    with TestClient(create_app(tmp_path)) as client:
+        response = client.post("/api/sessions/s/audio", json={"audio": "/tmp/moss.wav"})
+
+    assert response.status_code == 200
+    assert response.json()["session"]["turns"][0]["source"] == "moss"
 
 
 def test_text_only_evidence_does_not_create_an_undoable_revision(tmp_path):
