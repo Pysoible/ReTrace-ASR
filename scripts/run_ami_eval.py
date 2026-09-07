@@ -398,7 +398,11 @@ def evaluate(
         multi_raw = cpwer(speaker_references, raw_speaker_hypotheses)
         multi_current = cpwer(speaker_references, current_speaker_hypotheses)
     events = [event for event in session.get("revision_events") or [] if event.get("active", True)]
-    revisions = [event for event in events if event.get("action") in {"REVISE_CURRENT", "REVISE_HISTORY", "REVISE_TEXT", "ROLLBACK"}]
+    revisions = [
+        event for event in events
+        if event.get("event_kind", "revision") == "revision"
+        and event.get("action") in {"REVISE_CURRENT", "REVISE_HISTORY", "REVISE_TEXT", "ROLLBACK"}
+    ]
     return {
         "result": str(result_path),
         "reference": str(stm_path),

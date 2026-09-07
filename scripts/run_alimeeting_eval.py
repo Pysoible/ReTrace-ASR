@@ -116,11 +116,11 @@ def evaluate_one(
             session = {}
 
     events = [e for e in (session.get("revision_events") or []) if e.get("active")]
-    audit_events = [e for e in events if e.get("event_kind") == "audit" or (not e.get("span") and e.get("resolver") == "context-judge")]
+    audit_events = [e for e in events if e.get("event_kind") in {"audit", "candidate_audit"} or (not e.get("span") and e.get("resolver") == "context-judge")]
     committed_events = [
         e for e in events
         if e.get("action") in {"REVISE_CURRENT", "REVISE_HISTORY", "ROLLBACK"}
-        and e.get("event_kind") != "audit"
+        and e.get("event_kind", "revision") == "revision"
     ]
     raw = _join_turns(session, "raw_text")
     cur = _join_turns(session, "current_text")

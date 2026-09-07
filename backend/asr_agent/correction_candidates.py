@@ -21,6 +21,7 @@ class CorrectionCandidate:
     audio_end_sec: float | None = None
     relationship: str = "MUTUALLY_EXCLUSIVE"
     operation: str = "REPLACE"
+    alternatives: list[str] = field(default_factory=list)
 
     def key(self) -> tuple[str, str, str]:
         return self.target_turn_id, self.span, self.candidate
@@ -45,6 +46,7 @@ def deduplicate_candidates(candidates: list[CorrectionCandidate]) -> list[Correc
                 audio_end_sec=candidate.audio_end_sec,
                 relationship=candidate.relationship,
                 operation=candidate.operation,
+                alternatives=list(dict.fromkeys(candidate.alternatives)),
             )
             continue
         sources = list(dict.fromkeys([*existing.source.split("|"), *candidate.source.split("|")]))
@@ -56,6 +58,7 @@ def deduplicate_candidates(candidates: list[CorrectionCandidate]) -> list[Correc
         existing.audio_required = existing.audio_required or candidate.audio_required
         existing.audio_start_sec = existing.audio_start_sec if existing.audio_start_sec is not None else candidate.audio_start_sec
         existing.audio_end_sec = existing.audio_end_sec if existing.audio_end_sec is not None else candidate.audio_end_sec
+        existing.alternatives = list(dict.fromkeys([*existing.alternatives, *candidate.alternatives]))
     return list(merged.values())
 
 
@@ -82,6 +85,7 @@ def focus_to_candidate(focus: FocusProposal, session: Session) -> CorrectionCand
         audio_end_sec=meta.get("end_sec"),
         relationship=focus.relationship,
         operation=focus.operation,
+        alternatives=list(focus.alternatives),
     )
 
 
@@ -90,7 +94,11 @@ def candidate_to_focus(candidate: CorrectionCandidate) -> FocusProposal:
         target_turn_id=candidate.target_turn_id,
         span=candidate.span,
         proposed_text=candidate.candidate,
-        alternatives=[candidate.span, candidate.candidate],
+        alternatives=list(dict.fromkeys([
+            candidate.span,
+            *([candidate.candidate] if candidate.candidate else []),
+            *candidate.alternatives,
+        ])),
         evidence_turn_ids=list(candidate.evidence_turn_ids),
         rationale=candidate.rationale,
         source=candidate.source,

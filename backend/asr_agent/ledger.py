@@ -63,6 +63,7 @@ class RevisionLedger:
         if (
             target is None
             or not target.active
+            or target.event_kind != "revision"
             or target.action not in REVISION_ACTIONS
             or target.event_id in superseded_ids
         ):

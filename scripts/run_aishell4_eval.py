@@ -153,7 +153,7 @@ def evaluate_sample(base_url: str, audio: Path, reference_path: Path, output_dir
         "degenerate_turns": sum(bool((turn.get("meta") or {}).get("degeneration", {}).get("detected")) for turn in turns),
         "changed_turns": sum(turn.get("raw_text") != turn.get("current_text") for turn in turns),
         "raw": metrics(reference, raw), "final": metrics(reference, current),
-        "retrace": {"active_events": sum(event.get("active", True) for event in session.get("revision_events") or []), "committed_revisions": sum(event.get("active", True) and event.get("event_kind") != "audit" and event.get("action") in {"REVISE_CURRENT", "REVISE_HISTORY", "ROLLBACK"} for event in session.get("revision_events") or [])},
+        "retrace": {"active_events": sum(event.get("active", True) for event in session.get("revision_events") or []), "committed_revisions": sum(event.get("active", True) and event.get("event_kind", "revision") == "revision" and event.get("action") in {"REVISE_CURRENT", "REVISE_HISTORY", "ROLLBACK"} for event in session.get("revision_events") or [])},
         "retrace_miss_analysis": retrace_miss_analysis(session, rows),
     }
     metrics_path.write_text(json.dumps(item, ensure_ascii=False, indent=2), encoding="utf-8")

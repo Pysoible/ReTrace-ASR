@@ -382,7 +382,8 @@ class ReTraceService:
                         (
                             event
                             for event in reversed(self.ledger.active_events(snapshot))
-                            if event.target_turn_id == target.turn_id
+                            if event.event_kind == "revision"
+                            and event.target_turn_id == target.turn_id
                             and event.span == resolution.replacement
                             and event.replacement == resolution.span
                         ),

@@ -121,7 +121,10 @@ def evaluate_one(
         except Exception:
             session = {}
 
-    events = [e for e in (session.get("revision_events") or []) if e.get("active")]
+    events = [
+        e for e in (session.get("revision_events") or [])
+        if e.get("active") and e.get("event_kind", "revision") == "revision"
+    ]
     raw = _join_turns(session, "raw_text")
     cur = _join_turns(session, "current_text")
     asr_text = str(payload.get("final_text") or raw)

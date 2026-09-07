@@ -1,5 +1,5 @@
 from asr_agent.context_judge import FocusProposal
-from asr_agent.correction_candidates import CorrectionCandidate, deduplicate_candidates, focus_to_candidate
+from asr_agent.correction_candidates import CorrectionCandidate, candidate_to_focus, deduplicate_candidates, focus_to_candidate
 from asr_agent.models import Session, Turn
 
 
@@ -33,3 +33,33 @@ def test_focus_with_candidate_in_another_turn_is_inferred_as_history_homophone()
     candidate = focus_to_candidate(focus, session)
 
     assert candidate.source == "history_homophone"
+
+
+def test_focus_round_trip_preserves_all_closed_set_alternatives():
+    turn = Turn("t1", "我负责南庄部门", "我负责南庄部门")
+    focus = FocusProposal(
+        "t1",
+        "南庄",
+        "男装",
+        ["南庄", "男装", "南章"],
+        ["t1"],
+    )
+
+    restored = candidate_to_focus(focus_to_candidate(focus, Session("s", turns=[turn])))
+
+    assert restored.alternatives == ["南庄", "男装", "南章"]
+
+
+def test_deduplicate_candidates_merges_closed_set_alternatives():
+    first = CorrectionCandidate(
+        "t1", "南庄", "男装", "semantic_open", ["t1"],
+        alternatives=["南庄", "男装"],
+    )
+    second = CorrectionCandidate(
+        "t1", "南庄", "男装", "acoustic_diff", ["t2"],
+        alternatives=["南庄", "男装", "南章"],
+    )
+
+    result = deduplicate_candidates([first, second])
+
+    assert result[0].alternatives == ["南庄", "男装", "南章"]

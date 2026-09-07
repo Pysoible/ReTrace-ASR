@@ -113,6 +113,38 @@ def test_judge_accepts_semantic_open_candidate_not_found_in_history(monkeypatch)
     assert result.focus[0].source == "semantic_open"
 
 
+def test_judge_accepts_top_level_delete_candidate(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(
+        deepseek,
+        "_chat_json",
+        lambda *_, **__: {
+            "outcome": "CONFLICT",
+            "confidence": 0.95,
+            "candidates": [{
+                "target_turn_id": "t1",
+                "span": "啊啊",
+                "candidate": "",
+                "operation": "DELETE",
+                "source": "semantic_open",
+                "evidence_turn_ids": ["t1"],
+                "rationale": "局部音频确认该片段是幻觉",
+            }],
+        },
+    )
+    turn = Turn("t1", "开始啊啊继续", "开始啊啊继续")
+
+    result = deepseek.judge_context(
+        session=Session("s", turns=[turn]),
+        current_turn=turn,
+        memory=MemoryPacket(),
+    )
+
+    assert result.focus[0].operation == "DELETE"
+    assert result.focus[0].span == "啊啊"
+    assert result.focus[0].proposed_text == ""
+
+
 def test_focus_candidate_absent_from_history_is_marked_semantic_open(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr(deepseek, "_chat_json", lambda *_, **__: {

@@ -28,6 +28,7 @@ def evaluate_revisions(
         event
         for event in events
         if event.get("action") in revision_actions
+        and event.get("event_kind", "revision") == "revision"
         and event.get("active", True)
         and str(event.get("event_id", "")) not in superseded
     ]
@@ -56,7 +57,12 @@ def evaluate_revisions(
     recall = correct / ambiguous_turn_count if ambiguous_turn_count else 0.0
     historical_precision = len(historical_correct) / len(historical) if historical else None
     current_precision = len(current_correct) / len(current) if current else None
-    rollbacks = [event for event in events if event.get("action") == "ROLLBACK" and event.get("active", True)]
+    rollbacks = [
+        event for event in events
+        if event.get("action") == "ROLLBACK"
+        and event.get("event_kind", "revision") == "revision"
+        and event.get("active", True)
+    ]
     rollback_successes = sum(
         reference_by_turn.get(str(event.get("target_turn_id"))) == event.get("after_text")
         for event in rollbacks

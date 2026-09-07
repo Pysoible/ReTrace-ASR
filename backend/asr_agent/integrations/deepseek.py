@@ -357,13 +357,14 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
                 continue
             span = str(candidate.get("span") or candidate.get("source_span") or "").strip()
             proposed = str(candidate.get("candidate") or candidate.get("proposed_text") or "").strip()
+            operation = str(candidate.get("operation") or "REPLACE").upper()
             target_turn_id = str(candidate.get("target_turn_id") or current_turn.turn_id)
             evidence_turn_ids = [
                 str(turn_id)
                 for turn_id in (candidate.get("evidence_turn_ids") or [target_turn_id])
                 if str(turn_id)
             ]
-            if not span or not proposed or not any(
+            if not span or (operation != "DELETE" and not proposed) or not any(
                 turn.turn_id == target_turn_id
                 and (span in turn.raw_text or span in turn.current_text)
                 for turn in session.turns
@@ -378,7 +379,12 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
                 rationale=str(candidate.get("rationale") or "semantic-open candidate"),
                 semantic_confidence=judgment.confidence,
                 relationship=str(candidate.get("relationship") or "MUTUALLY_EXCLUSIVE"),
-                operation=str(candidate.get("operation") or "REPLACE").upper(),
+                operation=operation,
+                alternatives=[
+                    str(item)
+                    for item in (candidate.get("alternatives") or [])
+                    if str(item)
+                ],
             ))
         judgment.focus = [candidate_to_focus(item) for item in deduplicate_candidates(normalized_candidates)]
         if judgment.outcome in {"CONFLICT", "UNCERTAIN"} and not judgment.focus:
