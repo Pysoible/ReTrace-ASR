@@ -11,6 +11,9 @@ dependencies = [
   "numpy>=1.26.0",
   "websockets>=12.0",
   "python-multipart>=0.0.9",
+  "pypinyin>=0.55.0",
+  "requests>=2.34.2",
+  "python-levenshtein>=0.27.4",
 ]
 
 [dependency-groups]
