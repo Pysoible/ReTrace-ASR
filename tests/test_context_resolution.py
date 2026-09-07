@@ -216,7 +216,7 @@ def test_resolver_verifies_same_pronunciation_context_candidate():
     assert "context_homophone:南庄->男装" in result.evidence
 
 
-def test_direct_context_revision_survives_ledger_replay_for_repeated_span(tmp_path):
+def test_history_candidate_revision_changes_only_the_resolved_occurrence(tmp_path):
     from asr_agent.context_judge import ContextJudgment
     from asr_agent.retrace import ReTraceService
 
@@ -233,7 +233,7 @@ def test_direct_context_revision_survives_ledger_replay_for_repeated_span(tmp_pa
         meta={"audio_path": str(audio_path), "start_sec": 0, "end_sec": 2},
     )
 
-    assert result["session"]["turns"][1]["current_text"] == "我这男装那说两句啊呃，男装啊那个。"
+    assert result["session"]["turns"][1]["current_text"] == "我这男装那说两句啊呃，南庄啊那个。"
     revision = next(event for event in result["revisions"] if event["action"] == "REVISE_CURRENT")
     assert "candidate_source:history_homophone" in revision["evidence"]
 
@@ -280,7 +280,7 @@ def test_uncertain_acoustic_signal_can_commit_unique_context_homophone(tmp_path)
     audio_path.touch()
     service = ReTraceService(
         tmp_path,
-        context_judge=lambda **_: ContextJudgment("UNCERTAIN", 0.55),
+        context_judge=lambda **_: ContextJudgment("UNCERTAIN", 0.9),
         audio_verifier=lambda **_: {"ok": True, "scores": {"南庄": 0.0, "男装": 1.0}},
     )
     service.process_turn("s", "t1", "男装女装商场", source="text")
@@ -297,7 +297,7 @@ def test_uncertain_acoustic_signal_can_commit_unique_context_homophone(tmp_path)
     assert result["session"]["turns"][1]["current_text"] == "我这男装那说两句。"
 
 
-def test_semantic_open_candidate_without_independent_acoustic_signal_is_deferred(tmp_path):
+def test_semantic_open_candidate_with_decisive_audio_does_not_require_acoustic_disagreement(tmp_path):
     from asr_agent.context_judge import FocusProposal
     from asr_agent.resolver import EvidenceResolver
     from asr_agent.models import Session, Turn
@@ -329,8 +329,40 @@ def test_semantic_open_candidate_without_independent_acoustic_signal_is_deferred
         context_confidence=0.95,
     )
 
-    assert result.action == "DEFER"
-    assert "independent acoustic" in result.rationale
+    assert result.action == "REVISE_CURRENT"
+    assert result.replacement == "绿植品种"
+
+
+def test_semantic_open_candidate_commits_end_to_end_without_history_or_paraformer(tmp_path):
+    from asr_agent.context_judge import ContextJudgment, FocusProposal
+    from asr_agent.retrace import ReTraceService
+
+    audio_path = tmp_path / "turn.wav"
+    audio_path.touch()
+    judgment = ContextJudgment(
+        "CONFLICT",
+        0.95,
+        focus=[FocusProposal(
+            "t1", "南庄", "男装", ["南庄", "男装"], ["t1"],
+            rationale="当前正在讨论服装部门", source="semantic_open",
+        )],
+    )
+    service = ReTraceService(
+        tmp_path / "state",
+        context_judge=lambda **_: judgment,
+        audio_verifier=lambda **kwargs: {
+            "ok": True,
+            "scores": {item: (0.95 if item == "男装" else 0.03 if item == "南庄" else 0.02) for item in kwargs["candidates"]},
+        },
+    )
+
+    result = service.process_turn(
+        "s", "t1", "我负责南庄部门",
+        meta={"audio_path": str(audio_path), "start_sec": 0.0, "end_sec": 2.0},
+    )
+
+    assert result["session"]["turns"][0]["current_text"] == "我负责男装部门"
+    assert "candidate_source:semantic_open" in result["revisions"][0]["evidence"]
 
 
 def test_acoustic_focus_keeps_current_turn_as_evidence():

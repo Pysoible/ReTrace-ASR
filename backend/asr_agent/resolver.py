@@ -137,6 +137,8 @@ class EvidenceResolver:
             return 0.0
         span_end = pos + len(span)
         for item in disagreement:
+            if str(item.get("span_a") or "").strip() == span and item.get("offset_a") is None:
+                return 1.0
             start = int(item.get("offset_a") or 0)
             end = start + len(str(item.get("span_a") or ""))
             if start < span_end and pos < end:  # any character-level overlap
@@ -219,13 +221,6 @@ class EvidenceResolver:
             )
         acoustic_supported = self._acoustic_support(target, focus.span) > 0.0
         homophone_candidate = operation == "REPLACE" and self._is_same_pronunciation(focus.span, focus.proposed_text)
-        if operation == "REPLACE" and focus.source == "semantic_open" and not acoustic_supported:
-            return Resolution(
-                "DEFER",
-                target.turn_id,
-                focus.span,
-                rationale="semantic-open candidate requires independent acoustic support before revision",
-            )
         if (
             not self._is_safe_local_replacement(focus.span, focus.proposed_text, operation)
             and not acoustic_supported

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import json
-import os
 import re
 from pathlib import Path
 from typing import Any, Callable
@@ -16,6 +15,12 @@ from asr_agent.context_judge import (
     language_compatible,
     text_script_profile,
     normalize_judgment,
+)
+from asr_agent.correction_candidates import (
+    CorrectionCandidate,
+    candidate_to_focus,
+    deduplicate_candidates,
+    focus_to_candidate,
 )
 from asr_agent.degeneration import (
     DegenerationAssessment,
@@ -214,21 +219,17 @@ class ReTraceService:
                 except Exception as exc:
                     judgment = ContextJudgment("UNCERTAIN", rationale=f"context judge unavailable: {exc}")
 
-            if not judgment.focus and judgment.outcome != "CONFLICT":
-                acoustic_focus = self._acoustic_focus(trigger)
-                if acoustic_focus:
-                    judgment = ContextJudgment(
-                        "UNCERTAIN",
-                        confidence=max(judgment.confidence, 0.5),
-                        rationale="independent ASR disagreement requires targeted audio verification",
-                        focus=acoustic_focus,
-                        beliefs=judgment.beliefs,
-                    )
-
-            direct_context_event = None
+            candidate_pool = [focus_to_candidate(focus, snapshot) for focus in judgment.focus]
+            candidate_pool.extend(
+                focus_to_candidate(focus, snapshot)
+                for focus in self._acoustic_focus(trigger)
+            )
             trigger_uncertainty = trigger.meta.get("uncertainty") or {}
             has_acoustic_disagreement = bool(trigger_uncertainty.get("acoustic_disagreement"))
-            if judgment.outcome == "CONFLICT" or (judgment.outcome == "UNCERTAIN" and has_acoustic_disagreement):
+            if not judgment.focus and (
+                judgment.outcome == "CONFLICT"
+                or (judgment.outcome == "UNCERTAIN" and has_acoustic_disagreement)
+            ):
                 try:
                     from asr_agent.integrations.deepseek import _homophone_candidates
 
@@ -236,69 +237,35 @@ class ReTraceService:
                     by_span: dict[str, list[dict[str, str]]] = {}
                     for candidate in candidates:
                         by_span.setdefault(candidate["span"], []).append(candidate)
-                    body = trigger.current_text or trigger.raw_text
                     for span, matches in by_span.items():
                         matches = [
                             match for match in matches
                             if not any(particle in match["candidate"] for particle in ("啊", "呀", "吧", "呢", "啦"))
                         ]
-                        if len(matches) != 1 or span not in body:
+                        if len(matches) != 1 or span not in (trigger.current_text or trigger.raw_text):
                             continue
-                        replacement = matches[0]["candidate"]
-                        meta = trigger.meta or {}
-                        audio_path = meta.get("audio_path")
-                        start_sec, end_sec = meta.get("start_sec"), meta.get("end_sec")
-                        if not audio_path or start_sec is None or end_sec is None:
-                            continue
-                        try:
-                            audio = self.resolver.audio_verifier(
-                                audio_path=str(audio_path),
-                                start_sec=float(start_sec),
-                                end_sec=float(end_sec),
-                                candidates=[span, replacement],
-                            )
-                            scores = audio.get("scores") if isinstance(audio, dict) and audio.get("ok") else None
-                            if not isinstance(scores, dict) or set(scores) != {span, replacement}:
-                                continue
-                            ordered = sorted(
-                                ((key, max(0.0, float(value))) for key, value in scores.items()),
-                                key=lambda item: item[1],
-                                reverse=True,
-                            )
-                            if ordered[0][0] != replacement or ordered[0][1] < 0.85:
-                                continue
-                            if ordered[0][1] - ordered[1][1] < 0.30:
-                                continue
-                        except (TypeError, ValueError, OSError):
-                            continue
-                        after_text = body.replace(span, replacement)
-                        direct_context_event = RevisionEvent(
-                            event_id=self._event_id(snapshot.session_id, trigger.turn_id, observed_version, "REVISE_CURRENT", "direct-context"),
-                            action="REVISE_CURRENT",
+                        match = matches[0]
+                        candidate_pool.append(CorrectionCandidate(
                             target_turn_id=trigger.turn_id,
-                            source_turn_id=trigger.turn_id,
-                            span="",
-                            before_text=body,
-                            after_text=after_text,
-                            entity_id=None,
-                            score=judgment.confidence,
-                            evidence=[
-                                "candidate_source:history_homophone",
-                                *[f"evidence_turn:{turn_id}" for turn_id in matches[0].get("evidence_turn_ids", [])],
-                                f"context_homophone:{span}->{replacement}",
-                                f"audio_verified:{ordered[0][1]:.3f}/{ordered[1][1]:.3f}",
-                            ],
-                            resolver="direct-context-correction",
-                            rationale="context conflict and decisive closed-set local audio verification",
-                            replacement="",
-                        )
-                        trigger.current_text = after_text
-                        break
+                            span=span,
+                            candidate=match["candidate"],
+                            source="history_homophone",
+                            evidence_turn_ids=list(match.get("evidence_turn_ids") or []),
+                            rationale="context conflict exposes a same-pronunciation history candidate",
+                            semantic_confidence=judgment.confidence,
+                            audio_start_sec=(trigger.meta or {}).get("start_sec"),
+                            audio_end_sec=(trigger.meta or {}).get("end_sec"),
+                        ))
                 except Exception:
-                    direct_context_event = None
+                    pass
+
+            judgment.focus = [candidate_to_focus(item) for item in deduplicate_candidates(candidate_pool)]
+            if judgment.focus and judgment.outcome not in {"CONFLICT", "UNCERTAIN"}:
+                judgment.outcome = "UNCERTAIN"
+                judgment.confidence = max(judgment.confidence, 0.5)
 
             self._apply_beliefs(snapshot, judgment.beliefs)
-            events: list[RevisionEvent] = [event for event in (recovery_event, direct_context_event) if event is not None]
+            events: list[RevisionEvent] = [event for event in (recovery_event,) if event is not None]
             # Open-vocabulary relisten fallback: when the judge is uncertain (or
             # conflicted) but could not point at a specific span, go back to the
             # audio and re-transcribe the window. This catches garbled proper
