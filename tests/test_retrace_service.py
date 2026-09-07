@@ -780,6 +780,31 @@ def test_healthy_turn_relisten_difference_uses_candidate_resolver(tmp_path):
     assert "candidate_source:relisten_open" in result["revisions"][0]["evidence"]
 
 
+def test_candidate_outcome_is_persisted_as_structured_audit(tmp_path):
+    audio = tmp_path / "turn.wav"
+    audio.touch()
+    service = ReTraceService(
+        tmp_path / "state",
+        context_judge=lambda **_: ContextJudgment(
+            "CONFLICT", 0.95,
+            focus=[FocusProposal("t1", "南庄", "男装", ["南庄", "男装"], ["t1"], source="semantic_open")],
+        ),
+        audio_verifier=lambda **kwargs: {
+            "ok": True,
+            "scores": {item: (0.96 if item == "男装" else 0.03 if item == "南庄" else 0.01) for item in kwargs["candidates"]},
+        },
+    )
+
+    result = service.process_turn("s", "t1", "我负责南庄部门", meta={"audio_path": str(audio), "start_sec": 0.0, "end_sec": 2.0})
+    audit = next(event for event in result["session"]["revision_events"] if event["event_kind"] == "candidate_audit")
+
+    assert audit["candidate_id"]
+    assert audit["candidate_stage"] == "committed"
+    assert "candidate_source:semantic_open" in audit["evidence"]
+    assert "verifier_attempted:true" in audit["evidence"]
+    assert any(item.startswith("audio_verified:") for item in audit["evidence"])
+
+
 def test_coverage_risk_uses_segmented_relisten_even_when_judge_is_consistent(tmp_path):
     """A fluent but severely under-covered turn is an omission recovery task."""
     calls = []

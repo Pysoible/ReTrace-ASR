@@ -12,6 +12,7 @@ from typing import Any
 
 import requests
 from Levenshtein import editops as levenshtein_editops
+from scripts.report_candidate_pipeline import candidate_pipeline_metrics
 
 _ROW_RE = re.compile(r"^\s*([0-9.]+)\s+([0-9.]+)\s+(\S+)\s+(.+?)\s*$")
 
@@ -111,31 +112,14 @@ def retrace_miss_analysis(session: dict[str, Any], rows: list[dict[str, Any]]) -
             })
     diagnostics.sort(key=lambda item: (-item["final_edits"], item["start_sec"]))
     evaluated = sum(revision_outcomes.values())
-    candidate_events = [
-        event
-        for event in session.get("revision_events") or []
-        if event.get("active", True)
-        and any(str(item).startswith("candidate_source:") for item in event.get("evidence") or [])
-    ]
-    verified_candidates = [
-        event for event in candidate_events
-        if any(str(item).startswith("audio_verified:") for item in event.get("evidence") or [])
-    ]
-    committed_candidates = [
-        event for event in candidate_events
-        if event.get("action") in {"REVISE_CURRENT", "REVISE_HISTORY", "ROLLBACK"}
-    ]
     return {
         "purpose": "offline_gt_diagnostics_only", "categories": dict(categories),
         "raw_edits": raw_edits, "final_edits": final_edits, "net_edits_removed": raw_edits - final_edits,
         "revision_quality": {**dict(revision_outcomes), "evaluated": evaluated, "improvement_rate": revision_outcomes["improved"] / evaluated if evaluated else 0.0, "harm_rate": revision_outcomes["harmed"] / evaluated if evaluated else 0.0},
         "candidate_pipeline": {
-            "candidate_recall": None,
-            "candidate_proposals": len(candidate_events),
-            "candidate_to_verifier_rate": len(verified_candidates) / len(candidate_events) if candidate_events else 0.0,
-            "verified_candidate_rate": len(committed_candidates) / len(verified_candidates) if verified_candidates else 0.0,
-            "committed_revision_count": len(committed_candidates),
-            "note": "candidate_recall requires post-inference reference alignment and is intentionally not used online",
+            key: value
+            for key, value in candidate_pipeline_metrics(session).items()
+            if key != "candidate_sources"
         },
         "worst_missed_turns": diagnostics[:30],
     }

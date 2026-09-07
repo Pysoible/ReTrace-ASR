@@ -91,7 +91,7 @@ class RevisionLedger:
             turn.current_text = turn.raw_text
 
         for event in self.active_events(session):
-            if event.action not in REVISION_ACTIONS:
+            if event.event_kind != "revision" or event.action not in REVISION_ACTIONS:
                 continue
             try:
                 turn = turns_by_id[event.target_turn_id]

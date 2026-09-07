@@ -299,6 +299,7 @@ class ReTraceService:
                         for item in deduplicate_candidates(candidate_pool)
                     ]
             audit_events: list[RevisionEvent] = []
+            candidate_audits: list[RevisionEvent] = []
             deferred = judgment.outcome == "UNCERTAIN" and not judgment.focus
             if not judgment.focus:
                 action = {"NOVEL": "ACCEPT_NEW", "CONSISTENT": "KEEP_OLD"}.get(judgment.outcome, "DEFER")
@@ -332,6 +333,47 @@ class ReTraceService:
                     context_confidence=judgment.confidence,
                     memory_support=self._memory_support(memory.long_term_beliefs, focus.proposed_text),
                 )
+                candidate_id = self._event_id(
+                    session_id,
+                    focus.target_turn_id,
+                    observed_version,
+                    "CANDIDATE",
+                    f"{focus_index}:{focus.span}:{focus.proposed_text}",
+                )
+                candidate_stage = (
+                    "committed"
+                    if resolution.action in {"REVISE_CURRENT", "REVISE_HISTORY"}
+                    else "rejected"
+                    if resolution.action == "KEEP_OLD"
+                    else "deferred"
+                )
+                candidate_evidence = [
+                    f"candidate_source:{focus.source}",
+                    *[f"evidence_turn:{item}" for item in focus.evidence_turn_ids],
+                    f"verifier_attempted:{str(resolution.verifier_attempted).lower()}",
+                ]
+                if resolution.verifier_succeeded:
+                    candidate_evidence.append(
+                        f"audio_verified:{resolution.audio_confidence:.3f}/{resolution.audio_margin:.3f}"
+                    )
+                candidate_audits.append(RevisionEvent(
+                    event_id=candidate_id,
+                    action=resolution.action,
+                    target_turn_id=resolution.target_turn_id,
+                    source_turn_id=trigger.turn_id,
+                    span=resolution.span,
+                    before_text=next(turn.current_text for turn in snapshot.turns if turn.turn_id == resolution.target_turn_id),
+                    after_text=next(turn.current_text for turn in snapshot.turns if turn.turn_id == resolution.target_turn_id),
+                    entity_id=None,
+                    score=resolution.score,
+                    evidence=candidate_evidence,
+                    resolver="candidate-pipeline",
+                    rationale=resolution.rationale,
+                    replacement=focus.proposed_text,
+                    event_kind="candidate_audit",
+                    candidate_id=candidate_id,
+                    candidate_stage=candidate_stage,
+                ))
                 hypothesis.score = resolution.score
                 if resolution.action in {"REVISE_CURRENT", "REVISE_HISTORY"}:
                     hypothesis.status = "resolved"
@@ -430,7 +472,7 @@ class ReTraceService:
                     if evidence_turn_id not in snapshot.dependency_index[focus.target_turn_id]:
                         snapshot.dependency_index[focus.target_turn_id].append(evidence_turn_id)
 
-            self.ledger.append_many(snapshot, [*audit_events, *events], event_version=snapshot.version + 1)
+            self.ledger.append_many(snapshot, [*audit_events, *candidate_audits, *events], event_version=snapshot.version + 1)
             snapshot.analysis_status = "deferred" if deferred else "idle"
             trigger.meta["analyzed_observed_version"] = observed_version
             trigger.meta["analyzed_session_version"] = snapshot.version + 1
@@ -451,7 +493,7 @@ class ReTraceService:
             self.memory_consolidator.consolidate(committed.memory_scope, list(committed.working_beliefs.values()))
             return {
                 "status": committed.analysis_status,
-                "decisions": [event.as_dict() for event in [*audit_events, *events]],
+                "decisions": [event.as_dict() for event in [*audit_events, *candidate_audits, *events]],
                 "revisions": [
                     event.as_dict()
                     for event in events
