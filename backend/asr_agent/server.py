@@ -233,7 +233,7 @@ def create_app(
     coordinator: RealtimeAnalysisCoordinator | None = None,
 ) -> FastAPI:
     root = workspace or Path.cwd() / "retrace_state"
-    qwen_model = Path(read_asr_config().model_path).name
+    qwen_model = Path(str(getattr(read_asr_config(), "model_path", "unknown"))).name
     qwen_first_pass_identity = ModelIdentity("qwen-omni-vllm", qwen_model, "first_pass")
     if service is None:
         service = ReTraceService(

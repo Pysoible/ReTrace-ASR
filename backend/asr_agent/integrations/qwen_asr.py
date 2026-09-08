@@ -841,7 +841,7 @@ def stream_transcribe_audio(
         "ok": True,
         "audio": str(path),
         "backend": "qwen-omni-vllm",
-        "model": Path(cfg.model_path).name,
+        "model": Path(str(getattr(cfg, "model_path", "unknown"))).name,
         "chunk_count": int(chunk_info.get("chunk_count") or len(chunk_paths)),
         "duration_sec": chunk_info.get("duration_sec"),
         "chunked": bool(chunk_info.get("chunked")),
