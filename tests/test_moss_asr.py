@@ -53,3 +53,56 @@ def test_transcribe_audio_posts_to_moss_endpoint(monkeypatch, tmp_path):
     assert result["model"] == "MOSS-Transcribe-Diarize"
     assert result["chunks_text"] == ["测试文本"]
     assert result["chunks"][0]["speaker"] == "S01"
+
+
+def test_moss_request_uses_transcription_completion_parameter(monkeypatch, tmp_path):
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"audio")
+    seen = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "text": "[0.00][S01]完整文本[9.90]",
+                    "usage": {"type": "duration", "seconds": 10.0},
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        seen["body"] = request.data.decode("utf-8", errors="ignore")
+        return Response()
+
+    monkeypatch.setenv("MOSS_MAX_COMPLETION_TOKENS", "32768")
+    monkeypatch.setattr(moss_asr.urllib.request, "urlopen", fake_urlopen)
+
+    result = moss_asr.transcribe_audio(str(audio))
+
+    assert 'name="max_completion_tokens"' in seen["body"]
+    assert 'name="max_new_tokens"' not in seen["body"]
+    assert result["duration_sec"] == 10.0
+    assert result["completeness"]["coverage_ratio"] == 0.99
+    assert result["completeness"]["truncated"] is False
+
+
+def test_moss_marks_silent_http_200_truncation(monkeypatch, tmp_path):
+    payload = {
+        "text": "[0.00][S01]只有前半段[37.00][8",
+        "usage": {"type": "duration", "seconds": 100.0},
+    }
+    monkeypatch.setattr(moss_asr, "_post_transcription", lambda _: payload)
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"audio")
+
+    result = moss_asr.transcribe_audio(str(audio))
+
+    assert result["ok"] is False
+    assert result["failure_code"] == "incomplete_first_pass"
+    assert result["completeness"]["coverage_ratio"] == 0.37
+    assert result["completeness"]["parse_tail"] == "[8"

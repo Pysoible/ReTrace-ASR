@@ -36,8 +36,11 @@ def _env_timeout() -> float:
     return float(os.getenv("MOSS_TRANSCRIBE_TIMEOUT", "7200"))
 
 
-def _env_max_new_tokens() -> str:
-    return os.getenv("MOSS_MAX_NEW_TOKENS", "65536")
+def _env_max_completion_tokens() -> str:
+    return os.getenv(
+        "MOSS_MAX_COMPLETION_TOKENS",
+        os.getenv("MOSS_MAX_NEW_TOKENS", "32768"),
+    )
 
 
 def parse_moss_transcript(raw: str) -> dict[str, Any]:
@@ -64,6 +67,39 @@ def parse_moss_transcript(raw: str) -> dict[str, Any]:
         "text": text,
         "chunks_text": [text] if text else [],
         "chunks": [{"index": 0}] if text else [],
+    }
+
+
+def _response_duration(payload: dict[str, Any]) -> float | None:
+    direct = payload.get("duration") or payload.get("duration_sec")
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    value = direct or usage.get("seconds")
+    return float(value) if value is not None else None
+
+
+def transcript_completeness(
+    raw: str,
+    chunks: list[dict[str, Any]],
+    duration: float | None,
+) -> dict[str, Any]:
+    covered = max(
+        (
+            float(item["end_sec"])
+            for item in chunks
+            if item.get("end_sec") is not None
+        ),
+        default=0.0,
+    )
+    ratio = min(1.0, covered / duration) if duration and duration > 0 else None
+    matches = list(_SEGMENT_RE.finditer(raw or ""))
+    tail = (raw[matches[-1].end():] if matches else raw).strip()[:160]
+    threshold = float(os.getenv("MOSS_MIN_COVERAGE_RATIO", "0.98"))
+    return {
+        "covered_until_sec": covered,
+        "coverage_ratio": ratio,
+        "threshold": threshold,
+        "truncated": ratio is not None and ratio < threshold,
+        "parse_tail": tail,
     }
 
 
@@ -94,7 +130,7 @@ def _post_transcription(audio_path: Path) -> dict[str, Any]:
         "model": os.getenv("MOSS_MODEL_NAME", MOSS_TRANSCRIBE_DIARIZE_MODEL),
         "response_format": os.getenv("MOSS_RESPONSE_FORMAT", "json"),
         "temperature": os.getenv("MOSS_TEMPERATURE", "0"),
-        "max_new_tokens": _env_max_new_tokens(),
+        "max_completion_tokens": _env_max_completion_tokens(),
     }
     body, boundary = _multipart_form(fields, "file", audio_path)
     request = urllib.request.Request(
@@ -146,15 +182,20 @@ def transcribe_audio(audio: str) -> dict[str, Any]:
         return {"ok": False, "error": f"MOSS 转写失败: {exc}"}
     raw_text = str(payload.get("text") or payload.get("transcript") or "")
     parsed = parse_moss_transcript(raw_text)
+    duration = _response_duration(payload)
+    completeness = transcript_completeness(raw_text, parsed["chunks"], duration)
+    truncated = bool(completeness["truncated"])
     return {
-        "ok": bool(parsed["chunks_text"]),
+        "ok": bool(parsed["chunks_text"]) and not truncated,
+        "failure_code": "incomplete_first_pass" if truncated else None,
         "audio": str(audio_path),
         "final_text": parsed["text"],
         "chunks_text": parsed["chunks_text"],
         "uncertainties": [{} for _ in parsed["chunks_text"]],
         "backend": BACKEND,
         "model": MOSS_TRANSCRIBE_DIARIZE_MODEL,
-        "duration_sec": payload.get("duration") or payload.get("duration_sec"),
+        "duration_sec": duration,
+        "completeness": completeness,
         "chunked": True,
         "chunk_count": len(parsed["chunks_text"]),
         "chunks": parsed["chunks"],
