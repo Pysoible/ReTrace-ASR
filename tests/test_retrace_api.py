@@ -75,6 +75,28 @@ def test_moss_backend_never_acquires_qwen_model_name(tmp_path, monkeypatch):
     assert body["session"]["turns"][0]["meta"]["first_pass_identity"] == expected
 
 
+def test_audio_sessions_share_memory_by_model_and_isolate_other_models(tmp_path, monkeypatch):
+    results = iter([
+        {"ok": True, "backend": "qwen-omni-vllm", "model": "Qwen3_Omni_30B",
+         "chunks_text": ["甲"], "chunks": [{}], "uncertainties": [{}]},
+        {"ok": True, "backend": "qwen-omni-vllm", "model": "Qwen3_Omni_30B",
+         "chunks_text": ["乙"], "chunks": [{}], "uncertainties": [{}]},
+        {"ok": True, "backend": "moss-transcribe-diarize", "model": "MOSS-Audio-7B",
+         "chunks_text": ["丙"], "chunks": [{}], "uncertainties": [{}]},
+    ])
+    monkeypatch.setenv("ASR_EXPERIMENT_NAMESPACE", "scope-test")
+    monkeypatch.setattr(server, "transcribe_audio", lambda _audio: next(results))
+
+    with TestClient(create_app(tmp_path)) as client:
+        qwen_a = client.post("/api/sessions/a/audio", json={"audio": "/tmp/a.wav"}).json()
+        qwen_b = client.post("/api/sessions/b/audio", json={"audio": "/tmp/b.wav"}).json()
+        moss = client.post("/api/sessions/c/audio", json={"audio": "/tmp/c.wav"}).json()
+
+    assert qwen_a["session"]["memory_scope"] == qwen_b["session"]["memory_scope"]
+    assert qwen_a["session"]["memory_scope"] != moss["session"]["memory_scope"]
+    assert qwen_a["session"]["memory_scope"].startswith("model--scope-test--")
+
+
 def test_text_only_evidence_does_not_create_an_undoable_revision(tmp_path):
     with TestClient(create_app(tmp_path)) as client:
         client.post("/api/sessions/s/turns", json={"turn_id": "t1", "text": "图博士来了", "confidence": {"图博士": 0.2}})

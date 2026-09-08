@@ -1,5 +1,6 @@
 from asr_agent.memory import LongTermMemoryRepository, MemoryConsolidator, MemoryRetriever
 from asr_agent.models import MemoryBelief, Session, Turn
+from asr_agent.model_identity import ModelIdentity, model_memory_scope
 
 
 def belief(belief_id: str, value: str, *, sessions: list[str], kinds: list[str]) -> MemoryBelief:
@@ -54,6 +55,41 @@ def test_long_term_store_failure_degrades_to_empty_memory(tmp_path):
     session = Session("s", turns=[Turn("t1", "测试", "测试")])
     packet = MemoryRetriever(BrokenStore(tmp_path)).retrieve(session, session.turns[0])
     assert packet.long_term_beliefs == []
+
+
+def test_repository_status_exposes_consolidation_failure(tmp_path, monkeypatch):
+    store = LongTermMemoryRepository(tmp_path)
+
+    def fail_save(*_args, **_kwargs):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(store, "_save_unlocked", fail_save)
+
+    try:
+        store.update("model--test", lambda beliefs: None, operation="consolidate")
+    except OSError:
+        pass
+
+    assert store.status("model--test") == {
+        "scope": "model--test",
+        "provisional": 0,
+        "stable": 0,
+        "superseded": 0,
+        "last_operation": "consolidate",
+        "error": {"kind": "OSError", "message": "disk unavailable"},
+    }
+
+
+def test_model_memory_scope_is_shared_across_audio_but_isolated_by_model():
+    qwen = ModelIdentity("qwen-omni-vllm", "Qwen3_Omni_30B", "first_pass")
+    moss = ModelIdentity("moss-transcribe-diarize", "MOSS-Audio-7B", "first_pass")
+
+    assert model_memory_scope(qwen, namespace="experiment-a") == model_memory_scope(
+        qwen, namespace="experiment-a"
+    )
+    assert model_memory_scope(qwen, namespace="experiment-a") != model_memory_scope(
+        moss, namespace="experiment-a"
+    )
 
 
 def test_consolidator_merges_independent_sessions_before_promotion(tmp_path):

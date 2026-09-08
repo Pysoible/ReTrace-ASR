@@ -1027,6 +1027,7 @@ class ReTraceService:
         return summary
 
     def _observability(self, session: Session) -> dict[str, Any]:
+        memory_status = self.long_term_memory.status(session.memory_scope)
         if not session.turns:
             return {
                 "summary": self._session_summary(session),
@@ -1041,7 +1042,8 @@ class ReTraceService:
                     "working_beliefs": [],
                     "open_hypotheses": [],
                 },
-                "long_term": {"beliefs": []},
+                "long_term": {"beliefs": [], "status": memory_status},
+                "memory_status": memory_status,
             }
 
         latest = session.turns[-1]
@@ -1099,7 +1101,9 @@ class ReTraceService:
             },
             "long_term": {
                 "beliefs": [belief.as_dict() for belief in stable_long_term],
+                "status": memory_status,
             },
+            "memory_status": memory_status,
         }
 
     def process_turn(

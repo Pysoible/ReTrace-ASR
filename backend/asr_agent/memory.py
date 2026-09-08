@@ -10,7 +10,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock, RLock
-from typing import Callable
+from typing import Any, Callable
 
 from asr_agent.models import MemoryBelief, Session, Turn, WorkingHypothesis
 
@@ -156,6 +156,18 @@ class LongTermMemoryRepository:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._status_lock = RLock()
+        self._last_status: dict[str, dict[str, Any]] = {}
+
+    def _record(self, scope: str, operation: str, error: Exception | None = None) -> None:
+        with self._status_lock:
+            self._last_status[scope] = {
+                "last_operation": operation,
+                "error": None if error is None else {
+                    "kind": type(error).__name__,
+                    "message": str(error),
+                },
+            }
 
     def _path(self, scope: str) -> Path:
         if not scope or not re.fullmatch(r"[A-Za-z0-9_.-]+", scope) or ".." in scope:
@@ -168,8 +180,14 @@ class LongTermMemoryRepository:
             return _MEMORY_LOCKS.setdefault(key, RLock())
 
     def load(self, scope: str) -> list[MemoryBelief]:
-        with self._lock_for(scope):
-            return self._load_unlocked(scope)
+        try:
+            with self._lock_for(scope):
+                beliefs = self._load_unlocked(scope)
+        except Exception as exc:
+            self._record(scope, "load", exc)
+            raise
+        self._record(scope, "load")
+        return beliefs
 
     def _load_unlocked(self, scope: str) -> list[MemoryBelief]:
         path = self._path(scope)
@@ -181,8 +199,13 @@ class LongTermMemoryRepository:
         return [MemoryBelief.from_dict(item) for item in data]
 
     def save(self, scope: str, beliefs: list[MemoryBelief]) -> None:
-        with self._lock_for(scope):
-            self._save_unlocked(scope, beliefs)
+        try:
+            with self._lock_for(scope):
+                self._save_unlocked(scope, beliefs)
+        except Exception as exc:
+            self._record(scope, "save", exc)
+            raise
+        self._record(scope, "save")
 
     def _save_unlocked(self, scope: str, beliefs: list[MemoryBelief]) -> None:
         path = self._path(scope)
@@ -196,12 +219,47 @@ class LongTermMemoryRepository:
             if temporary and temporary.exists():
                 temporary.unlink()
 
-    def update(self, scope: str, mutate: Callable[[list[MemoryBelief]], None]) -> list[MemoryBelief]:
-        with self._lock_for(scope):
-            beliefs = self._load_unlocked(scope)
-            mutate(beliefs)
-            self._save_unlocked(scope, beliefs)
-            return [MemoryBelief.from_dict(item.as_dict()) for item in beliefs]
+    def update(
+        self,
+        scope: str,
+        mutate: Callable[[list[MemoryBelief]], None],
+        *,
+        operation: str = "update",
+    ) -> list[MemoryBelief]:
+        try:
+            with self._lock_for(scope):
+                beliefs = self._load_unlocked(scope)
+                mutate(beliefs)
+                self._save_unlocked(scope, beliefs)
+                result = [MemoryBelief.from_dict(item.as_dict()) for item in beliefs]
+        except Exception as exc:
+            self._record(scope, operation, exc)
+            raise
+        self._record(scope, operation)
+        return result
+
+    def status(self, scope: str) -> dict[str, Any]:
+        with self._status_lock:
+            recorded = dict(self._last_status.get(scope) or {})
+        try:
+            with self._lock_for(scope):
+                beliefs = self._load_unlocked(scope)
+        except Exception as exc:
+            beliefs = []
+            if not recorded.get("error"):
+                recorded = {
+                    "last_operation": "status",
+                    "error": {"kind": type(exc).__name__, "message": str(exc)},
+                }
+        counts = Counter(item.status for item in beliefs)
+        return {
+            "scope": scope,
+            "provisional": counts.get("provisional", 0),
+            "stable": counts.get("stable", 0),
+            "superseded": counts.get("superseded", 0),
+            "last_operation": recorded.get("last_operation"),
+            "error": recorded.get("error"),
+        }
 
 
 class MemoryRetriever:
@@ -342,7 +400,7 @@ class MemoryConsolidator:
             stored[:] = list(by_id.values())
 
         try:
-            self.repository.update(scope, merge)
+            self.repository.update(scope, merge, operation="consolidate")
         except (OSError, ValueError, json.JSONDecodeError):
             return []
         return promoted

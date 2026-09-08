@@ -27,7 +27,7 @@ from asr_agent.integrations.qwen_asr import (
     stream_transcribe_audio,
     transcribe_audio,
 )
-from asr_agent.model_identity import ModelIdentity
+from asr_agent.model_identity import ModelIdentity, model_memory_scope
 from asr_agent.realtime import RealtimeAnalysisCoordinator
 from asr_agent.retrace import ReTraceService
 
@@ -231,8 +231,9 @@ def create_app(
     coordinator: RealtimeAnalysisCoordinator | None = None,
 ) -> FastAPI:
     root = workspace or Path.cwd() / "retrace_state"
+    qwen_model = Path(read_asr_config().model_path).name
+    qwen_first_pass_identity = ModelIdentity("qwen-omni-vllm", qwen_model, "first_pass")
     if service is None:
-        qwen_model = Path(read_asr_config().model_path).name
         service = ReTraceService(
             root / "sessions",
             verifier_identity=ModelIdentity(
@@ -335,12 +336,13 @@ def create_app(
         bound_session = _audio_session_id(audio_path, session_id)
         first_pass = ModelIdentity.from_asr_result(asr)
         provenance = {"first_pass": first_pass.as_dict()}
-        # Each audio session keeps its own durable long-term memory file
-        # (scope == session id), so switching sessions never loses or mixes
-        # previously consolidated beliefs.
+        memory_scope = model_memory_scope(
+            first_pass,
+            namespace=os.getenv("ASR_EXPERIMENT_NAMESPACE", "default"),
+        )
         service.reset_session(
             bound_session,
-            memory_scope=bound_session,
+            memory_scope=memory_scope,
             pipeline_provenance=provenance,
         )
 
@@ -444,7 +446,16 @@ def create_app(
         bound_session = _audio_session_id(audio_path, session_id)
         events = _new_event_stream(bound_session)
         try:
-            service.reset_session(bound_session, memory_scope=bound_session)
+            provenance = {"first_pass": qwen_first_pass_identity.as_dict()}
+            memory_scope = model_memory_scope(
+                qwen_first_pass_identity,
+                namespace=os.getenv("ASR_EXPERIMENT_NAMESPACE", "default"),
+            )
+            service.reset_session(
+                bound_session,
+                memory_scope=memory_scope,
+                pipeline_provenance=provenance,
+            )
             _publish(bound_session, {"type": "session", "session_id": bound_session})
         except Exception as exc:
             _publish(bound_session, {"type": "error", "message": f"初始化会话失败: {exc}"})
@@ -481,6 +492,7 @@ def create_app(
                         "speakers": chunk.get("speakers") or [],
                         "overlap": bool(chunk.get("overlap")),
                         "routing": chunk.get("routing"),
+                        "first_pass_identity": qwen_first_pass_identity.as_dict(),
                     },
                 )
             except Exception as exc:
