@@ -7,6 +7,7 @@ import os
 import queue
 import re
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -405,15 +406,26 @@ def create_app(
             )
             revisions.extend(final_audit.get("revisions") or [])
 
+        session_payload = service.get_session(bound_session)
+        aggregate_timings: dict[str, float] = {}
+        aggregate_calls: dict[str, int] = {}
+        for turn in session_payload.get("turns") or []:
+            meta = turn.get("meta") or {}
+            for key, value in (meta.get("stage_timings_ms") or {}).items():
+                aggregate_timings[str(key)] = aggregate_timings.get(str(key), 0.0) + float(value)
+            for key, value in (meta.get("stage_call_counts") or {}).items():
+                aggregate_calls[str(key)] = aggregate_calls.get(str(key), 0) + int(value)
         out: dict[str, Any] = {
             "session_id": bound_session,
-            "session": service.get_session(bound_session),
+            "session": session_payload,
             "revisions": revisions,
             "asr": asr,
             "turn_count": len(processed_turn_ids),
             "mode": mode,
             "experiment_mode": mode,
             "provenance": provenance,
+            "stage_timings_ms": aggregate_timings,
+            "stage_call_counts": aggregate_calls,
         }
         return out
 
@@ -423,7 +435,10 @@ def create_app(
         audio_path: str,
         experiment_mode: Literal["baseline", "retrace"] = "retrace",
     ) -> dict[str, Any]:
+        request_started = time.perf_counter()
+        asr_started = time.perf_counter()
         asr = transcribe_audio(audio_path)
+        first_pass_ms = (time.perf_counter() - asr_started) * 1000.0
         if experiment_mode == "baseline":
             if not asr.get("ok"):
                 raise HTTPException(status_code=503, detail=asr.get("error") or "ASR failed")
@@ -441,14 +456,24 @@ def create_app(
                 "revisions": [],
                 "asr": asr,
                 "provenance": {"first_pass": identity.as_dict()},
+                "stage_timings_ms": {
+                    "first_pass_asr": first_pass_ms,
+                    "request_total": (time.perf_counter() - request_started) * 1000.0,
+                },
+                "stage_call_counts": {"first_pass_asr": 1, "request_total": 1},
             }
-        return _build_session_from_asr(
+        result = _build_session_from_asr(
             session_id,
             audio_path=audio_path,
             asr=asr,
             source="moss" if asr.get("backend") == "moss-transcribe-diarize" else "qwen-omni",
             mode="retrace",
         )
+        result["stage_timings_ms"]["first_pass_asr"] = first_pass_ms
+        result["stage_timings_ms"]["request_total"] = (time.perf_counter() - request_started) * 1000.0
+        result["stage_call_counts"]["first_pass_asr"] = 1
+        result["stage_call_counts"]["request_total"] = 1
+        return result
 
     def _stream_audio_session_background(
         session_id: str,

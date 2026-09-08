@@ -1,4 +1,35 @@
-from asr_agent.metrics import evaluate_revisions
+from asr_agent.metrics import evaluate_primary_metrics, evaluate_revisions
+
+
+def test_primary_task_metrics_use_offline_denominators_and_ignore_audits():
+    report = evaluate_primary_metrics(
+        events=[
+            {"event_id": "r1", "event_kind": "revision", "action": "REVISE_HISTORY",
+             "target_turn_id": "t1", "span": "图博士", "replacement": "涂博士", "active": True},
+            {"event_id": "r2", "event_kind": "revision", "action": "REVISE_CURRENT",
+             "target_turn_id": "t2", "span": "泰信", "replacement": "泰康", "active": True},
+            {"event_id": "r3", "event_kind": "revision", "action": "REVISE_CURRENT",
+             "target_turn_id": "t3", "span": "南庄", "replacement": "女装", "active": True},
+            {"event_id": "audit", "event_kind": "candidate_audit", "action": "REVISE_CURRENT",
+             "target_turn_id": "t4", "span": "甲", "replacement": "乙", "active": True},
+        ],
+        eligible_errors=[
+            {"target_turn_id": "t1", "span": "图博士", "correction": "涂博士"},
+            {"target_turn_id": "t2", "span": "泰信", "correction": "泰康"},
+            {"target_turn_id": "t5", "span": "卡斯克", "correction": "卡兹克"},
+        ],
+        entity_mentions=[
+            {"target_turn_id": "t1", "value": "图博士", "canonical": "涂博士"},
+            {"target_turn_id": "t2", "value": "泰信", "canonical": "泰康"},
+            {"target_turn_id": "t3", "value": "南庄", "canonical": "男装"},
+            {"target_turn_id": "t6", "value": "卡兹克", "canonical": "卡兹克"},
+        ],
+    )
+
+    assert report["lecr"] == 2 / 3
+    assert report["revision_precision"] == 2 / 3
+    assert report["entity_consistency_error_rate"] == 1 / 4
+    assert report["committed_revisions"] == 3
 
 
 def test_revision_metrics_measure_precision_overcorrection_and_latency():

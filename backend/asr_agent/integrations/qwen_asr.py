@@ -769,6 +769,7 @@ def stream_transcribe_audio(
     """Streaming Qwen-Omni ASR: split the audio, transcribe chunks across all GPUs
     and call ``on_chunk(index, text, uncertainty, chunk_meta)`` as soon as each
     chunk's transcript is ready (dual-GPU parallel)."""
+    started = time.perf_counter()
     audio = (audio or "").strip()
     if not audio:
         raise RuntimeError("需要音频路径 audio")
@@ -845,6 +846,7 @@ def stream_transcribe_audio(
         "duration_sec": chunk_info.get("duration_sec"),
         "chunked": bool(chunk_info.get("chunked")),
         "chunks": chunk_meta,
+        "elapsed_sec": round(time.perf_counter() - started, 3),
     }
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -160,6 +161,7 @@ class ReTraceService:
         session_complete: bool = False,
         max_retries: int = 3,
     ) -> dict[str, Any]:
+        analysis_started = time.perf_counter()
         for attempt in range(max_retries):
             snapshot = self.repository.load(session_id)
             self.ledger.replay(snapshot)
@@ -179,6 +181,18 @@ class ReTraceService:
                     "revalidated": snapshot.version != observed_version,
                     "session": snapshot.as_dict(),
                 }
+            stage_names = (
+                "context_judge",
+                "candidate_build",
+                "targeted_verifier",
+                "open_relisten",
+                "ledger_commit",
+                "end_to_end",
+            )
+            stage_timings = {name: 0.0 for name in stage_names}
+            stage_calls = {name: 0 for name in stage_names}
+            trigger.meta["stage_timings_ms"] = stage_timings
+            trigger.meta["stage_call_counts"] = stage_calls
             snapshot.analysis_status = "analyzing"
             recovery_event, degeneration = self._recover_degenerate_turn(
                 snapshot,
@@ -230,12 +244,18 @@ class ReTraceService:
                     rationale="first-pass transcript is degenerate and audio re-transcription did not recover it",
                 )
             else:
+                judge_started = time.perf_counter()
+                stage_calls["context_judge"] += 1
                 try:
                     raw_judgment = self.context_judge(session=snapshot, current_turn=trigger, memory=memory)
                     judgment = normalize_judgment(raw_judgment, snapshot)
                 except Exception as exc:
                     judgment = ContextJudgment("UNCERTAIN", rationale=f"context judge unavailable: {exc}")
+                finally:
+                    stage_timings["context_judge"] += (time.perf_counter() - judge_started) * 1000.0
 
+            candidate_started = time.perf_counter()
+            stage_calls["candidate_build"] += 1
             candidate_pool = [focus_to_candidate(focus, snapshot) for focus in judgment.focus]
             candidate_pool.extend(
                 focus_to_candidate(focus, snapshot)
@@ -280,6 +300,7 @@ class ReTraceService:
             if judgment.focus and judgment.outcome not in {"CONFLICT", "UNCERTAIN"}:
                 judgment.outcome = "UNCERTAIN"
                 judgment.confidence = max(judgment.confidence, 0.5)
+            stage_timings["candidate_build"] += (time.perf_counter() - candidate_started) * 1000.0
 
             self._apply_beliefs(snapshot, judgment.beliefs)
             events: list[RevisionEvent] = [event for event in (recovery_event,) if event is not None]
@@ -300,6 +321,8 @@ class ReTraceService:
                 and not judgment.focus
                 and (judgment.outcome in {"UNCERTAIN", "CONFLICT"} or has_acoustic_doubt or has_coverage_risk)
             ):
+                relisten_started = time.perf_counter()
+                stage_calls["open_relisten"] += 1
                 relisten_result = self._relisten_uncertain_window(
                     snapshot,
                     trigger,
@@ -315,6 +338,7 @@ class ReTraceService:
                         candidate_to_focus(item)
                         for item in deduplicate_candidates(candidate_pool)
                     ]
+                stage_timings["open_relisten"] += (time.perf_counter() - relisten_started) * 1000.0
             audit_events: list[RevisionEvent] = []
             candidate_audits: list[RevisionEvent] = []
             deferred = judgment.outcome == "UNCERTAIN" and not judgment.focus
@@ -343,6 +367,7 @@ class ReTraceService:
                     created_version=snapshot.version,
                     last_evaluated_version=snapshot.version,
                 )
+                verifier_started = time.perf_counter()
                 resolution = self.resolver.resolve(
                     snapshot,
                     trigger,
@@ -350,6 +375,9 @@ class ReTraceService:
                     context_confidence=judgment.confidence,
                     memory_support=self._memory_support(memory.long_term_beliefs, focus.proposed_text),
                 )
+                if resolution.verifier_attempted:
+                    stage_calls["targeted_verifier"] += 1
+                    stage_timings["targeted_verifier"] += (time.perf_counter() - verifier_started) * 1000.0
                 candidate_id = self._event_id(
                     session_id,
                     focus.target_turn_id,
@@ -495,7 +523,12 @@ class ReTraceService:
                     if evidence_turn_id not in snapshot.dependency_index[focus.target_turn_id]:
                         snapshot.dependency_index[focus.target_turn_id].append(evidence_turn_id)
 
+            ledger_started = time.perf_counter()
+            stage_calls["ledger_commit"] += 1
             self.ledger.append_many(snapshot, [*audit_events, *candidate_audits, *events], event_version=snapshot.version + 1)
+            stage_timings["ledger_commit"] += (time.perf_counter() - ledger_started) * 1000.0
+            stage_calls["end_to_end"] = 1
+            stage_timings["end_to_end"] = (time.perf_counter() - analysis_started) * 1000.0
             snapshot.analysis_status = "deferred" if deferred else "idle"
             trigger.meta["analyzed_observed_version"] = observed_version
             trigger.meta["analyzed_session_version"] = snapshot.version + 1

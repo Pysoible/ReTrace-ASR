@@ -843,6 +843,39 @@ def test_moss_turn_cannot_call_qwen_open_relistener(tmp_path):
     assert turn_meta["relisten_uncertain"]["failure_code"] == "relistener_backend_mismatch"
 
 
+def test_retrace_records_component_timings_and_call_counts(tmp_path):
+    identity = ModelIdentity("qwen-omni-vllm", "Qwen3_Omni_30B", "first_pass")
+    verifier = ModelIdentity("qwen-omni-vllm", "Qwen3_Omni_30B", "targeted_verifier")
+    service = ReTraceService(
+        tmp_path,
+        context_judge=lambda **_: ContextJudgment(
+            "CONFLICT", 0.99,
+            focus=[FocusProposal("t1", "南庄", "男装", ["南庄", "男装"], ["t1"])],
+        ),
+        audio_verifier=lambda **kwargs: {
+            "ok": True,
+            "scores": {item: (0.99 if item == "男装" else 0.01) for item in kwargs["candidates"]},
+        },
+        verifier_identity=verifier,
+    )
+
+    result = service.process_turn(
+        "s", "t1", "南庄", source="qwen-omni",
+        meta={"audio_path": "/tmp/a.wav", "start_sec": 0, "end_sec": 1,
+              "first_pass_identity": identity.as_dict()},
+    )
+
+    meta = result["session"]["turns"][0]["meta"]
+    timings = meta["stage_timings_ms"]
+    calls = meta["stage_call_counts"]
+    for stage in ("context_judge", "candidate_build", "targeted_verifier", "open_relisten", "ledger_commit", "end_to_end"):
+        assert timings[stage] >= 0
+        assert calls[stage] >= 0
+    assert calls["context_judge"] == 1
+    assert calls["targeted_verifier"] == 1
+    assert calls["open_relisten"] == 0
+
+
 def test_coverage_risk_uses_segmented_relisten_even_when_judge_is_consistent(tmp_path):
     """A fluent but severely under-covered turn is an omission recovery task."""
     calls = []

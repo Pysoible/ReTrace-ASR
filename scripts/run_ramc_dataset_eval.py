@@ -23,6 +23,8 @@ import wave
 from pathlib import Path
 from typing import Any
 
+from asr_agent.metrics import evaluate_primary_metrics
+
 _CHAR_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]")
 _TIMESTAMP_RE = re.compile(r"^\s*\[[0-9.]+\s*[,~-]\s*[0-9.]+\]")
 _MENLI_SCORER: Any = None
@@ -590,7 +592,16 @@ def revision_metrics(
     }
 
 
-def evaluate_one(base_url: str, wav: Path, txt: Path, output_root: Path, timeout: float, session_tag: str) -> dict[str, Any]:
+def evaluate_one(
+    base_url: str,
+    wav: Path,
+    txt: Path,
+    output_root: Path,
+    timeout: float,
+    session_tag: str,
+    experiment_mode: str = "retrace",
+    annotations: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     stem = wav.stem
     sample_dir = output_root / "samples" / stem
     sample_dir.mkdir(parents=True, exist_ok=True)
@@ -600,10 +611,27 @@ def evaluate_one(base_url: str, wav: Path, txt: Path, output_root: Path, timeout
     try:
         payload = post_json(
             f"{base_url.rstrip('/')}/api/sessions/{session_tag}_{stem}/audio",
-            {"audio": str(wav)},
+            {"audio": str(wav), "experiment_mode": experiment_mode},
             timeout,
         )
         session = payload.get("session") or {}
+        if experiment_mode == "baseline" and not session:
+            asr = payload.get("asr") or {}
+            parts = list(asr.get("chunks_text") or [])
+            chunks = list(asr.get("chunks") or [])
+            session = {
+                "turns": [
+                    {
+                        "turn_id": f"t{index + 1:03d}",
+                        "raw_text": str(text),
+                        "current_text": str(text),
+                        "meta": chunks[index] if index < len(chunks) else {},
+                    }
+                    for index, text in enumerate(parts)
+                    if str(text).strip()
+                ],
+                "revision_events": [],
+            }
         raw_display = join_turns(session, "raw_text")
         current_display = join_turns(session, "current_text")
         raw = join_turns_for_metrics(session, "raw_text")
@@ -616,11 +644,26 @@ def evaluate_one(base_url: str, wav: Path, txt: Path, output_root: Path, timeout
         groundtruth_segments = reference_segments(txt)
         turn_references, reference_diagnostics = reference_by_assigned_turn(session.get("turns") or [], groundtruth_segments)
         requested_metrics = revision_metrics(session, reference, duration, turn_references)
+        primary_metrics: dict[str, Any]
+        if annotations is not None:
+            primary_metrics = evaluate_primary_metrics(
+                events=list(session.get("revision_events") or []),
+                eligible_errors=list(annotations.get("eligible_errors") or []),
+                entity_mentions=list(annotations.get("entity_mentions") or []),
+            )
+        else:
+            primary_metrics = {
+                "lecr": None,
+                "revision_precision": requested_metrics.get("Revision Precision"),
+                "entity_consistency_error_rate": None,
+                "note": "LECR and ECER require offline eligible-error/entity annotations.",
+            }
         comparison = groundtruth_comparison(session, turn_references)
         mismatch_count = language_mismatch_count(session, turn_references)
         metrics = {
             "audio_id": stem,
             "metric_kind": "diagnostic_cer",
+            "experiment_mode": payload.get("experiment_mode", experiment_mode),
             "official_scoring": False,
             "duration_seconds": duration,
             "elapsed_seconds": round(elapsed, 3),
@@ -633,6 +676,9 @@ def evaluate_one(base_url: str, wav: Path, txt: Path, output_root: Path, timeout
             "final_menli_tacl2023": official_menli(reference, current),
             "metric_errors": dict(_METRIC_ERRORS),
             "requested_metrics": requested_metrics,
+            "primary_metrics": primary_metrics,
+            "stage_timings_ms": dict(payload.get("stage_timings_ms") or {}),
+            "stage_call_counts": dict(payload.get("stage_call_counts") or {}),
             "groundtruth_comparison": comparison,
             "cer_absolute_gain": round(raw_metrics["cer"] - current_metrics["cer"], 6),
             "cer_relative_gain": round((raw_metrics["cer"] - current_metrics["cer"]) / raw_metrics["cer"], 6) if raw_metrics["cer"] else 0.0,
@@ -729,7 +775,11 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "rollback_success_rate",
             )
         },
-        "component_time_note": "Component-level Qwen and Paraformer timings are not emitted by the current live endpoint; only end-to-end RTF is comparable until server instrumentation is added.",
+        "stage_timings_ms": {
+            stage: sum(float((row.get("stage_timings_ms") or {}).get(stage, 0.0)) for row in valid)
+            for stage in sorted({stage for row in valid for stage in (row.get("stage_timings_ms") or {})})
+        },
+        "component_time_note": "Stage timings are summed wall-clock milliseconds from the live endpoint; compare call counts alongside totals.",
     }
 
 
@@ -743,6 +793,8 @@ def main() -> None:
     parser.add_argument("--session-tag", default="", help="unique session namespace for this run")
     parser.add_argument("--timeout", type=float, default=7200.0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--experiment-mode", choices=("baseline", "retrace"), default="retrace")
+    parser.add_argument("--annotation-root", type=Path, help="optional per-audio JSON files with eligible_errors and entity_mentions")
     args = parser.parse_args()
     wavs = sorted((args.dataset_root / "WAV").glob("*.wav"))
     if args.stems:
@@ -769,7 +821,21 @@ def main() -> None:
         else:
             print(f"[{index}/{len(wavs)}] {wav.name}", flush=True)
             session_tag = args.session_tag.strip() or args.output_root.name
-            row = evaluate_one(args.base_url, wav, txt, args.output_root, args.timeout, session_tag)
+            annotations = None
+            if args.annotation_root is not None:
+                annotation_path = args.annotation_root / f"{wav.stem}.json"
+                if annotation_path.exists():
+                    annotations = json.loads(annotation_path.read_text(encoding="utf-8"))
+            row = evaluate_one(
+                args.base_url,
+                wav,
+                txt,
+                args.output_root,
+                args.timeout,
+                session_tag,
+                args.experiment_mode,
+                annotations,
+            )
             print(json.dumps({k: row.get(k) for k in ("audio_id", "status", "raw_asr", "final", "revision_events", "rtf", "error")}, ensure_ascii=False), flush=True)
         rows.append(row)
         with jsonl.open("a", encoding="utf-8") as stream:
@@ -788,6 +854,7 @@ def main() -> None:
             "acoustic_sentinel_observed_turns", "acoustic_sentinel_signal_turns",
             "whole_turn_recovery_count", "local_revision_count", "repeated_tail_cleanup_count",
             "eligible_turn_count", "ambiguous_turn_count", "unscorable_turn_count", "language_mismatch_count",
+            "experiment_mode", "lecr", "revision_precision_primary", "entity_consistency_error_rate",
             "error",
         ]
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -805,6 +872,7 @@ def main() -> None:
                 "acoustic_sentinel_observed_turns": row.get("acoustic_sentinel_observed_turns"), "acoustic_sentinel_signal_turns": row.get("acoustic_sentinel_signal_turns"),
                 "whole_turn_recovery_count": row.get("whole_turn_recovery_count"), "local_revision_count": row.get("local_revision_count"), "repeated_tail_cleanup_count": row.get("repeated_tail_cleanup_count"),
                 "eligible_turn_count": row.get("eligible_turn_count"), "ambiguous_turn_count": row.get("ambiguous_turn_count"), "unscorable_turn_count": row.get("unscorable_turn_count"), "language_mismatch_count": row.get("language_mismatch_count"),
+                "experiment_mode": row.get("experiment_mode"), "lecr": (row.get("primary_metrics") or {}).get("lecr"), "revision_precision_primary": (row.get("primary_metrics") or {}).get("revision_precision"), "entity_consistency_error_rate": (row.get("primary_metrics") or {}).get("entity_consistency_error_rate"),
                 "error": row.get("error", ""),
             })
     print(json.dumps(summary["metrics"], ensure_ascii=False, indent=2), flush=True)

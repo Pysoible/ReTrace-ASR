@@ -155,6 +155,9 @@ def test_evaluate_one_reports_diagnostic_cer_not_fake_wer(monkeypatch, tmp_path)
     assert row["final"]["cer"] == 0.0
     assert row["final_wer"] is None
     assert row["metric_kind"] == "diagnostic_cer"
+    assert row["experiment_mode"] == "retrace"
+    assert row["primary_metrics"]["lecr"] is None
+    assert row["primary_metrics"]["entity_consistency_error_rate"] is None
     assert row["eligible_turn_count"] == 1
     assert row["ambiguous_turn_count"] == 2
     assert row["unscorable_turn_count"] == 1

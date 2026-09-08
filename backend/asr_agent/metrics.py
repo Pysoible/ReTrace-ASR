@@ -4,6 +4,83 @@ from __future__ import annotations
 from typing import Any
 
 
+_REVISION_ACTIONS = {"REVISE_TEXT", "REVISE_CURRENT", "REVISE_HISTORY"}
+
+
+def _committed_revisions(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    superseded = {
+        str(event["supersedes_event_id"])
+        for event in events
+        if event.get("active", True) and event.get("supersedes_event_id")
+    }
+    return [
+        event
+        for event in events
+        if event.get("action") in _REVISION_ACTIONS
+        and event.get("event_kind", "revision") == "revision"
+        and event.get("active", True)
+        and str(event.get("event_id", "")) not in superseded
+    ]
+
+
+def evaluate_primary_metrics(
+    *,
+    events: list[dict[str, Any]],
+    eligible_errors: list[dict[str, Any]],
+    entity_mentions: list[dict[str, Any]],
+) -> dict[str, float | int]:
+    """Score ReTrace using fixed, offline ground-truth denominators.
+
+    LECR is the fraction of later-evidence-correctable errors fixed exactly.
+    Revision precision counts only committed revision events, never candidate
+    audits. ECER is the fraction of entity mentions whose final spelling still
+    differs from their offline canonical spelling.
+    """
+
+    revisions = _committed_revisions(events)
+    eligible = {
+        (str(item.get("target_turn_id", "")), str(item.get("span", ""))): str(
+            item.get("correction", "")
+        )
+        for item in eligible_errors
+    }
+    correct_revision_keys = {
+        (str(event.get("target_turn_id", "")), str(event.get("span", "")))
+        for event in revisions
+        if eligible.get((str(event.get("target_turn_id", "")), str(event.get("span", ""))))
+        == str(event.get("replacement", ""))
+    }
+    correct_revisions = sum(
+        eligible.get((str(event.get("target_turn_id", "")), str(event.get("span", ""))))
+        == str(event.get("replacement", ""))
+        for event in revisions
+    )
+
+    latest_by_target_span: dict[tuple[str, str], str] = {}
+    for event in revisions:
+        latest_by_target_span[
+            (str(event.get("target_turn_id", "")), str(event.get("span", "")))
+        ] = str(event.get("replacement", ""))
+    entity_errors = 0
+    for mention in entity_mentions:
+        turn_id = str(mention.get("target_turn_id", ""))
+        observed = str(mention.get("value", ""))
+        final_value = latest_by_target_span.get((turn_id, observed), observed)
+        entity_errors += final_value != str(mention.get("canonical", ""))
+
+    return {
+        "eligible_later_errors": len(eligible_errors),
+        "corrected_later_errors": len(correct_revision_keys),
+        "lecr": len(correct_revision_keys) / len(eligible_errors) if eligible_errors else 0.0,
+        "committed_revisions": len(revisions),
+        "correct_revisions": correct_revisions,
+        "revision_precision": correct_revisions / len(revisions) if revisions else 0.0,
+        "entity_mentions": len(entity_mentions),
+        "entity_errors": entity_errors,
+        "entity_consistency_error_rate": entity_errors / len(entity_mentions) if entity_mentions else 0.0,
+    }
+
+
 def evaluate_revisions(
     *,
     events: list[dict[str, Any]],
@@ -23,15 +100,7 @@ def evaluate_revisions(
         for event in events
         if event.get("active", True) and event.get("supersedes_event_id")
     }
-    revision_actions = {"REVISE_TEXT", "REVISE_CURRENT", "REVISE_HISTORY"}
-    revisions = [
-        event
-        for event in events
-        if event.get("action") in revision_actions
-        and event.get("event_kind", "revision") == "revision"
-        and event.get("active", True)
-        and str(event.get("event_id", "")) not in superseded
-    ]
+    revisions = _committed_revisions(events)
     positions = {turn_id: index for index, turn_id in enumerate(turn_order)}
     correct_events = [
         event

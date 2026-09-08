@@ -126,6 +126,8 @@ def test_baseline_mode_never_invokes_retrace_or_memory(tmp_path, monkeypatch):
     assert body["transcript"] == "第一句"
     assert body["revisions"] == []
     assert set(body["provenance"]) == {"first_pass"}
+    assert body["stage_timings_ms"]["first_pass_asr"] >= 0
+    assert body["stage_timings_ms"]["request_total"] >= body["stage_timings_ms"]["first_pass_asr"]
     assert not list(tmp_path.rglob("*.json"))
 
 
