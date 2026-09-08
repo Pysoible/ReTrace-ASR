@@ -8,6 +8,8 @@ import time
 from difflib import SequenceMatcher
 from typing import Any
 
+import requests
+
 from asr_agent.context_judge import ContextJudgment, ExplicitSignalFallbackJudge, FocusProposal, normalize_judgment
 from asr_agent.correction_candidates import (
     CorrectionCandidate,
@@ -114,18 +116,19 @@ def _api_key() -> str:
 
 def deepseek_status() -> dict[str, Any]:
     root = domainterms_root()
-    model = os.environ.get("JUDGE_MODEL") or os.environ.get("DEEPSEEK_MODEL", "")
-    transport = os.environ.get("LLM_TRANSPORT", "")
+    model = os.environ.get("JUDGE_MODEL") or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+    transport = os.environ.get("LLM_TRANSPORT", "http").strip().lower() or "http"
     error: str | None = None
-    try:
-        ensure_importable()
-        _sync_model_env()
-        from domain_terms import config as dt_config  # noqa: WPS433
+    if transport == "websocket":
+        try:
+            ensure_importable()
+            _sync_model_env()
+            from domain_terms import config as dt_config  # noqa: WPS433
 
-        model = getattr(dt_config, "JUDGE_MODEL", model) or model
-        transport = getattr(dt_config, "LLM_TRANSPORT", transport) or transport
-    except Exception as exc:
-        error = str(exc)
+            model = getattr(dt_config, "JUDGE_MODEL", model) or model
+            transport = getattr(dt_config, "LLM_TRANSPORT", transport) or transport
+        except Exception as exc:
+            error = str(exc)
     ready = bool(_api_key()) and error is None
     if not _api_key():
         error = "DEEPSEEK_API_KEY / LLM_API_KEY 未配置"
@@ -149,11 +152,34 @@ def context_judge_identity() -> dict[str, str]:
 
 
 def _chat_json(messages: list[dict[str, str]], *, max_tokens: int = 800) -> Any:
-    ensure_importable()
-    _sync_model_env()
-    from domain_terms import llm_client  # noqa: WPS433
+    transport = os.getenv("LLM_TRANSPORT", "http").strip().lower() or "http"
+    if transport == "websocket":
+        ensure_importable()
+        _sync_model_env()
+        from domain_terms import llm_client  # noqa: WPS433
 
-    return llm_client.chat_json(messages, max_tokens=max_tokens, temperature=0.0)
+        return llm_client.chat_json(messages, max_tokens=max_tokens, temperature=0.0)
+
+    api_key = _api_key()
+    if not api_key:
+        raise RuntimeError("DEEPSEEK_API_KEY / LLM_API_KEY 未配置")
+    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+    response = requests.post(
+        f"{base_url}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        },
+        timeout=float(os.getenv("DEEPSEEK_TIMEOUT", "120")),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    content = payload["choices"][0]["message"]["content"]
+    return _extract_json(content) if isinstance(content, str) else content
 
 
 def _domain_entities(memory: MemoryPacket) -> list[str]:

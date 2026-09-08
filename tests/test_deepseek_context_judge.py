@@ -3,6 +3,49 @@ from asr_agent.memory import MemoryPacket
 from asr_agent.models import Session, Turn
 
 
+def test_public_deepseek_status_does_not_require_domainterms_repo(monkeypatch, tmp_path):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-chat")
+    monkeypatch.delenv("LLM_TRANSPORT", raising=False)
+    monkeypatch.setenv("ASR_DOMAINTERMS_ROOT", str(tmp_path / "missing"))
+
+    status = deepseek.deepseek_status()
+
+    assert status["ready"] is True
+    assert status["transport"] == "http"
+    assert status["model"] == "deepseek-chat"
+    assert status["domainterms_exists"] is False
+
+
+def test_public_deepseek_chat_uses_openai_compatible_endpoint(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret-key")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-chat")
+    monkeypatch.delenv("LLM_TRANSPORT", raising=False)
+    seen = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"outcome":"CONSISTENT"}'}}]}
+
+    def post(url, **kwargs):
+        seen.update(url=url, **kwargs)
+        return Response()
+
+    monkeypatch.setattr(deepseek.requests, "post", post)
+
+    result = deepseek._chat_json([{"role": "user", "content": "hello"}], max_tokens=20)
+
+    assert result == {"outcome": "CONSISTENT"}
+    assert seen["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert seen["headers"]["Authorization"] == "Bearer secret-key"
+    assert seen["json"]["model"] == "deepseek-chat"
+
+
 def test_deepseek_context_judge_receives_bounded_analysis_window(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     seen = {}
