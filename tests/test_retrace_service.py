@@ -833,7 +833,7 @@ def test_moss_turn_cannot_call_qwen_open_relistener(tmp_path):
             "start_sec": 0,
             "end_sec": 1,
             "first_pass_identity": ModelIdentity(
-                "moss-transcribe-diarize", "MOSS-Audio-7B", "first_pass"
+                "moss-transcribe-diarize", "MOSS-Transcribe-Diarize", "first_pass"
             ).as_dict(),
         },
     )

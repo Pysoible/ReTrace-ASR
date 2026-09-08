@@ -15,6 +15,10 @@ from Levenshtein import editops as levenshtein_editops
 from scripts.report_candidate_pipeline import candidate_pipeline_metrics
 
 _ROW_RE = re.compile(r"^\s*([0-9.]+)\s+([0-9.]+)\s+(\S+)\s+(.+?)\s*$")
+_TEXTGRID_NAME_RE = re.compile(r'^\s*name\s*=\s*"(.*?)"\s*$')
+_TEXTGRID_XMIN_RE = re.compile(r"^\s*xmin\s*=\s*([0-9.]+)\s*$")
+_TEXTGRID_XMAX_RE = re.compile(r"^\s*xmax\s*=\s*([0-9.]+)\s*$")
+_TEXTGRID_TEXT_RE = re.compile(r'^\s*text\s*=\s*"(.*?)"\s*$')
 
 
 def clean(text: str) -> str:
@@ -48,7 +52,7 @@ def metrics(reference: str, hypothesis: str) -> dict[str, Any]:
     }
 
 
-def parse_reference(path: Path) -> tuple[str, list[dict[str, Any]]]:
+def _parse_text_reference(path: Path) -> tuple[str, list[dict[str, Any]]]:
     rows = []
     for line in path.read_text(encoding="utf-8").splitlines():
         match = _ROW_RE.match(line)
@@ -56,6 +60,44 @@ def parse_reference(path: Path) -> tuple[str, list[dict[str, Any]]]:
             rows.append({"start": float(match[1]), "end": float(match[2]), "spk": match[3], "text": re.sub(r"<[^>]+>", "", match[4]).strip()})
     rows.sort(key=lambda row: (row["start"], row["end"]))
     return "".join(row["text"] for row in rows), rows
+
+
+def _parse_textgrid_reference(path: Path) -> tuple[str, list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    speaker = "unknown"
+    start: float | None = None
+    end: float | None = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if name_match := _TEXTGRID_NAME_RE.match(line):
+            speaker = name_match[1] or speaker
+            continue
+        if xmin_match := _TEXTGRID_XMIN_RE.match(line):
+            start = float(xmin_match[1])
+            continue
+        if xmax_match := _TEXTGRID_XMAX_RE.match(line):
+            end = float(xmax_match[1])
+            continue
+        if text_match := _TEXTGRID_TEXT_RE.match(line):
+            text = re.sub(r"<[^>]+>", "", text_match[1]).strip()
+            if text and start is not None and end is not None and end > start:
+                rows.append({"start": start, "end": end, "spk": speaker, "text": text})
+            start = end = None
+    rows.sort(key=lambda row: (row["start"], row["end"]))
+    return "".join(row["text"] for row in rows), rows
+
+
+def parse_reference(path: Path) -> tuple[str, list[dict[str, Any]]]:
+    if path.name.lower().endswith((".textgrid", ".textgrid.txt")):
+        return _parse_textgrid_reference(path)
+    return _parse_text_reference(path)
+
+
+def resolve_reference_path(reference_dir: Path, stem: str) -> Path | None:
+    for suffix in (".txt", ".TextGrid", ".textgrid"):
+        candidate = reference_dir / f"{stem}{suffix}"
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def retrace_miss_analysis(session: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -165,11 +207,17 @@ def main() -> None:
     parser.add_argument("--wav-dir", type=Path, required=True); parser.add_argument("--reference-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True); parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--timeout", type=float, default=7200); parser.add_argument("--resume", action="store_true")
-    args = parser.parse_args(); samples = sorted(args.wav_dir.glob("*.wav")); summary_path = args.output_dir / "summary.json"; args.output_dir.mkdir(parents=True, exist_ok=True)
+    args = parser.parse_args()
+    samples = sorted(
+        path
+        for suffix in ("*.wav", "*.flac")
+        for path in args.wav_dir.glob(suffix)
+    )
+    summary_path = args.output_dir / "summary.json"; args.output_dir.mkdir(parents=True, exist_ok=True)
     summary = {item["sample"]: item for item in json.loads(summary_path.read_text(encoding="utf-8"))} if args.resume and summary_path.exists() else {}
     for index, audio in enumerate(samples, 1):
-        reference = args.reference_dir / f"{audio.stem}.txt"
-        if not reference.exists(): summary[audio.stem] = {"sample": audio.stem, "error": f"missing reference: {reference}"}; continue
+        reference = resolve_reference_path(args.reference_dir, audio.stem)
+        if reference is None: summary[audio.stem] = {"sample": audio.stem, "error": f"missing reference for stem {audio.stem} in {args.reference_dir}"}; continue
         print(f"[{index}/{len(samples)}] {audio.name}", flush=True)
         try:
             item = evaluate_sample(args.base_url, audio, reference, args.output_dir / audio.stem, args.timeout); summary[audio.stem] = item

@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from typing import Any
 
 
+MOSS_TRANSCRIBE_DIARIZE_MODEL = "MOSS-Transcribe-Diarize"
+
+
 def _clean(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
     return cleaned or "unknown"
@@ -40,9 +43,13 @@ class ModelIdentity:
 
     @classmethod
     def from_asr_result(cls, value: dict[str, Any]) -> "ModelIdentity":
+        backend = str(value.get("backend") or "unknown")
+        model = str(value.get("model") or "") or (
+            MOSS_TRANSCRIBE_DIARIZE_MODEL if backend.strip().lower() == "moss-transcribe-diarize" else "unknown"
+        )
         return cls(
-            backend=str(value.get("backend") or "unknown"),
-            model=str(value.get("model") or "unknown"),
+            backend=backend,
+            model=model,
             role="first_pass",
         )
 

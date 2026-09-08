@@ -82,7 +82,7 @@ def test_repository_status_exposes_consolidation_failure(tmp_path, monkeypatch):
 
 def test_model_memory_scope_is_shared_across_audio_but_isolated_by_model():
     qwen = ModelIdentity("qwen-omni-vllm", "Qwen3_Omni_30B", "first_pass")
-    moss = ModelIdentity("moss-transcribe-diarize", "MOSS-Audio-7B", "first_pass")
+    moss = ModelIdentity("moss-transcribe-diarize", "MOSS-Transcribe-Diarize", "first_pass")
 
     assert model_memory_scope(qwen, namespace="experiment-a") == model_memory_scope(
         qwen, namespace="experiment-a"

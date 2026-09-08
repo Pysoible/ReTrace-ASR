@@ -5,12 +5,12 @@ def test_unknown_moss_model_is_not_inferred_from_qwen_configuration():
     identity = ModelIdentity.from_asr_result({"backend": "moss-transcribe-diarize"})
 
     assert identity.backend == "moss-transcribe-diarize"
-    assert identity.model == "unknown"
+    assert identity.model == "MOSS-Transcribe-Diarize"
     assert identity.family == "moss"
 
 
 def test_same_model_shares_memory_scope_but_models_are_isolated():
-    moss = ModelIdentity("moss-transcribe-diarize", "MOSS-Audio-7B", "first_pass")
+    moss = ModelIdentity("moss-transcribe-diarize", "MOSS-Transcribe-Diarize", "first_pass")
     omni = ModelIdentity("qwen-omni-vllm", "Qwen3_Omni_30B", "first_pass")
 
     assert model_memory_scope(moss, namespace="eval") == model_memory_scope(moss, namespace="eval")

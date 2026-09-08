@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 from asr_agent.integrations.audio_verifier import verify_candidates
 from asr_agent.integrations.deepseek import deepseek_status
-from asr_agent.integrations.qwen_asr import (
+from asr_agent.integrations.asr_backend import (
     asr_status,
     preload_engine,
     read_asr_config,
@@ -233,17 +233,30 @@ def create_app(
     coordinator: RealtimeAnalysisCoordinator | None = None,
 ) -> FastAPI:
     root = workspace or Path.cwd() / "retrace_state"
-    qwen_model = Path(str(getattr(read_asr_config(), "model_path", "unknown"))).name
-    qwen_first_pass_identity = ModelIdentity("qwen-omni-vllm", qwen_model, "first_pass")
+    # Load project .env once during app construction. `read_asr_config()` is
+    # intentionally retained here because it already implements the repo-local
+    # dotenv fallback used by the existing Qwen path; MOSS and DeepSeek then see
+    # the same environment without depending on the Qwen backend at inference.
+    read_asr_config()
+    configured_first_pass = ModelIdentity.from_asr_result(asr_status())
+    verifier_identity = None
+    relistener_identity = None
+    if configured_first_pass.family == "qwen-omni":
+        verifier_identity = ModelIdentity(
+            configured_first_pass.backend,
+            configured_first_pass.model,
+            "targeted_verifier",
+        )
+        relistener_identity = ModelIdentity(
+            configured_first_pass.backend,
+            configured_first_pass.model,
+            "open_relistener",
+        )
     if service is None:
         service = ReTraceService(
             root / "sessions",
-            verifier_identity=ModelIdentity(
-                "qwen-omni-vllm", qwen_model, "targeted_verifier"
-            ),
-            relistener_identity=ModelIdentity(
-                "qwen-omni-vllm", qwen_model, "open_relistener"
-            ),
+            verifier_identity=verifier_identity,
+            relistener_identity=relistener_identity,
         )
     coordinator = coordinator or RealtimeAnalysisCoordinator(service)
     upload_dir = root / "uploads"
@@ -495,10 +508,11 @@ def create_app(
         events = _new_event_stream(bound_session)
         baseline_turns: list[dict[str, Any]] = []
         try:
-            provenance = {"first_pass": qwen_first_pass_identity.as_dict()}
+            first_pass_identity = ModelIdentity.from_asr_result(asr_status())
+            provenance = {"first_pass": first_pass_identity.as_dict()}
             if experiment_mode == "retrace":
                 memory_scope = model_memory_scope(
-                    qwen_first_pass_identity,
+                    first_pass_identity,
                     namespace=os.getenv("ASR_EXPERIMENT_NAMESPACE", "default"),
                 )
                 service.reset_session(
@@ -561,7 +575,7 @@ def create_app(
                         "speakers": chunk.get("speakers") or [],
                         "overlap": bool(chunk.get("overlap")),
                         "routing": chunk.get("routing"),
-                        "first_pass_identity": qwen_first_pass_identity.as_dict(),
+                        "first_pass_identity": first_pass_identity.as_dict(),
                     },
                 )
             except Exception as exc:
@@ -594,8 +608,15 @@ def create_app(
         try:
             summary = stream_transcribe_audio(audio_path, _on_chunk)
             _publish(bound_session, {"type": "asr_done", "chunk_count": summary.get("chunk_count"), "duration_sec": summary.get("duration_sec")})
-            from asr_agent.integrations.qwen_asr import _infer_speaker_segments, _truthy, parse_rttm, read_asr_config
-            if experiment_mode == "retrace" and summary.get("rttm") and _truthy(os.getenv("ASR_STREAM_SPEAKER_ROUTING", "0")):
+            speaker_routing_enabled = os.getenv("ASR_STREAM_SPEAKER_ROUTING", "0").strip().lower() in {"1", "true", "yes", "on"}
+            if (
+                experiment_mode == "retrace"
+                and first_pass_identity.family == "qwen-omni"
+                and summary.get("rttm")
+                and speaker_routing_enabled
+            ):
+                from asr_agent.integrations.qwen_asr import _infer_speaker_segments, parse_rttm, read_asr_config
+
                 _publish(bound_session, {"type": "speaker_asr_started", "session": service.get_session(bound_session)})
                 processor.finish()
                 worker.join(timeout=120)

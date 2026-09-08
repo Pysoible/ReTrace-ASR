@@ -1,4 +1,4 @@
-from scripts.run_aishell4_eval import clean, retrace_miss_analysis
+from scripts.run_aishell4_eval import clean, parse_reference, resolve_reference_path, retrace_miss_analysis
 from scripts.export_aishell4_errors import _group_for_display, _strip_time
 
 
@@ -24,6 +24,49 @@ def test_error_report_groups_short_turns_for_human_review():
         "gt": "乙丁",
         "timestamp": {"start_sec": 0.0, "end_sec": 24.0},
     }]
+
+
+def test_parse_aishell4_textgrid_reference(tmp_path):
+    reference = tmp_path / "sample.TextGrid"
+    reference.write_text(
+        '''
+        item [1]:
+            class = "IntervalTier"
+            name = "S01"
+            intervals [1]:
+                xmin = 0
+                xmax = 1.2
+                text = "大家好"
+            intervals [2]:
+                xmin = 1.2
+                xmax = 2.0
+                text = ""
+        item [2]:
+            class = "IntervalTier"
+            name = "S02"
+            intervals [1]:
+                xmin = 2.1
+                xmax = 3.0
+                text = "开始开会"
+        ''',
+        encoding="utf-8",
+    )
+
+    text, rows = parse_reference(reference)
+
+    assert text == "大家好开始开会"
+    assert rows == [
+        {"start": 0.0, "end": 1.2, "spk": "S01", "text": "大家好"},
+        {"start": 2.1, "end": 3.0, "spk": "S02", "text": "开始开会"},
+    ]
+
+
+def test_resolve_reference_path_prefers_txt_then_textgrid(tmp_path):
+    (tmp_path / "a.TextGrid").write_text("", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("", encoding="utf-8")
+
+    assert resolve_reference_path(tmp_path, "a") == tmp_path / "a.TextGrid"
+    assert resolve_reference_path(tmp_path, "b") == tmp_path / "b.txt"
 
 
 def test_miss_analysis_distinguishes_missing_signal_from_acoustic_failure():

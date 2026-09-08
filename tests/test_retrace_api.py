@@ -52,7 +52,7 @@ def test_moss_backend_result_marks_audio_turn_source(tmp_path, monkeypatch):
     assert response.json()["session"]["turns"][0]["source"] == "moss"
 
 
-def test_moss_backend_never_acquires_qwen_model_name(tmp_path, monkeypatch):
+def test_moss_backend_uses_canonical_model_name_without_qwen_fallback(tmp_path, monkeypatch):
     monkeypatch.setenv("ASR_MODEL_PATH", "/models/Qwen3_Omni_30B")
     monkeypatch.setattr(
         server,
@@ -69,7 +69,11 @@ def test_moss_backend_never_acquires_qwen_model_name(tmp_path, monkeypatch):
     with TestClient(create_app(tmp_path)) as client:
         body = client.post("/api/sessions/s/audio", json={"audio": "/tmp/moss.wav"}).json()
 
-    expected = {"backend": "moss-transcribe-diarize", "model": "unknown", "role": "first_pass"}
+    expected = {
+        "backend": "moss-transcribe-diarize",
+        "model": "MOSS-Transcribe-Diarize",
+        "role": "first_pass",
+    }
     assert body["provenance"]["first_pass"] == expected
     assert body["session"]["pipeline_provenance"]["first_pass"] == expected
     assert body["session"]["turns"][0]["meta"]["first_pass_identity"] == expected
@@ -81,7 +85,7 @@ def test_audio_sessions_share_memory_by_model_and_isolate_other_models(tmp_path,
          "chunks_text": ["甲"], "chunks": [{}], "uncertainties": [{}]},
         {"ok": True, "backend": "qwen-omni-vllm", "model": "Qwen3_Omni_30B",
          "chunks_text": ["乙"], "chunks": [{}], "uncertainties": [{}]},
-        {"ok": True, "backend": "moss-transcribe-diarize", "model": "MOSS-Audio-7B",
+        {"ok": True, "backend": "moss-transcribe-diarize", "model": "MOSS-Transcribe-Diarize",
          "chunks_text": ["丙"], "chunks": [{}], "uncertainties": [{}]},
     ])
     monkeypatch.setenv("ASR_EXPERIMENT_NAMESPACE", "scope-test")
