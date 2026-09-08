@@ -839,6 +839,8 @@ def stream_transcribe_audio(
     return {
         "ok": True,
         "audio": str(path),
+        "backend": "qwen-omni-vllm",
+        "model": Path(cfg.model_path).name,
         "chunk_count": int(chunk_info.get("chunk_count") or len(chunk_paths)),
         "duration_sec": chunk_info.get("duration_sec"),
         "chunked": bool(chunk_info.get("chunked")),
@@ -925,6 +927,7 @@ def transcribe_audio(audio: str) -> dict[str, Any]:
             "chunks_text": parts,
             "uncertainties": [item.get("uncertainty") or {} for item in observations],
             "backend": "qwen-omni-vllm",
+            "model": Path(cfg.model_path).name,
             "workers": len(_engines()),
             "gpus": read_asr_config().gpu_ids,
             "duration_sec": chunk_info.get("duration_sec"),

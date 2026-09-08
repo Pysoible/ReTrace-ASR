@@ -223,6 +223,7 @@ class Session:
     open_hypotheses: dict[str, WorkingHypothesis] = field(default_factory=dict)
     dependency_index: dict[str, list[str]] = field(default_factory=dict)
     decision_state: DecisionState = field(default_factory=DecisionState)
+    pipeline_provenance: dict[str, dict[str, str]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -241,4 +242,8 @@ class Session:
             dependency_index={key: list(value) for key, value in raw.get("dependency_index", {}).items()},
             revision_events=[RevisionEvent.from_dict(value) for value in raw.get("revision_events", [])],
             decision_state=DecisionState.from_dict(raw.get("decision_state")),
+            pipeline_provenance={
+                str(key): {str(field): str(item) for field, item in dict(value).items()}
+                for key, value in (raw.get("pipeline_provenance") or {}).items()
+            },
         )

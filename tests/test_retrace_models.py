@@ -42,6 +42,7 @@ def test_legacy_session_loads_with_versioned_memory_defaults():
     assert session.version == 0
     assert session.memory_scope == "default"
     assert session.open_hypotheses == {}
+    assert session.pipeline_provenance == {}
     serialized = json.loads(json.dumps(session.as_dict(), ensure_ascii=False))
     assert Session.from_dict(serialized).as_dict() == session.as_dict()
 

@@ -97,8 +97,18 @@ class ReTraceService:
         session.decision_state = self._decision_state_for_session(session)
         return self._session_summary(session)
 
-    def reset_session(self, session_id: str, *, memory_scope: str = "default") -> dict[str, Any]:
-        return self.repository.create(Session(session_id, memory_scope=memory_scope)).as_dict()
+    def reset_session(
+        self,
+        session_id: str,
+        *,
+        memory_scope: str = "default",
+        pipeline_provenance: dict[str, dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        return self.repository.create(Session(
+            session_id,
+            memory_scope=memory_scope,
+            pipeline_provenance=dict(pipeline_provenance or {}),
+        )).as_dict()
 
     def observe_turn(
         self,

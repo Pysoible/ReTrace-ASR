@@ -52,6 +52,29 @@ def test_moss_backend_result_marks_audio_turn_source(tmp_path, monkeypatch):
     assert response.json()["session"]["turns"][0]["source"] == "moss"
 
 
+def test_moss_backend_never_acquires_qwen_model_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASR_MODEL_PATH", "/models/Qwen3_Omni_30B")
+    monkeypatch.setattr(
+        server,
+        "transcribe_audio",
+        lambda _audio: {
+            "ok": True,
+            "backend": "moss-transcribe-diarize",
+            "chunks_text": ["测试文本"],
+            "chunks": [{"start_sec": 0.0, "end_sec": 1.0}],
+            "uncertainties": [{}],
+        },
+    )
+
+    with TestClient(create_app(tmp_path)) as client:
+        body = client.post("/api/sessions/s/audio", json={"audio": "/tmp/moss.wav"}).json()
+
+    expected = {"backend": "moss-transcribe-diarize", "model": "unknown", "role": "first_pass"}
+    assert body["provenance"]["first_pass"] == expected
+    assert body["session"]["pipeline_provenance"]["first_pass"] == expected
+    assert body["session"]["turns"][0]["meta"]["first_pass_identity"] == expected
+
+
 def test_text_only_evidence_does_not_create_an_undoable_revision(tmp_path):
     with TestClient(create_app(tmp_path)) as client:
         client.post("/api/sessions/s/turns", json={"turn_id": "t1", "text": "图博士来了", "confidence": {"图博士": 0.2}})

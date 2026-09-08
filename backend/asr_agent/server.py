@@ -26,6 +26,7 @@ from asr_agent.integrations.qwen_asr import (
     stream_transcribe_audio,
     transcribe_audio,
 )
+from asr_agent.model_identity import ModelIdentity
 from asr_agent.realtime import RealtimeAnalysisCoordinator
 from asr_agent.retrace import ReTraceService
 
@@ -321,10 +322,16 @@ def create_app(
 
         chunk_meta = list(asr.get("chunks") or [])
         bound_session = _audio_session_id(audio_path, session_id)
+        first_pass = ModelIdentity.from_asr_result(asr)
+        provenance = {"first_pass": first_pass.as_dict()}
         # Each audio session keeps its own durable long-term memory file
         # (scope == session id), so switching sessions never loses or mixes
         # previously consolidated beliefs.
-        service.reset_session(bound_session, memory_scope=bound_session)
+        service.reset_session(
+            bound_session,
+            memory_scope=bound_session,
+            pipeline_provenance=provenance,
+        )
 
         uncertainties = list(asr.get("uncertainties") or [])
         nbest_by_chunk = list(asr.get("nbest") or [])
@@ -366,6 +373,7 @@ def create_app(
                         "overlap": bool(chunk.get("overlap")),
                         "routing": chunk.get("routing"),
                         "routed_speaker_segments": routed_by_chunk.get(index, []),
+                        "first_pass_identity": first_pass.as_dict(),
                     },
                 )
             except ValueError as exc:
@@ -390,6 +398,7 @@ def create_app(
             "asr": asr,
             "turn_count": len(processed_turn_ids),
             "mode": mode,
+            "provenance": provenance,
         }
         return out
 
