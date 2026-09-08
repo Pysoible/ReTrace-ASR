@@ -24,6 +24,15 @@ def test_partition_turns_keeps_single_oversized_turn():
         {"turn_id": "t2", "text": "乙", "start_sec": 40.0, "end_sec": 41.0},
     ]
 
-    groups = partition_turns(turns, AnalysisWindowPolicy())
+    groups = partition_turns(
+        turns,
+        AnalysisWindowPolicy(max_turns=10, max_chars=180, max_audio_sec=30.0),
+    )
 
     assert [[item["turn_id"] for item in group] for group in groups] == [["t1"], ["t2"]]
+
+
+def test_default_policy_uses_meeting_scale_windows():
+    policy = AnalysisWindowPolicy()
+
+    assert (policy.max_turns, policy.max_chars, policy.max_audio_sec) == (20, 600, 90.0)

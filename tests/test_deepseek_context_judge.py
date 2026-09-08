@@ -91,6 +91,8 @@ def test_deepseek_context_judge_receives_bounded_analysis_window(monkeypatch):
         {"turn_id": "t2", "text": "今天讨论实验"},
         {"turn_id": "t3", "text": "我是涂博士"},
     ]
+    assert seen["payload"]["recent_turns"] == []
+    assert seen["payload"]["session_history_digest"] == []
     assert result.focus[0].target_turn_id == "t1"
 
 
@@ -135,7 +137,7 @@ def test_conflict_with_one_homophone_candidate_creates_focus(monkeypatch):
     monkeypatch.setattr(
         deepseek,
         "_homophone_candidates",
-        lambda *_: [{"span": "南庄", "candidate": "男装", "evidence_turn_ids": ["t0"]}],
+        lambda *_, **__: [{"span": "南庄", "candidate": "男装", "evidence_turn_ids": ["t0"]}],
     )
     turn = Turn("t1", "我这南庄那说两句", "我这南庄那说两句")
     result = deepseek.judge_context(

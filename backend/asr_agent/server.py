@@ -450,9 +450,9 @@ def create_app(
             moss_windows = partition_turns(
                 prepared_turns,
                 AnalysisWindowPolicy(
-                    max_turns=int(os.getenv("ASR_JUDGE_WINDOW_MAX_TURNS", "10")),
-                    max_chars=int(os.getenv("ASR_JUDGE_WINDOW_MAX_CHARS", "180")),
-                    max_audio_sec=float(os.getenv("ASR_JUDGE_WINDOW_MAX_AUDIO_SEC", "30")),
+                    max_turns=int(os.getenv("ASR_JUDGE_WINDOW_MAX_TURNS", "20")),
+                    max_chars=int(os.getenv("ASR_JUDGE_WINDOW_MAX_CHARS", "600")),
+                    max_audio_sec=float(os.getenv("ASR_JUDGE_WINDOW_MAX_AUDIO_SEC", "90")),
                 ),
             )
             moss_window_ids_by_trigger = {

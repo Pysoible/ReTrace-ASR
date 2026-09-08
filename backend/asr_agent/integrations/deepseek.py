@@ -227,7 +227,13 @@ def _canonical_entities(memory: MemoryPacket) -> list[dict[str, object]]:
     ]
 
 
-def _homophone_candidates(session: Session, current_turn: Turn, limit: int = 64) -> list[dict[str, Any]]:
+def _homophone_candidates(
+    session: Session,
+    current_turn: Turn,
+    limit: int = 64,
+    *,
+    turn_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
     """Provide same-pronunciation history candidates to the semantic judge."""
     try:
         from pypinyin import lazy_pinyin
@@ -241,6 +247,7 @@ def _homophone_candidates(session: Session, current_turn: Turn, limit: int = 64)
         )
         for turn in session.turns
         if turn.turn_id != current_turn.turn_id
+        and (turn_ids is None or turn.turn_id in turn_ids)
     ]
     candidates: dict[tuple[str, str], dict[str, Any]] = {}
     for width in range(2, 5):
@@ -354,6 +361,7 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
         (current_turn.meta or {}).get("analysis_window_turn_ids")
         or [current_turn.turn_id]
     )
+    windowed_analysis = bool((current_turn.meta or {}).get("analysis_window_turn_ids"))
     analysis_window = [
         {"turn_id": turn.turn_id, "text": turn.current_text or turn.raw_text}
         for turn in session.turns
@@ -362,21 +370,31 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
     payload = {
         "current_turn": current_payload,
         "analysis_window": analysis_window,
-        "recent_turns": [
+        "recent_turns": [] if windowed_analysis else [
             {"turn_id": turn.turn_id, "text": re.sub(r"^\[[0-9.]+[-,~][0-9.]+\]\s*", "", turn.current_text or turn.raw_text)[:240]}
             for turn in recent_turns
         ],
-        "session_history_digest": _session_history_digest(
-            session,
-            chars_per_turn=history_chars,
+        "session_history_digest": (
+            _session_history_digest(
+                session,
+                chars_per_turn=int(os.getenv("ASR_FINAL_AUDIT_DIGEST_CHARS", "40")),
+            )
+            if windowed_analysis and session_complete
+            else []
+            if windowed_analysis
+            else _session_history_digest(session, chars_per_turn=history_chars)
         ),
-        "dependent_turns": [] if session_complete else [turn.as_dict() for turn in memory.dependent_turns],
+        "dependent_turns": [] if windowed_analysis or session_complete else [turn.as_dict() for turn in memory.dependent_turns],
         "working_beliefs": [item.as_dict() for item in memory.working_beliefs[-12:]],
         "open_hypotheses": [] if session_complete else [item.as_dict() for item in memory.open_hypotheses],
         "long_term_beliefs": [item.as_dict() for item in memory.long_term_beliefs[-12:]],
         "domain_entities": _domain_entities(memory),
         "canonical_entities": _canonical_entities(memory),
-        "homophone_candidates": _homophone_candidates(session, current_turn),
+        "homophone_candidates": _homophone_candidates(
+            session,
+            current_turn,
+            turn_ids=window_ids if windowed_analysis else None,
+        ),
         # Acoustic uncertainty: spans where a second independent ASR disagreed
         # with the first pass. These are strong candidates for mis-hearings.
         "acoustic_disagreement": acoustic_disagreement,

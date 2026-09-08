@@ -7,9 +7,9 @@ from typing import Any
 
 @dataclass(frozen=True)
 class AnalysisWindowPolicy:
-    max_turns: int = 10
-    max_chars: int = 180
-    max_audio_sec: float = 30.0
+    max_turns: int = 20
+    max_chars: int = 600
+    max_audio_sec: float = 90.0
 
     def __post_init__(self) -> None:
         if self.max_turns <= 0 or self.max_chars <= 0 or self.max_audio_sec <= 0:
