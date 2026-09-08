@@ -10,9 +10,9 @@ import threading
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -48,6 +48,7 @@ class TurnRequest(BaseModel):
 
 class AudioTurnRequest(BaseModel):
     audio: str
+    experiment_mode: Literal["baseline", "retrace"] = "retrace"
 
 
 class AudioVerificationRequest(BaseModel):
@@ -411,6 +412,7 @@ def create_app(
             "asr": asr,
             "turn_count": len(processed_turn_ids),
             "mode": mode,
+            "experiment_mode": mode,
             "provenance": provenance,
         }
         return out
@@ -419,13 +421,33 @@ def create_app(
         session_id: str,
         *,
         audio_path: str,
+        experiment_mode: Literal["baseline", "retrace"] = "retrace",
     ) -> dict[str, Any]:
         asr = transcribe_audio(audio_path)
+        if experiment_mode == "baseline":
+            if not asr.get("ok"):
+                raise HTTPException(status_code=503, detail=asr.get("error") or "ASR failed")
+            identity = ModelIdentity.from_asr_result(asr)
+            parts = [str(item).strip() for item in (asr.get("chunks_text") or []) if str(item).strip()]
+            transcript = str(asr.get("final_text") or "").strip() or "".join(parts)
+            if not transcript:
+                raise HTTPException(status_code=502, detail="ASR returned empty text")
+            return {
+                "session_id": _audio_session_id(audio_path, session_id),
+                "experiment_mode": "baseline",
+                "mode": "baseline",
+                "transcript": transcript,
+                "turn_count": len(parts) or 1,
+                "revisions": [],
+                "asr": asr,
+                "provenance": {"first_pass": identity.as_dict()},
+            }
         return _build_session_from_asr(
             session_id,
             audio_path=audio_path,
             asr=asr,
             source="moss" if asr.get("backend") == "moss-transcribe-diarize" else "qwen-omni",
+            mode="retrace",
         )
 
     def _stream_audio_session_background(
@@ -433,6 +455,7 @@ def create_app(
         *,
         audio_path: str,
         source: str = "qwen-omni",
+        experiment_mode: Literal["baseline", "retrace"] = "retrace",
     ) -> None:
         """Stream a long audio into a session turn-by-turn, publishing SSE events.
 
@@ -445,18 +468,25 @@ def create_app(
         # session id, while the derived bound_session is the real identifier).
         bound_session = _audio_session_id(audio_path, session_id)
         events = _new_event_stream(bound_session)
+        baseline_turns: list[dict[str, Any]] = []
         try:
             provenance = {"first_pass": qwen_first_pass_identity.as_dict()}
-            memory_scope = model_memory_scope(
-                qwen_first_pass_identity,
-                namespace=os.getenv("ASR_EXPERIMENT_NAMESPACE", "default"),
-            )
-            service.reset_session(
-                bound_session,
-                memory_scope=memory_scope,
-                pipeline_provenance=provenance,
-            )
-            _publish(bound_session, {"type": "session", "session_id": bound_session})
+            if experiment_mode == "retrace":
+                memory_scope = model_memory_scope(
+                    qwen_first_pass_identity,
+                    namespace=os.getenv("ASR_EXPERIMENT_NAMESPACE", "default"),
+                )
+                service.reset_session(
+                    bound_session,
+                    memory_scope=memory_scope,
+                    pipeline_provenance=provenance,
+                )
+            _publish(bound_session, {
+                "type": "session",
+                "session_id": bound_session,
+                "experiment_mode": experiment_mode,
+                "provenance": provenance,
+            })
         except Exception as exc:
             _publish(bound_session, {"type": "error", "message": f"初始化会话失败: {exc}"})
             events.put(None)
@@ -469,6 +499,20 @@ def create_app(
             start = chunk.get("start_sec")
             end = chunk.get("end_sec")
             display = (text or "").strip()
+            if experiment_mode == "baseline":
+                if display:
+                    baseline_turns.append({
+                        "turn_id": turn_id,
+                        "raw_text": display,
+                        "current_text": display,
+                        "source": source,
+                        "meta": {"start_sec": start, "end_sec": end, "chunk_index": index},
+                    })
+                _publish(bound_session, {
+                    "type": "turn", "index": index, "turn_id": turn_id,
+                    "text": display, "experiment_mode": "baseline", "revisions": [],
+                })
+                return
             if not display:
                 _publish(bound_session, {"type": "turn", "index": index, "turn_id": turn_id, "text": "", "session": service.get_session(bound_session)})
                 return
@@ -526,7 +570,7 @@ def create_app(
             summary = stream_transcribe_audio(audio_path, _on_chunk)
             _publish(bound_session, {"type": "asr_done", "chunk_count": summary.get("chunk_count"), "duration_sec": summary.get("duration_sec")})
             from asr_agent.integrations.qwen_asr import _infer_speaker_segments, _truthy, parse_rttm, read_asr_config
-            if summary.get("rttm") and _truthy(os.getenv("ASR_STREAM_SPEAKER_ROUTING", "0")):
+            if experiment_mode == "retrace" and summary.get("rttm") and _truthy(os.getenv("ASR_STREAM_SPEAKER_ROUTING", "0")):
                 _publish(bound_session, {"type": "speaker_asr_started", "session": service.get_session(bound_session)})
                 processor.finish()
                 worker.join(timeout=120)
@@ -545,6 +589,20 @@ def create_app(
         finally:
             processor.finish()
             worker.join(timeout=120)
+            if experiment_mode == "baseline":
+                transcript = "".join(turn["raw_text"] for turn in baseline_turns)
+                _publish(bound_session, {
+                    "type": "done",
+                    "session_id": bound_session,
+                    "experiment_mode": "baseline",
+                    "transcript": transcript,
+                    "turns": baseline_turns,
+                    "revisions": [],
+                    "provenance": provenance,
+                })
+                events.put(None)
+                _drop_event_stream(bound_session)
+                return
             try:
                 completed_session = service.get_session(bound_session)
                 completed_turns = completed_session.get("turns") or []
@@ -560,7 +618,12 @@ def create_app(
             events.put(None)
             _drop_event_stream(bound_session)
 
-    def _start_stream_audio_session(session_id: str, *, audio_path: str) -> dict[str, Any]:
+    def _start_stream_audio_session(
+        session_id: str,
+        *,
+        audio_path: str,
+        experiment_mode: Literal["baseline", "retrace"] = "retrace",
+    ) -> dict[str, Any]:
         # Uploaded files can be submitted repeatedly with the same original
         # filename. Keep each upload isolated so an older background stream
         # cannot append late chunks into the new session's transcript.
@@ -568,7 +631,7 @@ def create_app(
         thread = threading.Thread(
             target=_stream_audio_session_background,
             args=(bound_session,),
-            kwargs={"audio_path": audio_path},
+            kwargs={"audio_path": audio_path, "experiment_mode": experiment_mode},
             name=f"retrace-audio-{bound_session}",
             daemon=True,
         )
@@ -577,6 +640,7 @@ def create_app(
             "session_id": bound_session,
             "status": "processing",
             "stream": f"/api/sessions/{bound_session}/events",
+            "experiment_mode": experiment_mode,
         }
 
     @app.get("/api/sessions/{session_id}/events")
@@ -603,12 +667,14 @@ def create_app(
         return _run_audio_session(
             session_id,
             audio_path=request.audio,
+            experiment_mode=request.experiment_mode,
         )
 
     @app.post("/api/sessions/{session_id}/audio/upload")
     async def process_audio_upload(
         session_id: str,
         file: UploadFile = File(...),
+        experiment_mode: Literal["baseline", "retrace"] = Form("retrace"),
     ) -> dict[str, Any]:
         filename = _safe_filename(file.filename or "audio.wav")
         dest = upload_dir / f"{uuid.uuid4().hex}_{filename}"
@@ -621,6 +687,7 @@ def create_app(
         return _start_stream_audio_session(
             session_id,
             audio_path=str(dest),
+            experiment_mode=experiment_mode,
         )
 
     @app.get("/api/sessions/{session_id}")

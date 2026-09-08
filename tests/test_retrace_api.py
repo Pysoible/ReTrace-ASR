@@ -97,6 +97,38 @@ def test_audio_sessions_share_memory_by_model_and_isolate_other_models(tmp_path,
     assert qwen_a["session"]["memory_scope"].startswith("model--scope-test--")
 
 
+def test_baseline_mode_never_invokes_retrace_or_memory(tmp_path, monkeypatch):
+    class ForbiddenService:
+        def __getattr__(self, name):
+            raise AssertionError(f"baseline invoked ReTrace service method: {name}")
+
+    monkeypatch.setattr(
+        server,
+        "transcribe_audio",
+        lambda _audio: {
+            "ok": True,
+            "backend": "qwen-omni-vllm",
+            "model": "Qwen3_Omni_30B",
+            "final_text": "第一句",
+            "chunks_text": ["第一句"],
+            "chunks": [{"start_sec": 0.0, "end_sec": 1.0}],
+            "uncertainties": [{}],
+        },
+    )
+
+    with TestClient(create_app(tmp_path, service=ForbiddenService())) as client:
+        body = client.post(
+            "/api/sessions/base/audio",
+            json={"audio": "/tmp/a.wav", "experiment_mode": "baseline"},
+        ).json()
+
+    assert body["experiment_mode"] == "baseline"
+    assert body["transcript"] == "第一句"
+    assert body["revisions"] == []
+    assert set(body["provenance"]) == {"first_pass"}
+    assert not list(tmp_path.rglob("*.json"))
+
+
 def test_text_only_evidence_does_not_create_an_undoable_revision(tmp_path):
     with TestClient(create_app(tmp_path)) as client:
         client.post("/api/sessions/s/turns", json={"turn_id": "t1", "text": "图博士来了", "confidence": {"图博士": 0.2}})
