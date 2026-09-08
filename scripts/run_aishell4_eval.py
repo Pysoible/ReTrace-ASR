@@ -167,37 +167,207 @@ def retrace_miss_analysis(session: dict[str, Any], rows: list[dict[str, Any]]) -
     }
 
 
+def _turn_references(session: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, str]:
+    turns = []
+    for turn in session.get("turns") or []:
+        meta = turn.get("meta") or {}
+        if meta.get("start_sec") is not None and meta.get("end_sec") is not None:
+            turns.append((str(turn.get("turn_id")), float(meta["start_sec"]), float(meta["end_sec"])))
+    assigned: dict[str, list[dict[str, Any]]] = {turn_id: [] for turn_id, *_ in turns}
+    for row in rows:
+        overlaps = [
+            (max(0.0, min(float(row["end"]), end) - max(float(row["start"]), start)), turn_id)
+            for turn_id, start, end in turns
+        ]
+        overlaps = [(amount, turn_id) for amount, turn_id in overlaps if amount > 0]
+        if overlaps:
+            assigned[max(overlaps)[1]].append(row)
+    return {
+        turn_id: "".join(item["text"] for item in sorted(items, key=lambda item: (item["start"], item["end"])))
+        for turn_id, items in assigned.items()
+    }
+
+
+def _committed_revision_quality(session: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, int]:
+    references = _turn_references(session, rows)
+    outcomes = Counter()
+    for event in session.get("revision_events") or []:
+        if not event.get("active", True) or event.get("event_kind", "revision") != "revision":
+            continue
+        if event.get("action") not in {"REVISE_CURRENT", "REVISE_HISTORY"}:
+            continue
+        reference = references.get(str(event.get("target_turn_id")), "")
+        before = metrics(reference, str(event.get("before_text") or ""))["edits"]
+        after = metrics(reference, str(event.get("after_text") or ""))["edits"]
+        outcomes["improved" if after < before else "harmed" if after > before else "neutral"] += 1
+    return {
+        "committed": sum(outcomes.values()),
+        "improved": outcomes["improved"],
+        "harmed": outcomes["harmed"],
+        "neutral": outcomes["neutral"],
+    }
+
+
+def evaluate_pair_payloads(
+    baseline_payload: dict[str, Any],
+    retrace_payload: dict[str, Any],
+    *,
+    reference: str,
+    rows: list[dict[str, Any]],
+    integrations: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate and score one baseline/ReTrace pair from one immutable first pass."""
+    session = retrace_payload.get("session") or {}
+    turns = sorted(
+        session.get("turns") or [],
+        key=lambda turn: float((turn.get("meta") or {}).get("start_sec", 0)),
+    )
+    baseline_text = str(baseline_payload.get("transcript") or "")
+    raw_text = "".join(str(turn.get("raw_text") or "") for turn in turns)
+    final_text = "".join(str(turn.get("current_text") or turn.get("raw_text") or "") for turn in turns)
+    artifact_id = baseline_payload.get("first_pass_artifact_id")
+    invalid_reasons: list[str] = []
+    if not artifact_id or artifact_id != retrace_payload.get("first_pass_artifact_id"):
+        invalid_reasons.append("first_pass_artifact_mismatch")
+    for payload in (baseline_payload, retrace_payload):
+        asr = payload.get("asr") or {}
+        if not asr.get("ok") or (asr.get("completeness") or {}).get("truncated") is True:
+            if "incomplete_first_pass" not in invalid_reasons:
+                invalid_reasons.append("incomplete_first_pass")
+    if not (integrations.get("deepseek") or {}).get("ready"):
+        invalid_reasons.append("deepseek_not_ready")
+    if clean(baseline_text) != clean(raw_text):
+        invalid_reasons.append("raw_transcript_mismatch")
+    memory_status = ((session.get("observability") or {}).get("memory_status") or {})
+    if memory_status.get("error"):
+        invalid_reasons.append("memory_error")
+
+    baseline_metric = metrics(reference, baseline_text)
+    raw_metric = metrics(reference, raw_text)
+    final_metric = metrics(reference, final_text)
+    revision_quality = _committed_revision_quality(session, rows)
+    funnel = candidate_pipeline_metrics(session)
+    effectiveness = None
+    if not invalid_reasons:
+        baseline_edits = int(baseline_metric["edits"])
+        committed = revision_quality["committed"]
+        validated = int(funnel["validated_candidates"])
+        effectiveness = {
+            "ecer": (baseline_edits - int(final_metric["edits"])) / baseline_edits if baseline_edits else 0.0,
+            "revision_precision": revision_quality["improved"] / committed if committed else None,
+            "candidate_to_correction_yield": revision_quality["improved"] / validated if validated else None,
+        }
+    return {
+        "valid": not invalid_reasons,
+        "invalid_reasons": invalid_reasons,
+        "first_pass_artifact_id": artifact_id,
+        "baseline": baseline_metric,
+        "raw": raw_metric,
+        "final": final_metric,
+        "effectiveness": effectiveness,
+        "retrace": {
+            "committed_revisions": revision_quality["committed"],
+            "revision_quality": revision_quality,
+            "candidate_funnel": funnel,
+        },
+        "stage_timings_ms": retrace_payload.get("stage_timings_ms") or {},
+        "stage_call_counts": retrace_payload.get("stage_call_counts") or {},
+        "baseline_stage_timings_ms": baseline_payload.get("stage_timings_ms") or {},
+        "memory_scope": session.get("memory_scope"),
+        "memory_status": memory_status,
+        "completeness": (retrace_payload.get("asr") or {}).get("completeness") or {},
+    }
+
+
+def aggregate_results(items: list[dict[str, Any]]) -> dict[str, Any]:
+    valid = [item for item in items if item.get("valid") is True]
+    invalid = [item for item in items if item.get("valid") is not True]
+    baseline_edits = sum(int((item.get("baseline") or {}).get("edits") or 0) for item in valid)
+    final_edits = sum(int((item.get("final") or {}).get("edits") or 0) for item in valid)
+    committed = sum(int(((item.get("retrace") or {}).get("revision_quality") or {}).get("committed") or 0) for item in valid)
+    improved = sum(int(((item.get("retrace") or {}).get("revision_quality") or {}).get("improved") or 0) for item in valid)
+    validated = sum(int(((item.get("retrace") or {}).get("candidate_funnel") or {}).get("validated_candidates") or 0) for item in valid)
+    stage_timings: Counter[str] = Counter()
+    stage_calls: Counter[str] = Counter()
+    for item in valid:
+        stage_timings.update({str(key): float(value) for key, value in (item.get("stage_timings_ms") or {}).items()})
+        stage_calls.update({str(key): int(value) for key, value in (item.get("stage_call_counts") or {}).items()})
+    return {
+        "valid_samples": len(valid),
+        "invalid_samples": len(invalid),
+        "pooled_counts": {
+            "baseline_edits": baseline_edits,
+            "final_edits": final_edits,
+            "committed_revisions": committed,
+            "improved_revisions": improved,
+            "validated_candidates": validated,
+        },
+        "effectiveness": {
+            "ecer": (baseline_edits - final_edits) / baseline_edits if baseline_edits else 0.0,
+            "revision_precision": improved / committed if committed else None,
+            "candidate_to_correction_yield": improved / validated if validated else None,
+        },
+        "stage_timings_ms": dict(stage_timings),
+        "stage_call_counts": dict(stage_calls),
+        "invalid": [
+            {"sample": item.get("sample"), "reasons": item.get("invalid_reasons") or [item.get("error") or "unknown_error"]}
+            for item in invalid
+        ],
+    }
+
+
 def evaluate_sample(base_url: str, audio: Path, reference_path: Path, output_dir: Path, timeout: float) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    result_path, metrics_path = output_dir / "result.json", output_dir / "metrics.json"
-    if result_path.exists() and metrics_path.exists():
+    baseline_path = output_dir / "baseline_result.json"
+    retrace_path = output_dir / "retrace_result.json"
+    metrics_path = output_dir / "metrics.json"
+    if baseline_path.exists() and retrace_path.exists() and metrics_path.exists():
         return json.loads(metrics_path.read_text(encoding="utf-8"))
     reference, rows = parse_reference(reference_path)
     started = time.time()
-    if result_path.exists():
-        payload = json.loads(result_path.read_text(encoding="utf-8"))
-    else:
-        session_id = f"aishell4_full_{audio.stem}_{int(time.time())}"
-        response = requests.post(f"{base_url.rstrip('/')}/api/sessions/{session_id}/audio", json={"audio": str(audio)}, timeout=timeout)
+    def post_mode(mode: str, path: Path) -> dict[str, Any]:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+        session_id = f"aishell4_{mode}_{audio.stem}_{int(time.time())}"
+        response = requests.post(
+            f"{base_url.rstrip('/')}/api/sessions/{session_id}/audio",
+            json={"audio": str(audio), "experiment_mode": mode},
+            timeout=timeout,
+        )
         response.raise_for_status()
         payload = response.json()
-        result_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    session = payload.get("session") or {}
-    turns = sorted(session.get("turns") or [], key=lambda turn: float((turn.get("meta") or {}).get("start_sec", 0)))
-    raw, current = "".join(str(turn.get("raw_text") or "") for turn in turns), "".join(str(turn.get("current_text") or "") for turn in turns)
-    item = {
-        "sample": audio.stem, "audio": str(audio), "reference": str(reference_path), "result": str(result_path),
-        "metric_kind": "diagnostic_whole_corpus_character_metrics", "audio_duration_sec": payload.get("asr", {}).get("duration_sec"),
-        "request_elapsed_sec": round(time.time() - started, 2), "asr_elapsed_sec": payload.get("asr", {}).get("elapsed_sec"),
-        "reference_segments": len(rows), "reference_overlap_pairs": sum(left["start"] < right["end"] and right["start"] < left["end"] and left["spk"] != right["spk"] for index, left in enumerate(rows) for right in rows[index + 1:]),
-        "asr_chunks": payload.get("asr", {}).get("chunk_count"), "valid_turns": len(turns),
-        "empty_chunks": sum(not str(text).strip() for text in payload.get("asr", {}).get("chunks_text", [])),
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return payload
+
+    baseline_payload = post_mode("baseline", baseline_path)
+    retrace_payload = post_mode("retrace", retrace_path)
+    status_response = requests.get(f"{base_url.rstrip('/')}/api/integrations/status", timeout=min(timeout, 30.0))
+    status_response.raise_for_status()
+    integrations = status_response.json()
+    session = retrace_payload.get("session") or {}
+    turns = session.get("turns") or []
+    item = evaluate_pair_payloads(
+        baseline_payload,
+        retrace_payload,
+        reference=reference,
+        rows=rows,
+        integrations=integrations,
+    )
+    item.update({
+        "sample": audio.stem, "audio": str(audio), "reference": str(reference_path),
+        "baseline_result": str(baseline_path), "retrace_result": str(retrace_path),
+        "metric_kind": "diagnostic_whole_corpus_character_metrics",
+        "audio_duration_sec": retrace_payload.get("asr", {}).get("duration_sec"),
+        "request_elapsed_sec": round(time.time() - started, 2),
+        "asr_elapsed_sec": retrace_payload.get("asr", {}).get("elapsed_sec"),
+        "reference_segments": len(rows),
+        "reference_overlap_pairs": sum(left["start"] < right["end"] and right["start"] < left["end"] and left["spk"] != right["spk"] for index, left in enumerate(rows) for right in rows[index + 1:]),
+        "asr_chunks": retrace_payload.get("asr", {}).get("chunk_count"), "valid_turns": len(turns),
+        "empty_chunks": sum(not str(text).strip() for text in retrace_payload.get("asr", {}).get("chunks_text", [])),
         "degenerate_turns": sum(bool((turn.get("meta") or {}).get("degeneration", {}).get("detected")) for turn in turns),
         "changed_turns": sum(turn.get("raw_text") != turn.get("current_text") for turn in turns),
-        "raw": metrics(reference, raw), "final": metrics(reference, current),
-        "retrace": {"active_events": sum(event.get("active", True) for event in session.get("revision_events") or []), "committed_revisions": sum(event.get("active", True) and event.get("event_kind", "revision") == "revision" and event.get("action") in {"REVISE_CURRENT", "REVISE_HISTORY", "ROLLBACK"} for event in session.get("revision_events") or [])},
         "retrace_miss_analysis": retrace_miss_analysis(session, rows),
-    }
+    })
     metrics_path.write_text(json.dumps(item, ensure_ascii=False, indent=2), encoding="utf-8")
     return item
 
@@ -222,10 +392,12 @@ def main() -> None:
         try:
             item = evaluate_sample(args.base_url, audio, reference, args.output_dir / audio.stem, args.timeout); summary[audio.stem] = item
             summary_path.write_text(json.dumps(list(summary.values()), ensure_ascii=False, indent=2), encoding="utf-8")
-            print(json.dumps({"sample": audio.stem, "raw_cer": item["raw"]["cer"], "final_cer": item["final"]["cer"], "chunks": item.get("asr_chunks")}, ensure_ascii=False), flush=True)
+            print(json.dumps({"sample": audio.stem, "valid": item["valid"], "ecer": (item.get("effectiveness") or {}).get("ecer"), "raw_cer": item["raw"]["cer"], "final_cer": item["final"]["cer"], "chunks": item.get("asr_chunks")}, ensure_ascii=False), flush=True)
         except Exception as exc:
             summary[audio.stem] = {"sample": audio.stem, "error": f"{type(exc).__name__}: {exc}"}; summary_path.write_text(json.dumps(list(summary.values()), ensure_ascii=False, indent=2), encoding="utf-8"); print(summary[audio.stem], flush=True)
-    print(f"Wrote {summary_path}")
+    aggregate_path = args.output_dir / "aggregate.json"
+    aggregate_path.write_text(json.dumps(aggregate_results(list(summary.values())), ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Wrote {summary_path} and {aggregate_path}")
 
 
 if __name__ == "__main__":

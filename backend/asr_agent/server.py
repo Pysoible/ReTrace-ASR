@@ -18,8 +18,10 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from asr_agent.analysis_windows import AnalysisWindowPolicy, partition_turns
+from asr_agent.asr_artifacts import FirstPassArtifactRepository, artifact_key, inference_contract
 from asr_agent.integrations.audio_verifier import verify_candidates
-from asr_agent.integrations.deepseek import deepseek_status
+from asr_agent.integrations.deepseek import context_judge_identity, deepseek_status
 from asr_agent.integrations.asr_backend import (
     asr_status,
     preload_engine,
@@ -241,7 +243,27 @@ def create_app(
     configured_first_pass = ModelIdentity.from_asr_result(asr_status())
     verifier_identity = None
     relistener_identity = None
+    audio_verifier = None
+    audio_retranscriber = None
     if configured_first_pass.family == "qwen-omni":
+        verifier_identity = ModelIdentity(
+            configured_first_pass.backend,
+            configured_first_pass.model,
+            "targeted_verifier",
+        )
+        relistener_identity = ModelIdentity(
+            configured_first_pass.backend,
+            configured_first_pass.model,
+            "open_relistener",
+        )
+    elif configured_first_pass.family == "moss":
+        from asr_agent.integrations.moss_audio_tools import (
+            retranscribe_window as moss_retranscribe_window,
+            verify_candidates as moss_verify_candidates,
+        )
+
+        audio_verifier = moss_verify_candidates
+        audio_retranscriber = moss_retranscribe_window
         verifier_identity = ModelIdentity(
             configured_first_pass.backend,
             configured_first_pass.model,
@@ -255,6 +277,8 @@ def create_app(
     if service is None:
         service = ReTraceService(
             root / "sessions",
+            audio_verifier=audio_verifier,
+            audio_retranscriber=audio_retranscriber,
             verifier_identity=verifier_identity,
             relistener_identity=relistener_identity,
         )
@@ -271,6 +295,8 @@ def create_app(
     app.state.service = service
     app.state.coordinator = coordinator
     app.state.upload_dir = upload_dir
+    artifact_repository = FirstPassArtifactRepository(root / "first_pass_artifacts")
+    app.state.first_pass_artifacts = artifact_repository
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
@@ -279,9 +305,22 @@ def create_app(
     @app.get("/api/integrations/status")
     def integrations_status() -> dict[str, Any]:
         disabled = {"0", "false", "no", "off"}
+        first_pass_identity = ModelIdentity.from_asr_result(asr_status())
         return {
             "qwen_asr": asr_status(),
+            "asr": asr_status(),
             "deepseek": deepseek_status(),
+            "audio_tools": {
+                "first_pass": first_pass_identity.as_dict(),
+                "targeted_verifier": (
+                    service.resolver.verifier_identity.as_dict()
+                    if service.resolver.verifier_identity is not None else None
+                ),
+                "open_relistener": (
+                    service.relistener_identity.as_dict()
+                    if service.relistener_identity is not None else None
+                ),
+            },
             "retrace_policy": {
                 "fast_normal_turns": os.getenv("ASR_FAST_NORMAL_TURNS", "0").strip().lower() not in disabled,
                 "strict_revision": os.getenv("ASR_STRICT_REVISION", "1").strip().lower() not in disabled,
@@ -351,6 +390,18 @@ def create_app(
         bound_session = _audio_session_id(audio_path, session_id)
         first_pass = ModelIdentity.from_asr_result(asr)
         provenance = {"first_pass": first_pass.as_dict()}
+        if mode != "baseline":
+            provenance["context_judge"] = context_judge_identity()
+            if (
+                service.resolver.verifier_identity is not None
+                and service.resolver.verifier_identity.family == first_pass.family
+            ):
+                provenance["targeted_verifier"] = service.resolver.verifier_identity.as_dict()
+            if (
+                service.relistener_identity is not None
+                and service.relistener_identity.family == first_pass.family
+            ):
+                provenance["open_relistener"] = service.relistener_identity.as_dict()
         memory_scope = model_memory_scope(
             first_pass,
             namespace=os.getenv("ASR_EXPERIMENT_NAMESPACE", "default"),
@@ -371,6 +422,7 @@ def create_app(
                 continue
         revisions: list[dict[str, Any]] = []
         processed_turn_ids: list[str] = []
+        prepared_turns: list[dict[str, Any]] = []
         for index, text in enumerate(parts):
             turn_id = f"t{index + 1:03d}"
             chunk = chunk_meta[index] if index < len(chunk_meta) else {}
@@ -381,40 +433,97 @@ def create_app(
             display = text.strip()
             if not display:
                 continue
+            prepared_turns.append({
+                "turn_id": turn_id,
+                "text": display,
+                "index": index,
+                "chunk": chunk,
+                "uncertainty": uncertainty,
+                "nbest": nbest,
+                "start_sec": start,
+                "end_sec": end,
+            })
+
+        moss_windows: list[list[dict[str, Any]]] = []
+        moss_window_ids_by_trigger: dict[str, list[str]] = {}
+        if first_pass.family == "moss":
+            moss_windows = partition_turns(
+                prepared_turns,
+                AnalysisWindowPolicy(
+                    max_turns=int(os.getenv("ASR_JUDGE_WINDOW_MAX_TURNS", "10")),
+                    max_chars=int(os.getenv("ASR_JUDGE_WINDOW_MAX_CHARS", "180")),
+                    max_audio_sec=float(os.getenv("ASR_JUDGE_WINDOW_MAX_AUDIO_SEC", "30")),
+                ),
+            )
+            moss_window_ids_by_trigger = {
+                str(window[-1]["turn_id"]): [str(item["turn_id"]) for item in window]
+                for window in moss_windows
+            }
+
+        for prepared in prepared_turns:
+            turn_id = str(prepared["turn_id"])
+            index = int(prepared["index"])
+            chunk = dict(prepared["chunk"] or {})
+            uncertainty = dict(prepared["uncertainty"] or {})
+            nbest = prepared["nbest"]
+            turn_meta = {
+                "audio_path": audio_path,
+                "chunk_index": index,
+                "start_sec": prepared["start_sec"],
+                "end_sec": prepared["end_sec"],
+                "uncertainty": uncertainty,
+                "speaker_segments": uncertainty.get("speaker_segments") or [],
+                "speakers": chunk.get("speakers") or [],
+                "overlap": bool(chunk.get("overlap")),
+                "routing": chunk.get("routing"),
+                "routed_speaker_segments": routed_by_chunk.get(index, []),
+                "first_pass_identity": first_pass.as_dict(),
+            }
+            if turn_id in moss_window_ids_by_trigger:
+                turn_meta["analysis_window_turn_ids"] = moss_window_ids_by_trigger[turn_id]
             try:
-                result = service.process_turn(
-                    bound_session,
-                    turn_id,
-                    display,
-                    confidence=dict(uncertainty.get("confidence") or {}),
-                    text_candidates=dict(uncertainty.get("text_candidates") or {}),
-                    source=source,
-                    nbest=list(nbest) if isinstance(nbest, list) else [],
-                    meta={
-                        "audio_path": audio_path,
-                        "chunk_index": index,
-                        "start_sec": start,
-                        "end_sec": end,
-                        "uncertainty": uncertainty,
-                        "speaker_segments": uncertainty.get("speaker_segments") or [],
-                        "speakers": chunk.get("speakers") or [],
-                        "overlap": bool(chunk.get("overlap")),
-                        "routing": chunk.get("routing"),
-                        "routed_speaker_segments": routed_by_chunk.get(index, []),
-                        "first_pass_identity": first_pass.as_dict(),
-                    },
-                )
+                if first_pass.family == "moss":
+                    service.observe_turn(
+                        bound_session,
+                        turn_id,
+                        str(prepared["text"]),
+                        confidence=dict(uncertainty.get("confidence") or {}),
+                        text_candidates=dict(uncertainty.get("text_candidates") or {}),
+                        source=source,
+                        nbest=list(nbest) if isinstance(nbest, list) else [],
+                        meta=turn_meta,
+                    )
+                    result = {"revisions": []}
+                else:
+                    result = service.process_turn(
+                        bound_session,
+                        turn_id,
+                        str(prepared["text"]),
+                        confidence=dict(uncertainty.get("confidence") or {}),
+                        text_candidates=dict(uncertainty.get("text_candidates") or {}),
+                        source=source,
+                        nbest=list(nbest) if isinstance(nbest, list) else [],
+                        meta=turn_meta,
+                    )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             processed_turn_ids.append(turn_id)
             revisions.extend(result.get("revisions") or [])
 
-        # The batch path has the complete session available. One bounded final
-        # audit exposes later evidence without running another ASR pass.
-        if processed_turn_ids:
+        if first_pass.family == "moss":
+            for window_index, window in enumerate(moss_windows):
+                audit = service.analyze_turn(
+                    bound_session,
+                    str(window[-1]["turn_id"]),
+                    session_complete=window_index == len(moss_windows) - 1,
+                )
+                revisions.extend(audit.get("revisions") or [])
+        # Qwen's existing streaming-style per-turn analysis is retained, with
+        # one final audit that exposes later evidence to the last turn.
+        elif processed_turn_ids:
             final_audit = service.analyze_turn(
                 bound_session,
-            processed_turn_ids[-1],
+                processed_turn_ids[-1],
                 session_complete=True,
             )
             revisions.extend(final_audit.get("revisions") or [])
@@ -450,7 +559,26 @@ def create_app(
     ) -> dict[str, Any]:
         request_started = time.perf_counter()
         asr_started = time.perf_counter()
-        asr = transcribe_audio(audio_path)
+        selected_identity = ModelIdentity.from_asr_result(asr_status())
+        first_pass_artifact_id: str | None = None
+        first_pass_cache_hit = False
+        audio_file = Path(audio_path).expanduser()
+        if audio_file.exists():
+            first_pass_artifact_id = artifact_key(
+                audio_file,
+                identity=selected_identity.as_dict(),
+                config=inference_contract(selected_identity.as_dict()),
+            )
+            artifact = artifact_repository.load(first_pass_artifact_id)
+            if artifact is not None:
+                asr = dict(artifact["payload"])
+                first_pass_cache_hit = True
+            else:
+                asr = transcribe_audio(audio_path)
+                if asr.get("ok") and not (asr.get("completeness") or {}).get("truncated"):
+                    artifact_repository.save(first_pass_artifact_id, asr)
+        else:
+            asr = transcribe_audio(audio_path)
         first_pass_ms = (time.perf_counter() - asr_started) * 1000.0
         if experiment_mode == "baseline":
             if not asr.get("ok"):
@@ -468,6 +596,8 @@ def create_app(
                 "turn_count": len(parts) or 1,
                 "revisions": [],
                 "asr": asr,
+                "first_pass_artifact_id": first_pass_artifact_id,
+                "first_pass_cache_hit": first_pass_cache_hit,
                 "provenance": {"first_pass": identity.as_dict()},
                 "stage_timings_ms": {
                     "first_pass_asr": first_pass_ms,
@@ -486,6 +616,8 @@ def create_app(
         result["stage_timings_ms"]["request_total"] = (time.perf_counter() - request_started) * 1000.0
         result["stage_call_counts"]["first_pass_asr"] = 1
         result["stage_call_counts"]["request_total"] = 1
+        result["first_pass_artifact_id"] = first_pass_artifact_id
+        result["first_pass_cache_hit"] = first_pass_cache_hit
         return result
 
     def _stream_audio_session_background(

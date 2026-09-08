@@ -3,6 +3,54 @@ from asr_agent.memory import MemoryPacket
 from asr_agent.models import Session, Turn
 
 
+def test_deepseek_context_judge_receives_bounded_analysis_window(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    seen = {}
+
+    def fake_chat(messages, **_):
+        import json
+
+        seen["payload"] = json.loads(messages[1]["content"])
+        return {
+            "outcome": "CONFLICT",
+            "confidence": 0.95,
+            "focus": [
+                {
+                    "target_turn_id": "t1",
+                    "span": "图博士",
+                    "proposed_text": "涂博士",
+                    "alternatives": ["图博士", "涂博士"],
+                    "evidence_turn_ids": ["t3"],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(deepseek, "_chat_json", fake_chat)
+    turns = [
+        Turn("t1", "图博士来了", "图博士来了"),
+        Turn("t2", "今天讨论实验", "今天讨论实验"),
+        Turn(
+            "t3",
+            "我是涂博士",
+            "我是涂博士",
+            meta={"analysis_window_turn_ids": ["t1", "t2", "t3"]},
+        ),
+    ]
+
+    result = deepseek.judge_context(
+        session=Session("s", turns=turns),
+        current_turn=turns[-1],
+        memory=MemoryPacket(),
+    )
+
+    assert seen["payload"]["analysis_window"] == [
+        {"turn_id": "t1", "text": "图博士来了"},
+        {"turn_id": "t2", "text": "今天讨论实验"},
+        {"turn_id": "t3", "text": "我是涂博士"},
+    ]
+    assert result.focus[0].target_turn_id == "t1"
+
+
 def test_deepseek_context_judge_returns_validated_focus(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr(

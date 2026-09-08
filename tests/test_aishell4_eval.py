@@ -1,4 +1,11 @@
-from scripts.run_aishell4_eval import clean, parse_reference, resolve_reference_path, retrace_miss_analysis
+from scripts.run_aishell4_eval import (
+    clean,
+    evaluate_pair_payloads,
+    aggregate_results,
+    parse_reference,
+    resolve_reference_path,
+    retrace_miss_analysis,
+)
 from scripts.export_aishell4_errors import _group_for_display, _strip_time
 
 
@@ -147,3 +154,99 @@ def test_miss_analysis_reports_candidate_pipeline_metrics():
         "rejected_candidate_count": 1,
         "note": "candidate_recall requires post-inference reference alignment and is intentionally not used online",
     }
+
+
+def test_paired_payloads_report_primary_effectiveness_metrics():
+    baseline = {
+        "first_pass_artifact_id": "artifact-1",
+        "transcript": "图博士发言",
+        "asr": {"ok": True, "completeness": {"truncated": False}},
+        "stage_timings_ms": {"first_pass_asr": 1000.0},
+    }
+    retrace = {
+        "first_pass_artifact_id": "artifact-1",
+        "asr": {"ok": True, "completeness": {"truncated": False}},
+        "stage_timings_ms": {"context_judge": 20.0},
+        "session": {
+            "memory_scope": "model--moss",
+            "turns": [{
+                "turn_id": "t001", "raw_text": "图博士发言", "current_text": "涂博士发言",
+                "meta": {"start_sec": 0.0, "end_sec": 1.0},
+            }],
+            "revision_events": [
+                {"active": True, "event_kind": "revision", "action": "REVISE_CURRENT", "target_turn_id": "t001", "before_text": "图博士发言", "after_text": "涂博士发言"},
+                {"active": True, "event_kind": "candidate_audit", "candidate_stage": "committed", "evidence": ["verifier_attempted:true", "audio_verified:0.9/0.1"]},
+            ],
+            "observability": {"memory_status": {"error": None}},
+        },
+    }
+    rows = [{"start": 0.0, "end": 1.0, "spk": "S01", "text": "涂博士发言"}]
+
+    item = evaluate_pair_payloads(
+        baseline,
+        retrace,
+        reference="涂博士发言",
+        rows=rows,
+        integrations={"deepseek": {"ready": True}},
+    )
+
+    assert item["valid"] is True
+    assert item["first_pass_artifact_id"] == "artifact-1"
+    assert item["raw"] == item["baseline"]
+    assert item["effectiveness"]["ecer"] == 1.0
+    assert item["effectiveness"]["revision_precision"] == 1.0
+    assert item["effectiveness"]["candidate_to_correction_yield"] == 1.0
+    assert item["retrace"]["committed_revisions"] == 1
+
+
+def test_paired_payloads_reject_mismatched_incomplete_or_unready_runs():
+    baseline = {
+        "first_pass_artifact_id": "artifact-a",
+        "transcript": "甲",
+        "asr": {"ok": True, "completeness": {"truncated": False}},
+    }
+    retrace = {
+        "first_pass_artifact_id": "artifact-b",
+        "asr": {"ok": False, "completeness": {"truncated": True}},
+        "session": {"turns": [{"turn_id": "t1", "raw_text": "乙", "current_text": "乙", "meta": {}}]},
+    }
+
+    item = evaluate_pair_payloads(
+        baseline,
+        retrace,
+        reference="甲",
+        rows=[],
+        integrations={"deepseek": {"ready": False}},
+    )
+
+    assert item["valid"] is False
+    assert "first_pass_artifact_mismatch" in item["invalid_reasons"]
+    assert "incomplete_first_pass" in item["invalid_reasons"]
+    assert "deepseek_not_ready" in item["invalid_reasons"]
+    assert "raw_transcript_mismatch" in item["invalid_reasons"]
+    assert item["effectiveness"] is None
+
+
+def test_aggregate_uses_only_valid_pooled_counts():
+    valid = {
+        "sample": "ok", "valid": True, "invalid_reasons": [],
+        "baseline": {"edits": 10}, "final": {"edits": 6},
+        "retrace": {"revision_quality": {"committed": 4, "improved": 3}, "candidate_funnel": {"validated_candidates": 6}},
+        "stage_timings_ms": {"context_judge": 100.0},
+        "stage_call_counts": {"context_judge": 2},
+    }
+    invalid = {
+        "sample": "bad", "valid": False, "invalid_reasons": ["deepseek_not_ready"],
+        "baseline": {"edits": 100}, "final": {"edits": 0},
+    }
+
+    result = aggregate_results([valid, invalid])
+
+    assert result["valid_samples"] == 1
+    assert result["invalid_samples"] == 1
+    assert result["effectiveness"] == {
+        "ecer": 0.4,
+        "revision_precision": 0.75,
+        "candidate_to_correction_yield": 0.5,
+    }
+    assert result["stage_timings_ms"] == {"context_judge": 100.0}

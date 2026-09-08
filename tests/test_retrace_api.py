@@ -2,6 +2,8 @@ from fastapi.testclient import TestClient
 from pathlib import Path
 
 from asr_agent import server
+from asr_agent.context_judge import ContextJudgment
+from asr_agent.retrace import ReTraceService
 from asr_agent.server import create_app
 
 
@@ -77,6 +79,128 @@ def test_moss_backend_uses_canonical_model_name_without_qwen_fallback(tmp_path, 
     assert body["provenance"]["first_pass"] == expected
     assert body["session"]["pipeline_provenance"]["first_pass"] == expected
     assert body["session"]["turns"][0]["meta"]["first_pass_identity"] == expected
+
+
+def test_moss_analysis_uses_bounded_windows_without_merging_turns(tmp_path, monkeypatch):
+    calls = []
+
+    def judge(*, current_turn, **_):
+        calls.append(
+            {
+                "turn_id": current_turn.turn_id,
+                "window": list(current_turn.meta.get("analysis_window_turn_ids") or []),
+                "session_complete": bool(current_turn.meta.get("session_complete")),
+            }
+        )
+        return ContextJudgment("CONSISTENT", 0.9)
+
+    chunks = [
+        {"start_sec": float(index), "end_sec": float(index + 1), "speaker": "S01"}
+        for index in range(21)
+    ]
+    monkeypatch.setenv("ASR_JUDGE_WINDOW_MAX_TURNS", "10")
+    monkeypatch.setenv("ASR_JUDGE_WINDOW_MAX_CHARS", "10000")
+    monkeypatch.setenv("ASR_JUDGE_WINDOW_MAX_AUDIO_SEC", "10000")
+    monkeypatch.setattr(
+        server,
+        "transcribe_audio",
+        lambda _audio: {
+            "ok": True,
+            "backend": "moss-transcribe-diarize",
+            "model": "MOSS-Transcribe-Diarize",
+            "chunks_text": [f"第{index}句" for index in range(21)],
+            "chunks": chunks,
+            "uncertainties": [{} for _ in chunks],
+        },
+    )
+    service = ReTraceService(tmp_path / "service", context_judge=judge)
+
+    with TestClient(create_app(tmp_path / "app", service=service)) as client:
+        body = client.post("/api/sessions/s/audio", json={"audio": "/tmp/moss.wav"}).json()
+
+    assert len(body["session"]["turns"]) == 21
+    assert [len(item["window"]) for item in calls] == [10, 10, 1]
+    assert calls[-1]["session_complete"] is True
+
+
+def test_default_moss_service_uses_only_moss_audio_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASR_BACKEND", "moss-transcribe-diarize")
+
+    with TestClient(create_app(tmp_path)) as client:
+        service = client.app.state.service
+
+    assert service.resolver.verifier_identity.family == "moss"
+    assert service.relistener_identity.family == "moss"
+    assert service.resolver.audio_verifier.__module__.endswith("moss_audio_tools")
+    assert service.audio_retranscriber.__module__.endswith("moss_audio_tools")
+
+
+def test_moss_retrace_provenance_names_moss_audio_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASR_BACKEND", "moss-transcribe-diarize")
+    monkeypatch.setattr(
+        server,
+        "transcribe_audio",
+        lambda _audio: {
+            "ok": True,
+            "backend": "moss-transcribe-diarize",
+            "model": "MOSS-Transcribe-Diarize",
+            "chunks_text": ["完整转写"],
+            "chunks": [{"start_sec": 0.0, "end_sec": 1.0}],
+            "uncertainties": [{}],
+        },
+    )
+
+    with TestClient(create_app(tmp_path)) as client:
+        body = client.post("/api/sessions/s/audio", json={"audio": "/tmp/missing.wav"}).json()
+
+    assert body["provenance"]["first_pass"]["model"] == "MOSS-Transcribe-Diarize"
+    assert body["provenance"]["targeted_verifier"]["model"] == "MOSS-Transcribe-Diarize"
+    assert body["provenance"]["open_relistener"]["model"] == "MOSS-Transcribe-Diarize"
+    assert body["provenance"]["context_judge"]["backend"] == "deepseek-api"
+
+
+def test_baseline_and_retrace_reuse_same_complete_first_pass_artifact(tmp_path, monkeypatch):
+    calls = []
+    audio = tmp_path / "sample.flac"
+    audio.write_bytes(b"test audio bytes")
+
+    def transcribe(path):
+        calls.append(path)
+        return {
+            "ok": True,
+            "backend": "moss-transcribe-diarize",
+            "model": "MOSS-Transcribe-Diarize",
+            "chunks_text": ["第一句", "第二句"],
+            "chunks": [
+                {"start_sec": 0.0, "end_sec": 1.0},
+                {"start_sec": 1.0, "end_sec": 2.0},
+            ],
+            "uncertainties": [{}, {}],
+            "completeness": {"truncated": False, "coverage_ratio": 1.0},
+        }
+
+    monkeypatch.setenv("ASR_BACKEND", "moss-transcribe-diarize")
+    monkeypatch.setattr(server, "transcribe_audio", transcribe)
+    service = ReTraceService(
+        tmp_path / "service",
+        context_judge=lambda **_: ContextJudgment("CONSISTENT", 0.9),
+    )
+
+    with TestClient(create_app(tmp_path / "app", service=service)) as client:
+        baseline = client.post(
+            "/api/sessions/baseline/audio",
+            json={"audio": str(audio), "experiment_mode": "baseline"},
+        ).json()
+        retrace = client.post(
+            "/api/sessions/retrace/audio",
+            json={"audio": str(audio), "experiment_mode": "retrace"},
+        ).json()
+
+    assert len(calls) == 1
+    assert baseline["first_pass_artifact_id"] == retrace["first_pass_artifact_id"]
+    assert baseline["first_pass_cache_hit"] is False
+    assert retrace["first_pass_cache_hit"] is True
+    assert "".join(turn["raw_text"] for turn in retrace["session"]["turns"]) == baseline["transcript"]
 
 
 def test_audio_sessions_share_memory_by_model_and_isolate_other_models(tmp_path, monkeypatch):

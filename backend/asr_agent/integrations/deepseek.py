@@ -98,6 +98,8 @@ _CONTEXT_JUDGE_SYSTEM = (
     "必须是包含 span 与 proposed_text 的候选列表，字段名用 alternatives 即可）、"
     "evidence_turn_ids、rationale 和 relationship。relationship 只能是 MUTUALLY_EXCLUSIVE、COEXIST、"
     "TEMPORAL_CHANGE。只输出 JSON 对象。"
+    "当 user 消息包含 analysis_window 时，必须逐条审计该窗口内的所有 turn，而不是只看 current_turn；"
+    "focus.target_turn_id 必须保持为被修改 turn 的真实 ID，不能统一改成窗口最后一个 turn。"
 )
 
 
@@ -134,6 +136,15 @@ def deepseek_status() -> dict[str, Any]:
         "transport": transport or None,
         "model": model or None,
         "error": error,
+    }
+
+
+def context_judge_identity() -> dict[str, str]:
+    status = deepseek_status()
+    return {
+        "backend": "deepseek-api",
+        "model": str(status.get("model") or "unknown"),
+        "role": "context_judge",
     }
 
 
@@ -313,8 +324,18 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
         recent_turns = memory.recent_turns
         history_chars = int(os.getenv("ASR_HISTORY_DIGEST_CHARS", "120"))
         current_payload = current_turn.as_dict()
+    window_ids = set(
+        (current_turn.meta or {}).get("analysis_window_turn_ids")
+        or [current_turn.turn_id]
+    )
+    analysis_window = [
+        {"turn_id": turn.turn_id, "text": turn.current_text or turn.raw_text}
+        for turn in session.turns
+        if turn.turn_id in window_ids
+    ]
     payload = {
         "current_turn": current_payload,
+        "analysis_window": analysis_window,
         "recent_turns": [
             {"turn_id": turn.turn_id, "text": re.sub(r"^\[[0-9.]+[-,~][0-9.]+\]\s*", "", turn.current_text or turn.raw_text)[:240]}
             for turn in recent_turns
