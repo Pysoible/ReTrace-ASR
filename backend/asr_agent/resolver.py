@@ -206,7 +206,7 @@ class EvidenceResolver:
         # is safe (we only skip a revision, never invent one).
         if operation == "REPLACE" and (
             focus.span in target.raw_text
-            and focus.proposed_text in target.raw_text
+            and focus.proposed_text in target.raw_text.replace(focus.span, "")
             and focus.proposed_text != focus.span
         ):
             return Resolution(

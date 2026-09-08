@@ -235,6 +235,38 @@ def test_resolver_still_revises_when_proposed_is_not_already_in_the_turn():
     assert result.replacement == "涂博士"
 
 
+def test_resolver_does_not_treat_replacement_substring_as_a_separate_occurrence():
+    target = Turn(
+        "t1",
+        "像像这些问题",
+        "像像这些问题",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0, "end_sec": 2},
+    )
+    focus = FocusProposal("t1", "像像这些", "像这些", ["像像这些", "像这些"], ["t1"])
+    calls = []
+
+    def verify(**kwargs):
+        calls.append(kwargs)
+        return {
+            "ok": True,
+            "scores": {
+                candidate: 0.96 if candidate == "像这些" else 0.02
+                for candidate in kwargs["candidates"]
+            },
+        }
+
+    result = EvidenceResolver(audio_verifier=verify).resolve(
+        Session("s", turns=[target]),
+        target,
+        focus,
+        context_confidence=0.95,
+    )
+
+    assert calls
+    assert result.action == "REVISE_CURRENT"
+    assert result.replacement == "像这些"
+
+
 def test_resolver_verifies_same_pronunciation_context_candidate():
     target = Turn(
         "t1",
