@@ -32,6 +32,7 @@ from asr_agent.degeneration import (
 )
 from asr_agent.ledger import RevisionLedger
 from asr_agent.memory import LongTermMemoryRepository, MemoryConsolidator, MemoryRetriever
+from asr_agent.model_identity import ModelIdentity
 from asr_agent.models import (
     DecisionState,
     EvidenceRef,
@@ -61,6 +62,8 @@ class ReTraceService:
         audio_retranscriber: AudioRetranscriber | None = None,
         resolver: EvidenceResolver | None = None,
         memory_dir: Path | None = None,
+        verifier_identity: ModelIdentity | None = None,
+        relistener_identity: ModelIdentity | None = None,
     ) -> None:
         root = Path(storage_dir)
         self.repository = SessionRepository(root)
@@ -72,12 +75,16 @@ class ReTraceService:
 
             context_judge = judge_context
         self.context_judge = context_judge
-        self.resolver = resolver or EvidenceResolver(audio_verifier=audio_verifier)
+        self.resolver = resolver or EvidenceResolver(
+            audio_verifier=audio_verifier,
+            verifier_identity=verifier_identity,
+        )
         if audio_retranscriber is None:
             from asr_agent.integrations.audio_verifier import retranscribe_window
 
             audio_retranscriber = retranscribe_window
         self.audio_retranscriber = audio_retranscriber
+        self.relistener_identity = relistener_identity
         self.memory_consolidator = MemoryConsolidator(
             self.long_term_memory,
             confidence_threshold=self.resolver.policy.thresholds.long_memory,
@@ -362,6 +369,11 @@ class ReTraceService:
                     *[f"evidence_turn:{item}" for item in focus.evidence_turn_ids],
                     f"verifier_attempted:{str(resolution.verifier_attempted).lower()}",
                 ]
+                if self.resolver.verifier_identity is not None:
+                    verifier = self.resolver.verifier_identity
+                    candidate_evidence.append(f"verifier_identity:{verifier.backend}/{verifier.model}")
+                if resolution.failure_code:
+                    candidate_evidence.append(f"failure_code:{resolution.failure_code}")
                 if resolution.verifier_succeeded:
                     candidate_evidence.append(
                         f"audio_verified:{resolution.audio_confidence:.3f}/{resolution.audio_margin:.3f}"
@@ -779,6 +791,23 @@ class ReTraceService:
                 except Exception:
                     hints = None
             try:
+                first_pass_raw = turn.meta.get("first_pass_identity")
+                if isinstance(first_pass_raw, dict):
+                    first_pass = ModelIdentity.from_dict(first_pass_raw)
+                    failure_code = (
+                        "relistener_unavailable"
+                        if self.relistener_identity is None
+                        else "relistener_backend_mismatch"
+                        if first_pass.family != self.relistener_identity.family
+                        else ""
+                    )
+                    if failure_code:
+                        meta["relisten_uncertain"] = {
+                            "relistened": False,
+                            "failure_code": failure_code,
+                            "error": "model-matched open relistener is unavailable",
+                        }
+                        return None
                 result = self.audio_retranscriber(
                     audio_path=str(audio_path),
                     start_sec=float(start_sec),

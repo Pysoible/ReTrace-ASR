@@ -1,6 +1,7 @@
 import json
 
 from asr_agent.context_judge import BeliefProposal, ContextJudgment, FocusProposal
+from asr_agent.model_identity import ModelIdentity
 from asr_agent.models import MemoryBelief
 from asr_agent.retrace import ReTraceService
 
@@ -803,6 +804,43 @@ def test_candidate_outcome_is_persisted_as_structured_audit(tmp_path):
     assert "candidate_source:semantic_open" in audit["evidence"]
     assert "verifier_attempted:true" in audit["evidence"]
     assert any(item.startswith("audio_verified:") for item in audit["evidence"])
+
+
+def test_moss_turn_cannot_call_qwen_open_relistener(tmp_path):
+    called = False
+
+    def qwen_relisten(**_):
+        nonlocal called
+        called = True
+        return {"ok": True, "text": "男装"}
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=lambda **_: ContextJudgment("UNCERTAIN", 0.95),
+        audio_retranscriber=qwen_relisten,
+        relistener_identity=ModelIdentity(
+            "qwen-omni-vllm", "Qwen3_Omni_30B", "open_relistener"
+        ),
+    )
+
+    result = service.process_turn(
+        "s",
+        "t1",
+        "南庄",
+        source="moss",
+        meta={
+            "audio_path": str(tmp_path / "a.wav"),
+            "start_sec": 0,
+            "end_sec": 1,
+            "first_pass_identity": ModelIdentity(
+                "moss-transcribe-diarize", "MOSS-Audio-7B", "first_pass"
+            ).as_dict(),
+        },
+    )
+
+    turn_meta = result["session"]["turns"][0]["meta"]
+    assert called is False
+    assert turn_meta["relisten_uncertain"]["failure_code"] == "relistener_backend_mismatch"
 
 
 def test_coverage_risk_uses_segmented_relisten_even_when_judge_is_consistent(tmp_path):

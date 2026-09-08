@@ -10,6 +10,7 @@ from typing import Any, Callable
 from asr_agent.calibration import DecisionPolicy, EvidenceFeatures
 from asr_agent.context_judge import FocusProposal, candidates_language_compatible, language_compatible
 from asr_agent.integrations.audio_verifier import retranscribe_window, verify_candidates
+from asr_agent.model_identity import ModelIdentity
 from asr_agent.models import Session, Turn
 
 
@@ -27,6 +28,7 @@ class Resolution:
     audio_margin: float = 0.0
     verifier_attempted: bool = False
     verifier_succeeded: bool = False
+    failure_code: str = ""
 
 
 class EvidenceResolver:
@@ -36,9 +38,22 @@ class EvidenceResolver:
         self,
         audio_verifier: Callable[..., dict[str, Any]] | None = None,
         policy: DecisionPolicy | None = None,
+        verifier_identity: ModelIdentity | None = None,
     ) -> None:
         self.audio_verifier = audio_verifier or verify_candidates
         self.policy = policy or DecisionPolicy()
+        self.verifier_identity = verifier_identity
+
+    def _verifier_failure(self, target: Turn) -> str:
+        raw_identity = target.meta.get("first_pass_identity")
+        if not isinstance(raw_identity, dict):
+            return ""
+        first_pass = ModelIdentity.from_dict(raw_identity)
+        if self.verifier_identity is None:
+            return "verifier_unavailable"
+        if first_pass.family != self.verifier_identity.family:
+            return "verifier_backend_mismatch"
+        return ""
 
     @staticmethod
     def _strict_revision_enabled() -> bool:
@@ -257,6 +272,15 @@ class EvidenceResolver:
             candidates = [focus.span, self.DELETE_CANDIDATE]
         elif self.DELETE_CANDIDATE not in candidates:
             candidates.append(self.DELETE_CANDIDATE)
+        verifier_failure = self._verifier_failure(target)
+        if verifier_failure:
+            return Resolution(
+                "DEFER",
+                target.turn_id,
+                focus.span,
+                rationale="model-matched targeted audio verifier is unavailable",
+                failure_code=verifier_failure,
+            )
         try:
             audio = self.audio_verifier(
                 audio_path=str(audio_path),

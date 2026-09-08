@@ -22,6 +22,7 @@ from asr_agent.integrations.deepseek import deepseek_status
 from asr_agent.integrations.qwen_asr import (
     asr_status,
     preload_engine,
+    read_asr_config,
     shutdown_engines,
     stream_transcribe_audio,
     transcribe_audio,
@@ -230,7 +231,17 @@ def create_app(
     coordinator: RealtimeAnalysisCoordinator | None = None,
 ) -> FastAPI:
     root = workspace or Path.cwd() / "retrace_state"
-    service = service or ReTraceService(root / "sessions")
+    if service is None:
+        qwen_model = Path(read_asr_config().model_path).name
+        service = ReTraceService(
+            root / "sessions",
+            verifier_identity=ModelIdentity(
+                "qwen-omni-vllm", qwen_model, "targeted_verifier"
+            ),
+            relistener_identity=ModelIdentity(
+                "qwen-omni-vllm", qwen_model, "open_relistener"
+            ),
+        )
     coordinator = coordinator or RealtimeAnalysisCoordinator(service)
     upload_dir = root / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)

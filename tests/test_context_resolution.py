@@ -3,6 +3,7 @@ import pytest
 from asr_agent.calibration import CalibrationPoint, DecisionPolicy, EvidenceFeatures, select_revision_threshold
 from asr_agent.context_judge import BeliefProposal, ContextJudgment, FocusProposal, normalize_judgment
 from asr_agent.models import Session, Turn
+from asr_agent.model_identity import ModelIdentity
 from asr_agent.resolver import EvidenceResolver
 
 
@@ -62,6 +63,48 @@ def test_resolver_accepts_only_the_proposed_closed_set_winner():
     assert result.action == "REVISE_HISTORY"
     assert result.replacement == "涂博士"
     assert result.audio_verified is True
+
+
+def test_moss_turn_cannot_call_qwen_verifier(tmp_path):
+    called = False
+
+    def qwen_verify(**_):
+        nonlocal called
+        called = True
+        return {"ok": True, "scores": {"南庄": 0.1, "男装": 0.9}}
+
+    resolver = EvidenceResolver(
+        audio_verifier=qwen_verify,
+        verifier_identity=ModelIdentity(
+            "qwen-omni-vllm", "Qwen3_Omni_30B", "targeted_verifier"
+        ),
+    )
+    target = Turn(
+        "t1",
+        "南庄",
+        "南庄",
+        source="moss",
+        meta={
+            "audio_path": str(tmp_path / "a.wav"),
+            "start_sec": 0,
+            "end_sec": 1,
+            "first_pass_identity": ModelIdentity(
+                "moss-transcribe-diarize", "MOSS-Audio-7B", "first_pass"
+            ).as_dict(),
+        },
+    )
+    focus = FocusProposal(
+        "t1", "南庄", "男装", ["南庄", "男装"], ["t1"], source="semantic_open"
+    )
+
+    result = resolver.resolve(
+        Session("s", turns=[target]), target, focus, context_confidence=0.99
+    )
+
+    assert result.action == "DEFER"
+    assert result.verifier_attempted is False
+    assert result.failure_code == "verifier_backend_mismatch"
+    assert called is False
 
 
 def test_context_judgment_carries_grounded_working_beliefs():
