@@ -6,12 +6,17 @@ import argparse
 from collections import Counter
 import json
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import requests
 from Levenshtein import editops as levenshtein_editops
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from scripts.report_candidate_pipeline import candidate_pipeline_metrics
 
 _ROW_RE = re.compile(r"^\s*([0-9.]+)\s+([0-9.]+)\s+(\S+)\s+(.+?)\s*$")
