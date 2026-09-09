@@ -54,6 +54,40 @@ def test_moss_backend_result_marks_audio_turn_source(tmp_path, monkeypatch):
     assert response.json()["session"]["turns"][0]["source"] == "moss"
 
 
+def test_moss_audio_turn_preserves_primary_speaker_and_overlap_audit(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "transcribe_audio",
+        lambda _audio: {
+            "ok": True,
+            "backend": "moss-transcribe-diarize",
+            "model": "MOSS-Transcribe-Diarize",
+            "chunks_text": ["主说话人", "插话人"],
+            "chunks": [
+                {"index": 0, "start_sec": 0.0, "end_sec": 2.0, "speaker": "S06"},
+                {"index": 1, "start_sec": 1.0, "end_sec": 1.8, "speaker": "S02"},
+            ],
+            "uncertainties": [{}, {}],
+        },
+    )
+    service = ReTraceService(
+        tmp_path / "service",
+        context_judge=lambda **_: ContextJudgment("CONSISTENT", 0.9),
+    )
+
+    with TestClient(create_app(tmp_path / "app", service=service)) as client:
+        response = client.post("/api/sessions/s/audio", json={"audio": "/tmp/moss.wav"})
+
+    response.raise_for_status()
+    turns = response.json()["session"]["turns"]
+    assert turns[0]["meta"]["speaker"] == "S06"
+    assert turns[0]["meta"]["speakers"] == ["S06", "S02"]
+    assert turns[0]["meta"]["overlap"] is True
+    assert turns[0]["meta"]["overlap_duration_sec"] == 0.8
+    assert turns[0]["meta"]["overlap_with_indices"] == [1]
+    assert turns[0]["meta"]["uncertainty"]["overlap"]["automatic_revision_allowed"] is False
+
+
 def test_moss_backend_uses_canonical_model_name_without_qwen_fallback(tmp_path, monkeypatch):
     monkeypatch.setenv("ASR_MODEL_PATH", "/models/Qwen3_Omni_30B")
     monkeypatch.setattr(
@@ -138,6 +172,35 @@ def test_runtime_coverage_is_derived_for_old_cached_moss_payload(monkeypatch):
     assert "coverage" not in payload["uncertainties"][0]
     assert derived["uncertainties"][0]["coverage"]["truncated"] is True
     assert derived["uncertainties"][0]["coverage"]["detector"] == "moss_segment_char_density"
+
+
+def test_runtime_overlap_is_recomputed_for_old_cached_moss_payload(monkeypatch):
+    monkeypatch.setenv("MOSS_OVERLAP_MIN_SEC", "0.25")
+    payload = {
+        "ok": True,
+        "backend": "moss-transcribe-diarize",
+        "chunks_text": ["第一句", "第二句"],
+        "chunks": [
+            {
+                "index": 0,
+                "start_sec": 0.0,
+                "end_sec": 1.1,
+                "speaker": "S01",
+                "speakers": ["S01", "S02"],
+                "overlap": True,
+                "overlap_duration_sec": 0.1,
+                "overlap_with_indices": [1],
+            },
+            {"index": 1, "start_sec": 1.0, "end_sec": 2.0, "speaker": "S02"},
+        ],
+        "uncertainties": [{}, {}],
+    }
+
+    derived = server._derive_runtime_asr_signals(payload)
+
+    assert payload["chunks"][0]["overlap"] is True
+    assert "overlap" not in derived["chunks"][0]
+    assert derived["uncertainties"][0]["overlap"]["detected"] is False
 
 
 def test_moss_coverage_anomaly_inside_window_gets_its_own_agent_action(tmp_path, monkeypatch):

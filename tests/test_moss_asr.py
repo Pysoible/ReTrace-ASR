@@ -19,6 +19,43 @@ def test_parse_moss_transcript_into_retrace_chunks():
     }
 
 
+def test_parse_moss_transcript_marks_cross_speaker_timestamp_overlap(monkeypatch):
+    monkeypatch.setenv("MOSS_OVERLAP_MIN_SEC", "0.25")
+    raw = (
+        "[0.00][S06]主说话人持续发言[3.00]"
+        "[1.00][S02]另一位说话人插话[2.00]"
+        "[3.10][S03]后续发言[4.00]"
+    )
+
+    parsed = moss_asr.parse_moss_transcript(raw)
+
+    first, second, third = parsed["chunks"]
+    assert first == {
+        "index": 0,
+        "start_sec": 0.0,
+        "end_sec": 3.0,
+        "speaker": "S06",
+        "speakers": ["S06", "S02"],
+        "overlap": True,
+        "overlap_duration_sec": 1.0,
+        "overlap_with_indices": [1],
+    }
+    assert second["speakers"] == ["S02", "S06"]
+    assert second["overlap"] is True
+    assert second["overlap_duration_sec"] == 1.0
+    assert second["overlap_with_indices"] == [0]
+    assert third == {"index": 2, "start_sec": 3.1, "end_sec": 4.0, "speaker": "S03"}
+
+
+def test_parse_moss_transcript_ignores_short_cross_speaker_overlap(monkeypatch):
+    monkeypatch.setenv("MOSS_OVERLAP_MIN_SEC", "0.25")
+    raw = "[0.00][S01]第一句[1.10][1.00][S02]第二句[2.00]"
+
+    parsed = moss_asr.parse_moss_transcript(raw)
+
+    assert all("overlap" not in chunk for chunk in parsed["chunks"])
+
+
 def test_moss_segment_coverage_routes_sparse_long_turn_to_redecode(monkeypatch):
     monkeypatch.setenv("MOSS_MIN_SEGMENT_CHAR_DENSITY", "2.0")
 
@@ -35,6 +72,29 @@ def test_moss_segment_coverage_routes_sparse_long_turn_to_redecode(monkeypatch):
     assert sparse["reasons"] == ["low_transcript_density"]
     assert sparse["recommended_actions"] == ["RESEGMENT", "REDECODE"]
     assert uncertainties[1]["coverage"]["truncated"] is False
+
+
+def test_moss_overlap_is_a_separate_audit_signal_not_coverage_truncation(monkeypatch):
+    monkeypatch.setenv("MOSS_OVERLAP_MIN_SEC", "0.25")
+    chunks = moss_asr.parse_moss_transcript(
+        "[0.00][S01]第一位发言[2.00][1.00][S02]第二位插话[1.80]"
+    )["chunks"]
+
+    uncertainties = moss_asr.segment_coverage_uncertainties(
+        ["第一位发言", "第二位插话"],
+        chunks,
+    )
+
+    assert uncertainties[0]["coverage"]["truncated"] is False
+    assert uncertainties[0]["overlap"] == {
+        "detector": "moss_cross_speaker_timestamp_overlap",
+        "detected": True,
+        "duration_sec": 0.8,
+        "speakers": ["S01", "S02"],
+        "with_indices": [1],
+        "automatic_revision_allowed": False,
+        "recommended_actions": ["AUDIT_OVERLAP", "GUIDED_SOURCE_SEPARATION"],
+    }
 
 
 def test_transcribe_audio_posts_to_moss_endpoint(monkeypatch, tmp_path):

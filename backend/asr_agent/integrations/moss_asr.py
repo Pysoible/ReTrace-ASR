@@ -43,6 +43,81 @@ def _env_max_completion_tokens() -> str:
     )
 
 
+def annotate_speaker_overlaps(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return copied chunks annotated with cross-speaker timestamp overlap.
+
+    MOSS emits one primary ``speaker`` per segment.  Concurrent speakers appear
+    as intersecting segments, so retain that primary label and derive the
+    plural ``speakers``/overlap audit fields from the timestamps.  Short edge
+    intersections are ignored to avoid treating timestamp jitter as speech
+    overlap.
+    """
+    minimum_overlap = max(0.0, float(os.getenv("MOSS_OVERLAP_MIN_SEC", "0.25")))
+    annotated = [dict(chunk) for chunk in chunks]
+    for chunk in annotated:
+        for field in ("speakers", "overlap", "overlap_duration_sec", "overlap_with_indices"):
+            chunk.pop(field, None)
+    overlap_ranges: dict[int, list[tuple[float, float]]] = {}
+    overlap_indices: dict[int, set[int]] = {}
+    overlap_speakers: dict[int, list[str]] = {}
+
+    timed: list[tuple[float, float, int, str]] = []
+    for position, chunk in enumerate(annotated):
+        start, end = chunk.get("start_sec"), chunk.get("end_sec")
+        speaker = str(chunk.get("speaker") or "").strip()
+        if start is None or end is None or not speaker:
+            continue
+        start_value, end_value = float(start), float(end)
+        if end_value > start_value:
+            timed.append((start_value, end_value, position, speaker))
+    timed.sort(key=lambda item: (item[0], item[1], item[2]))
+
+    active: list[tuple[float, float, int, str]] = []
+    for current in timed:
+        current_start, current_end, current_position, current_speaker = current
+        active = [item for item in active if item[1] - current_start >= minimum_overlap]
+        for other_start, other_end, other_position, other_speaker in active:
+            if other_speaker == current_speaker:
+                continue
+            overlap_start = max(current_start, other_start)
+            overlap_end = min(current_end, other_end)
+            if overlap_end <= overlap_start or overlap_end - overlap_start < minimum_overlap:
+                continue
+            for position, peer_position, peer_speaker in (
+                (current_position, other_position, other_speaker),
+                (other_position, current_position, current_speaker),
+            ):
+                overlap_ranges.setdefault(position, []).append((overlap_start, overlap_end))
+                overlap_indices.setdefault(position, set()).add(peer_position)
+                speakers = overlap_speakers.setdefault(position, [])
+                if peer_speaker not in speakers:
+                    speakers.append(peer_speaker)
+        active.append(current)
+
+    for position, ranges in overlap_ranges.items():
+        ranges.sort()
+        merged: list[list[float]] = []
+        for start, end in ranges:
+            if not merged or start > merged[-1][1]:
+                merged.append([start, end])
+            else:
+                merged[-1][1] = max(merged[-1][1], end)
+        chunk = annotated[position]
+        primary = str(chunk.get("speaker") or "").strip()
+        chunk.update(
+            {
+                "speakers": [primary, *overlap_speakers.get(position, [])],
+                "overlap": True,
+                "overlap_duration_sec": round(sum(end - start for start, end in merged), 3),
+                "overlap_with_indices": sorted(
+                    int(annotated[index].get("index", index))
+                    for index in overlap_indices.get(position, set())
+                ),
+            }
+        )
+    return annotated
+
+
 def parse_moss_transcript(raw: str) -> dict[str, Any]:
     """Parse canonical MOSS ``[start][Sxx]text[end]`` output."""
     chunks_text: list[str] = []
@@ -61,6 +136,7 @@ def parse_moss_transcript(raw: str) -> dict[str, Any]:
             }
         )
     if chunks_text:
+        chunks = annotate_speaker_overlaps(chunks)
         return {"text": "".join(chunks_text), "chunks_text": chunks_text, "chunks": chunks}
     text = re.sub(r"\s+", " ", raw or "").strip()
     return {
@@ -123,6 +199,7 @@ def segment_coverage_uncertainties(
         char_count = len(re.findall(r"[0-9A-Za-z\u4e00-\u9fff]", text or ""))
         density = char_count / duration if duration > 0 else None
         suspect = bool(duration >= minimum_duration and density is not None and density < threshold)
+        overlap_detected = bool(chunk.get("overlap"))
         output.append({
             "coverage": {
                 "detector": "moss_segment_char_density",
@@ -133,7 +210,18 @@ def segment_coverage_uncertainties(
                 "truncated": suspect,
                 "reasons": ["low_transcript_density"] if suspect else [],
                 "recommended_actions": ["RESEGMENT", "REDECODE"] if suspect else [],
-            }
+            },
+            "overlap": {
+                "detector": "moss_cross_speaker_timestamp_overlap",
+                "detected": overlap_detected,
+                "duration_sec": float(chunk.get("overlap_duration_sec") or 0.0),
+                "speakers": list(chunk.get("speakers") or ([chunk["speaker"]] if chunk.get("speaker") else [])),
+                "with_indices": list(chunk.get("overlap_with_indices") or []),
+                "automatic_revision_allowed": False,
+                "recommended_actions": (
+                    ["AUDIT_OVERLAP", "GUIDED_SOURCE_SEPARATION"] if overlap_detected else []
+                ),
+            },
         })
     return output
 

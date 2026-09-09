@@ -42,11 +42,14 @@ def _derive_runtime_asr_signals(asr: dict[str, Any]) -> dict[str, Any]:
     derived = dict(asr)
     if derived.get("backend") != "moss-transcribe-diarize":
         return derived
-    from asr_agent.integrations.moss_asr import segment_coverage_uncertainties
+    from asr_agent.integrations.moss_asr import annotate_speaker_overlaps, segment_coverage_uncertainties
+
+    chunks = annotate_speaker_overlaps(list(derived.get("chunks") or []))
+    derived["chunks"] = chunks
 
     coverage = segment_coverage_uncertainties(
         list(derived.get("chunks_text") or []),
-        list(derived.get("chunks") or []),
+        chunks,
     )
     existing = list(derived.get("uncertainties") or [])
     derived["uncertainties"] = [
@@ -495,8 +498,11 @@ def create_app(
                 "end_sec": prepared["end_sec"],
                 "uncertainty": uncertainty,
                 "speaker_segments": uncertainty.get("speaker_segments") or [],
-                "speakers": chunk.get("speakers") or [],
+                "speaker": chunk.get("speaker"),
+                "speakers": chunk.get("speakers") or ([chunk["speaker"]] if chunk.get("speaker") else []),
                 "overlap": bool(chunk.get("overlap")),
+                "overlap_duration_sec": float(chunk.get("overlap_duration_sec") or 0.0),
+                "overlap_with_indices": list(chunk.get("overlap_with_indices") or []),
                 "routing": chunk.get("routing"),
                 "routed_speaker_segments": routed_by_chunk.get(index, []),
                 "first_pass_identity": first_pass.as_dict(),
@@ -750,8 +756,11 @@ def create_app(
                         "uncertainty": uncertainty,
                         "speaker_segments": uncertainty.get("speaker_segments") or [],
                         "routed_speaker_segments": uncertainty.get("routed_speaker_segments") or [],
-                        "speakers": chunk.get("speakers") or [],
+                        "speaker": chunk.get("speaker"),
+                        "speakers": chunk.get("speakers") or ([chunk["speaker"]] if chunk.get("speaker") else []),
                         "overlap": bool(chunk.get("overlap")),
+                        "overlap_duration_sec": float(chunk.get("overlap_duration_sec") or 0.0),
+                        "overlap_with_indices": list(chunk.get("overlap_with_indices") or []),
                         "routing": chunk.get("routing"),
                         "first_pass_identity": first_pass_identity.as_dict(),
                     },
