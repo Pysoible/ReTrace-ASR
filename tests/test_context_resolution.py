@@ -157,6 +157,27 @@ def test_gss_candidate_uses_separated_decode_instead_of_original_mixture(tmp_pat
     assert called is False
 
 
+def test_repeated_gss_support_is_stable_at_uncertain_semantic_confidence(tmp_path):
+    target = Turn(
+        "t1", "宣传代业", "宣传代业",
+        meta={
+            "audio_path": str(tmp_path / "meeting.flac"), "start_sec": 1.0, "end_sec": 3.0,
+            "uncertainty": {"overlap": {"substitution_candidates": [
+                {"span": "代业", "candidate": "单页", "source": "gss_overlap"}
+            ]}},
+        },
+    )
+    focus = FocusProposal(
+        "t1", "代业", "单页", ["代业", "单页"], ["t1", "t2"], source="gss_overlap"
+    )
+
+    result = EvidenceResolver().resolve(
+        Session("s", turns=[target]), target, focus, context_confidence=0.8
+    )
+
+    assert result.action == "REVISE_CURRENT"
+
+
 def test_context_judgment_carries_grounded_working_beliefs():
     session = Session("s", turns=[Turn("t1", "负责人是涂博士", "负责人是涂博士")])
     judgment = ContextJudgment(

@@ -424,8 +424,13 @@ class EvidenceResolver:
             and margin >= 0.30
             and self._is_safe_local_replacement(focus.span, focus.proposed_text, operation)
         )
+        context_minimum = (
+            0.75
+            if gss_supported and len(set(focus.evidence_turn_ids)) >= 2
+            else 0.85
+        )
         if strict_revision and not near_variant and not structured_repetition and (
-            context_confidence < 0.85
+            context_confidence < context_minimum
             or top < 0.85
             or margin < 0.30
             or (not acoustic_support and self.policy.calibrator.predict(features) < 0.75)
