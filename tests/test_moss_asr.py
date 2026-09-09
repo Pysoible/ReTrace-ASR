@@ -97,6 +97,50 @@ def test_moss_overlap_is_a_separate_audit_signal_not_coverage_truncation(monkeyp
     }
 
 
+def test_gss_overlap_candidates_keep_only_local_substitutions():
+    candidates = moss_asr.extract_gss_substitution_candidates(
+        "宣传代业，代业，哦对，前期就做这个",
+        "宣传单页，单页，哦对，前期就要做这个。宣传宣传单页，对。嗯。",
+    )
+
+    assert candidates == [
+        {
+            "span": "代业",
+            "candidate": "单页",
+            "source": "gss_overlap",
+        }
+    ]
+
+
+def test_gss_overlap_candidates_reject_language_switch_and_insertions():
+    assert moss_asr.extract_gss_substitution_candidates("对对对", "Good evening.") == []
+    assert moss_asr.extract_gss_substitution_candidates("今天开会", "今天下午开会") == []
+
+
+def test_moss_uncertainty_exposes_gss_span_candidates_without_authorizing_revision():
+    uncertainties = moss_asr.segment_coverage_uncertainties(
+        ["宣传代业，啊对"],
+        [
+            {
+                "speaker": "S08",
+                "start_sec": 1.0,
+                "end_sec": 2.0,
+                "overlap": True,
+                "speakers": ["S08", "S02"],
+                "overlap_duration_sec": 0.8,
+                "overlap_with_indices": [2],
+                "gss_text": "宣传单页啊，对。",
+            }
+        ],
+    )
+
+    assert uncertainties[0]["text_candidates"] == {"代业": ["代业", "单页"]}
+    assert uncertainties[0]["overlap"]["substitution_candidates"] == [
+        {"span": "代业", "candidate": "单页", "source": "gss_overlap"}
+    ]
+    assert uncertainties[0]["overlap"]["automatic_revision_allowed"] is False
+
+
 def test_transcribe_audio_posts_to_moss_endpoint(monkeypatch, tmp_path):
     audio = tmp_path / "sample.wav"
     audio.write_bytes(b"audio")

@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ _SEGMENT_RE = re.compile(
     r"\[(?P<start>\d+(?:\.\d+)?)\]\[(?P<speaker>S\d+)\](?P<text>.*?)\[(?P<end>\d+(?:\.\d+)?)\]",
     re.DOTALL,
 )
+_TRANSCRIPT_CHAR_RE = re.compile(r"[0-9A-Za-z\u4e00-\u9fff]")
 
 
 def _env_model_path() -> str:
@@ -118,6 +120,77 @@ def annotate_speaker_overlaps(chunks: list[dict[str, Any]]) -> list[dict[str, An
     return annotated
 
 
+def _compact_transcript(text: str) -> str:
+    return "".join(_TRANSCRIPT_CHAR_RE.findall(text or ""))
+
+
+def _script_profile(text: str) -> set[str]:
+    profile: set[str] = set()
+    if re.search(r"[\u4e00-\u9fff]", text or ""):
+        profile.add("cjk")
+    if re.search(r"[A-Za-z]", text or ""):
+        profile.add("latin")
+    if re.search(r"[0-9]", text or ""):
+        profile.add("digit")
+    return profile
+
+
+def _minimal_repeated_pair(source: str, candidate: str) -> tuple[str, str]:
+    """Collapse aligned repeated substitutions such as 代业代业 -> 单页单页."""
+    if len(source) != len(candidate):
+        return source, candidate
+    for width in range(1, len(source) + 1):
+        if len(source) % width:
+            continue
+        repetitions = len(source) // width
+        left, right = source[:width], candidate[:width]
+        if repetitions > 1 and left * repetitions == source and right * repetitions == candidate:
+            return left, right
+    return source, candidate
+
+
+def extract_gss_substitution_candidates(
+    first_pass_text: str,
+    gss_text: str,
+    *,
+    max_span_chars: int = 4,
+) -> list[dict[str, str]]:
+    """Extract conservative span replacements from a separated MOSS decode.
+
+    Insertions and deletions are intentionally discarded.  GSS is an acoustic
+    candidate generator, not authority to replace a whole turn; every emitted
+    span must still pass the normal semantic and local-audio gates.
+    """
+    source = _compact_transcript(first_pass_text)
+    separated = _compact_transcript(gss_text)
+    if not source or not separated or re.search(r"\[\d", gss_text or ""):
+        return []
+    source_scripts = _script_profile(source)
+    if _script_profile(separated) - source_scripts:
+        return []
+
+    output: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for tag, left_start, left_end, right_start, right_end in SequenceMatcher(
+        None,
+        source,
+        separated,
+        autojunk=False,
+    ).get_opcodes():
+        if tag != "replace" or left_end - left_start != right_end - right_start:
+            continue
+        span, candidate = _minimal_repeated_pair(
+            source[left_start:left_end],
+            separated[right_start:right_end],
+        )
+        key = (span, candidate)
+        if not span or span == candidate or len(span) > max_span_chars or span not in first_pass_text or key in seen:
+            continue
+        seen.add(key)
+        output.append({"span": span, "candidate": candidate, "source": "gss_overlap"})
+    return output
+
+
 def parse_moss_transcript(raw: str) -> dict[str, Any]:
     """Parse canonical MOSS ``[start][Sxx]text[end]`` output."""
     chunks_text: list[str] = []
@@ -200,7 +273,12 @@ def segment_coverage_uncertainties(
         density = char_count / duration if duration > 0 else None
         suspect = bool(duration >= minimum_duration and density is not None and density < threshold)
         overlap_detected = bool(chunk.get("overlap"))
-        output.append({
+        substitutions = (
+            extract_gss_substitution_candidates(text, str(chunk.get("gss_text") or ""))
+            if overlap_detected and chunk.get("gss_text")
+            else []
+        )
+        item: dict[str, Any] = {
             "coverage": {
                 "detector": "moss_segment_char_density",
                 "speech_window_sec": round(duration, 3),
@@ -222,7 +300,14 @@ def segment_coverage_uncertainties(
                     ["AUDIT_OVERLAP", "GUIDED_SOURCE_SEPARATION"] if overlap_detected else []
                 ),
             },
-        })
+        }
+        if substitutions:
+            item["text_candidates"] = {
+                candidate["span"]: [candidate["span"], candidate["candidate"]]
+                for candidate in substitutions
+            }
+            item["overlap"]["substitution_candidates"] = substitutions
+        output.append(item)
     return output
 
 

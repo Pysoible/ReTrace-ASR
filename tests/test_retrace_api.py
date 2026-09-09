@@ -203,6 +203,32 @@ def test_runtime_overlap_is_recomputed_for_old_cached_moss_payload(monkeypatch):
     assert derived["uncertainties"][0]["overlap"]["detected"] is False
 
 
+def test_runtime_moss_signals_preserve_gss_text_and_derive_span_candidates(monkeypatch):
+    monkeypatch.setenv("MOSS_OVERLAP_MIN_SEC", "0.25")
+    payload = {
+        "ok": True,
+        "backend": "moss-transcribe-diarize",
+        "chunks_text": ["宣传代业，啊对", "宣传单页"],
+        "chunks": [
+            {
+                "index": 0,
+                "start_sec": 0.0,
+                "end_sec": 2.0,
+                "speaker": "S01",
+                "gss_text": "宣传单页啊，对。",
+            },
+            {"index": 1, "start_sec": 1.0, "end_sec": 2.0, "speaker": "S02"},
+        ],
+        "uncertainties": [{}, {}],
+    }
+
+    derived = server._derive_runtime_asr_signals(payload)
+
+    assert derived["chunks"][0]["gss_text"] == "宣传单页啊，对。"
+    assert derived["uncertainties"][0]["text_candidates"] == {"代业": ["代业", "单页"]}
+    assert derived["uncertainties"][0]["overlap"]["automatic_revision_allowed"] is False
+
+
 def test_moss_coverage_anomaly_inside_window_gets_its_own_agent_action(tmp_path, monkeypatch):
     calls = []
 

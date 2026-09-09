@@ -85,6 +85,10 @@ _CONTEXT_JUDGE_SYSTEM = (
     "直接体现。你应当把它们视为'此处可能听错'的线索，与语义判断结合使用：如果某个低置信度字与上下文"
     "不搭、或读起来像某个已知专有名词/领域词，则更可能是 ASR 错误，可在 focus 中针对该字所在的最短"
     "词提出候选。反之，如果低置信度字在语义上完全通顺，则不必强行修订。"
+    "user 消息里的 overlap_candidates 来自多通道重叠语音经 GSS 分离后、由同一个首遍 ASR 重新解码得到的"
+    "短等长替换候选。它们是独立声学视图，不是正确答案。只在 candidate 明显修正 span 的错字或错词、"
+    "符合当前句和相邻上下文时，才为原始 target_turn_id 输出最短 focus；不得接受 GSS 中的新增、删除、"
+    "语气词堆叠、翻译或整句改写。不确定时保留原文。"
     "user 消息里的 canonical_entities 是 agent 已经通过上下文与定向音频验证确认过的实体规范写法，"
     "每项有 canonical、aliases 与证据 turn。它们用于保证一个 session 内同一实体只有一种写法：当"
     "current_turn 或 recent_turns 中出现 alias 或另一种近音音译，而语境指向同一实体时，必须提出该历史 "
@@ -400,6 +404,7 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
     uncertainty = current_turn.meta.get("uncertainty") or {}
     acoustic_disagreement = uncertainty.get("acoustic_disagreement")
     low_conf_chars = uncertainty.get("low_conf_chars")
+    overlap_candidates = (uncertainty.get("overlap") or {}).get("substitution_candidates") or []
     session_complete = bool((current_turn.meta or {}).get("session_complete"))
     if session_complete:
         recent_turns = memory.recent_turns[-4:]
@@ -456,6 +461,10 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
         # Char-level acoustic confidence: characters the second ASR itself was
         # unsure about, with their confidence values.
         "low_conf_chars": low_conf_chars,
+        # GSS is candidate evidence only.  Insertions/deletions were already
+        # removed deterministically; the semantic judge must still validate
+        # each remaining short substitution against its context.
+        "overlap_candidates": overlap_candidates,
         "session_complete": session_complete,
     }
     messages = [
