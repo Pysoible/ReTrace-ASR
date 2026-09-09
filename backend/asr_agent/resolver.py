@@ -368,6 +368,7 @@ class EvidenceResolver:
         if effective_operation == "REPLACE" and focus.proposed_text not in normalized:
             return Resolution("KEEP_OLD", target.turn_id, focus.span, score=top, rationale="replacement candidate was not acoustically verified", audio_confidence=top, verifier_attempted=True, verifier_succeeded=True)
         near_variant = effective_operation == "REPLACE" and self._is_near_variant(focus.span, focus.proposed_text)
+        strict_revision = self._strict_revision_enabled()
 
         # For a near-variant proper noun, the decisive question is whether the
         # proposed spelling is still the best candidate and whether the evidence is
@@ -375,7 +376,7 @@ class EvidenceResolver:
         # just because the general-purpose audio_margin gate is designed for more
         # divergent candidates.
         if ordered[0][0] != proposed_key and effective_operation != "DELETE":
-            if not near_variant:
+            if strict_revision or not near_variant:
                 return Resolution("KEEP_OLD", target.turn_id, focus.span, score=top, audio_confidence=top, verifier_attempted=True, verifier_succeeded=True)
             if proposed_score < 0.0:
                 return Resolution("KEEP_OLD", target.turn_id, focus.span, score=top, audio_confidence=top, verifier_attempted=True, verifier_succeeded=True)
@@ -383,7 +384,6 @@ class EvidenceResolver:
                 return Resolution("KEEP_OLD", target.turn_id, focus.span, score=top, audio_confidence=top, verifier_attempted=True, verifier_succeeded=True)
 
         margin = top - (ordered[1][1] if len(ordered) > 1 else 0.0)
-        strict_revision = self._strict_revision_enabled()
         if structured_repetition:
             effective_margin_threshold = max(0.30, self.policy.thresholds.audio_margin)
             effective_revise_threshold = 0.0
@@ -448,7 +448,7 @@ class EvidenceResolver:
             )
         if top < self.policy.thresholds.relisten:
             return Resolution("DEFER", target.turn_id, focus.span, score=top, rationale="audio confidence below relisten threshold", audio_confidence=top, audio_margin=margin, verifier_attempted=True, verifier_succeeded=True)
-        if margin < effective_margin_threshold and not near_variant:
+        if margin < effective_margin_threshold:
             return Resolution("DEFER", target.turn_id, focus.span, score=top, rationale="audio margin too small for a safe revision", audio_confidence=top, audio_margin=margin, verifier_attempted=True, verifier_succeeded=True)
         if self.policy.calibrator.predict(features) < effective_revise_threshold:
             return Resolution("DEFER", target.turn_id, focus.span, score=top, rationale="evidence below adjusted revision policy", audio_confidence=top, audio_margin=margin, verifier_attempted=True, verifier_succeeded=True)

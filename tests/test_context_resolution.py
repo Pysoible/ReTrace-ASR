@@ -178,6 +178,23 @@ def test_repeated_gss_support_is_stable_at_uncertain_semantic_confidence(tmp_pat
     assert result.action == "REVISE_CURRENT"
 
 
+def test_strict_near_variant_rejects_tied_same_model_audio(tmp_path):
+    target = Turn(
+        "t1", "其实咱们", "其实咱们",
+        meta={"audio_path": str(tmp_path / "meeting.flac"), "start_sec": 1.0, "end_sec": 3.0},
+    )
+    focus = FocusProposal(
+        "t1", "实咱们", "是咱们", ["实咱们", "是咱们"], ["t2", "t3"], source="history_homophone"
+    )
+    resolver = EvidenceResolver(audio_verifier=lambda **_: {
+        "ok": True, "scores": {"实咱们": 0.5, "是咱们": 0.5, "[DELETE]": 0.0}
+    })
+
+    result = resolver.resolve(Session("s", turns=[target]), target, focus, context_confidence=0.99)
+
+    assert result.action == "KEEP_OLD"
+
+
 def test_context_judgment_carries_grounded_working_beliefs():
     session = Session("s", turns=[Turn("t1", "负责人是涂博士", "负责人是涂博士")])
     judgment = ContextJudgment(
