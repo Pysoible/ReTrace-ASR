@@ -275,10 +275,16 @@ class ReTraceService:
             # soon as a same-pronunciation variant appears.  This bounded helper
             # existed but was not connected to the candidate pool, so only the
             # end-of-session global scan could surface these substitutions.
-            candidate_pool.extend(
-                focus_to_candidate(focus, snapshot)
-                for focus in self._context_homophone_focus(snapshot, trigger)
-            )
+            # Batched MOSS analysis already supplies window-scoped homophone
+            # candidates to the semantic judge.  Re-scanning every n-gram in
+            # the full meeting once per window was redundant and dominated
+            # runtime on long recordings.  Keep this helper for true streaming
+            # turns, where no analysis window exists.
+            if not (trigger.meta or {}).get("analysis_window_turn_ids"):
+                candidate_pool.extend(
+                    focus_to_candidate(focus, snapshot)
+                    for focus in self._context_homophone_focus(snapshot, trigger)
+                )
             # Deterministic repeated-session homophones were previously only
             # exposed to the LLM prompt. Add a bounded set directly to the
             # verifier queue so a CONSISTENT text-only judgment cannot hide a
