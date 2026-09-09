@@ -466,6 +466,7 @@ def aggregate_results(items: list[dict[str, Any]]) -> dict[str, Any]:
     invalid = [item for item in items if item.get("valid") is not True]
     baseline_edits = sum(int((item.get("baseline") or {}).get("edits") or 0) for item in valid)
     final_edits = sum(int((item.get("final") or {}).get("edits") or 0) for item in valid)
+    reference_chars = sum(int((item.get("baseline") or {}).get("reference_chars") or 0) for item in valid)
     baseline_by_type = {
         key: sum(int((item.get("baseline") or {}).get(key) or 0) for item in valid)
         for key in ("substitutions", "insertions", "deletions")
@@ -478,6 +479,7 @@ def aggregate_results(items: list[dict[str, Any]]) -> dict[str, Any]:
     improved = sum(int(((item.get("retrace") or {}).get("revision_quality") or {}).get("improved") or 0) for item in valid)
     validated = sum(int(((item.get("retrace") or {}).get("candidate_funnel") or {}).get("validated_candidates") or 0) for item in valid)
     harmed = sum(int(((item.get("retrace") or {}).get("revision_quality") or {}).get("harmed") or 0) for item in valid)
+    neutral = sum(int(((item.get("retrace") or {}).get("revision_quality") or {}).get("neutral") or 0) for item in valid)
     overlap_baseline = {
         key: sum(int((((item.get("overlap_region") or {}).get("baseline") or {}).get(key)) or 0) for item in valid)
         for key in ("edits", "reference_chars", "substitutions", "insertions", "deletions")
@@ -497,13 +499,20 @@ def aggregate_results(items: list[dict[str, Any]]) -> dict[str, Any]:
         "pooled_counts": {
             "baseline_edits": baseline_edits,
             "final_edits": final_edits,
+            "reference_chars": reference_chars,
             "committed_revisions": committed,
             "improved_revisions": improved,
+            "harmed_revisions": harmed,
+            "neutral_revisions": neutral,
             "validated_candidates": validated,
             "baseline_by_error_type": baseline_by_type,
             "final_by_error_type": final_by_type,
         },
         "effectiveness": {
+            "baseline_cer": baseline_edits / reference_chars if reference_chars else 0.0,
+            "final_cer": final_edits / reference_chars if reference_chars else 0.0,
+            "cer_absolute_change": (final_edits - baseline_edits) / reference_chars if reference_chars else 0.0,
+            "cer_relative_reduction": (baseline_edits - final_edits) / baseline_edits if baseline_edits else 0.0,
             "ecer": (baseline_edits - final_edits) / baseline_edits if baseline_edits else 0.0,
             "revision_precision": improved / committed if committed else None,
             "harmful_revision_rate": harmed / committed if committed else None,

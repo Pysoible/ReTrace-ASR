@@ -288,7 +288,7 @@ def test_paired_payloads_reject_mismatched_incomplete_or_unready_runs():
 def test_aggregate_uses_only_valid_pooled_counts():
     valid = {
         "sample": "ok", "valid": True, "invalid_reasons": [],
-        "baseline": {"edits": 10}, "final": {"edits": 6},
+        "baseline": {"edits": 10, "reference_chars": 20}, "final": {"edits": 6, "reference_chars": 20},
         "retrace": {"revision_quality": {"committed": 4, "improved": 3}, "candidate_funnel": {"validated_candidates": 6}},
         "stage_timings_ms": {"context_judge": 100.0},
         "stage_call_counts": {"context_judge": 2},
@@ -304,6 +304,10 @@ def test_aggregate_uses_only_valid_pooled_counts():
     assert result["invalid_samples"] == 1
     assert result["effectiveness"] == {
         "ecer": 0.4,
+        "baseline_cer": 0.5,
+        "final_cer": 0.3,
+        "cer_absolute_change": -0.2,
+        "cer_relative_reduction": 0.4,
         "revision_precision": 0.75,
         "harmful_revision_rate": 0.0,
         "candidate_to_correction_yield": 0.5,
