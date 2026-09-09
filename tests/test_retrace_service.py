@@ -992,6 +992,41 @@ def test_exact_text_overlap_across_overlapping_chunks_removes_insertion(tmp_path
     assert result["session"]["turns"][1]["meta"]["boundary_overlap_dedup"]["overlap_text"] == "实验结果"
 
 
+def test_session_repetition_candidate_removes_only_audio_unsupported_copy(tmp_path):
+    def verify(*, candidates, **_kwargs):
+        return {
+            "ok": True,
+            "scores": {
+                candidate: 0.95 if candidate == "实验结果" else 0.03
+                for candidate in candidates
+            },
+        }
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=lambda **_: ContextJudgment("CONSISTENT", 0.95),
+        audio_verifier=verify,
+    )
+    service.reset_session("s")
+    observed = service.observe_turn(
+        "s",
+        "t1",
+        "我们讨论实验结果实验结果非常理想",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0.0, "end_sec": 5.0},
+    )
+
+    result = service.analyze_turn(
+        "s",
+        "t1",
+        observed_version=observed["observed_version"],
+        session_complete=True,
+    )
+
+    assert result["session"]["turns"][0]["current_text"] == "我们讨论实验结果非常理想"
+    assert result["revisions"][0]["replacement"] == "实验结果"
+    assert "candidate_source:repetition_candidate" in result["revisions"][0]["evidence"]
+
+
 def test_judge_tolerates_single_object_focus_from_model(tmp_path):
     """A model returning "focus": {...} (single dict) instead of a list must not
     fail the whole judgment — it should be treated as a one-element list."""

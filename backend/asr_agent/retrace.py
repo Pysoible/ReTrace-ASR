@@ -271,15 +271,16 @@ class ReTraceService:
             # exposed to the LLM prompt. Add a bounded set directly to the
             # verifier queue so a CONSISTENT text-only judgment cannot hide a
             # plausible substitution from local audio verification.
-            homophone_focus: list[FocusProposal] = []
+            session_action_focus: list[FocusProposal] = []
             if trigger.meta.get("session_complete"):
                 # One global pass is enough: scanning every bounded Judge window
                 # repeats the same session-wide n-gram index and is quadratic on
                 # long meetings. Build the index once and prefer 3-4 char spans.
-                homophone_focus = self._session_homophone_focus(snapshot, limit=3)
+                session_action_focus = self._session_homophone_focus(snapshot, limit=3)
+                session_action_focus.extend(self._session_repetition_focus(snapshot, limit=3))
             candidate_pool.extend(
                 focus_to_candidate(focus, snapshot)
-                for focus in homophone_focus[:3]
+                for focus in session_action_focus
             )
             trigger_uncertainty = trigger.meta.get("uncertainty") or {}
             has_acoustic_disagreement = bool(trigger_uncertainty.get("acoustic_disagreement"))
@@ -709,6 +710,46 @@ class ReTraceService:
                     if len(proposals) >= limit:
                         return proposals
         return proposals
+
+    @staticmethod
+    def _session_repetition_focus(session: Session, *, limit: int = 3) -> list[FocusProposal]:
+        """Nominate non-filler adjacent repetitions for local audio checking."""
+        filler_tokens = {"这个", "那个", "就是", "然后"}
+        ranked: list[tuple[int, str, FocusProposal]] = []
+        for turn in session.turns:
+            text = re.sub(
+                r"^\[\d+(?:\.\d+)?[-~]\d+(?:\.\d+)?\]\s*",
+                "",
+                turn.current_text or turn.raw_text,
+            )
+            seen: set[tuple[str, str]] = set()
+            for width in range(6, 1, -1):
+                for index in range(len(text) - width * 2 + 1):
+                    token = text[index:index + width]
+                    doubled = text[index:index + width * 2]
+                    if token in filler_tokens or doubled != token * 2:
+                        continue
+                    if not all(char.isalnum() or "\u4e00" <= char <= "\u9fff" for char in token):
+                        continue
+                    key = (doubled, token)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    ranked.append((
+                        -width,
+                        f"{turn.turn_id}:{index}:{token}",
+                        FocusProposal(
+                            target_turn_id=turn.turn_id,
+                            span=doubled,
+                            proposed_text=token,
+                            alternatives=[doubled, token],
+                            evidence_turn_ids=[turn.turn_id],
+                            rationale="adjacent repeated span may be an ASR insertion; verify single versus double audio realization",
+                            source="repetition_candidate",
+                        ),
+                    ))
+        ranked.sort(key=lambda item: (item[0], item[1]))
+        return [proposal for _width, _key, proposal in ranked[:limit]]
 
     def _recover_overlapping_boundary(
         self,

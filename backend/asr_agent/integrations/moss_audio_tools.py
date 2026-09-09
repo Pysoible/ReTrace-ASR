@@ -115,18 +115,32 @@ def verify_candidates(
         return {"ok": False, "error": "MOSS focused verification returned empty text"}
 
     similarities = {
-        candidate: (
-            0.05
-            if candidate == DELETE_CANDIDATE
-            else _candidate_similarity(transcript, candidate)
-        )
+        candidate: _candidate_similarity(transcript, candidate)
         for candidate in unique
+        if candidate != DELETE_CANDIDATE
     }
+    if DELETE_CANDIDATE in unique:
+        # The first item is the observed span. Deletion support means a focused
+        # re-decode produced substantive surrounding speech but no trace of that
+        # span. A fixed near-zero DELETE score made insertion repair impossible.
+        observed_span = next((item for item in unique if item != DELETE_CANDIDATE), "")
+        observed_score = similarities.get(observed_span, 0.0)
+        transcript_chars = len(_normalize(transcript))
+        minimum_context = max(4, len(_normalize(observed_span)) * 2)
+        similarities[DELETE_CANDIDATE] = (
+            max(0.0, 1.0 - observed_score)
+            if transcript_chars >= minimum_context
+            else 0.05
+        )
     non_delete_scores = [
         score for candidate, score in similarities.items() if candidate != DELETE_CANDIDATE
     ]
     minimum_match = float(os.getenv("MOSS_VERIFIER_MIN_ABSOLUTE_SIMILARITY", "0.60"))
-    if not non_delete_scores or max(non_delete_scores) < minimum_match:
+    delete_supported = bool(
+        DELETE_CANDIDATE in similarities
+        and similarities[DELETE_CANDIDATE] >= float(os.getenv("MOSS_DELETE_MIN_ABSENCE_SCORE", "0.75"))
+    )
+    if (not non_delete_scores or max(non_delete_scores) < minimum_match) and not delete_supported:
         return {
             "ok": False,
             "failure_code": "no_closed_set_match",

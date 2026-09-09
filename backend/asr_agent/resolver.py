@@ -190,6 +190,7 @@ class EvidenceResolver:
         if target is None or (focus.span not in target.raw_text and focus.span not in target.current_text):
             return Resolution("DEFER", focus.target_turn_id, focus.span, rationale="invalid target span")
         operation = (focus.operation or "REPLACE").upper()
+        structured_repetition = focus.source == "repetition_candidate"
         if operation == "REPLACE" and not language_compatible(focus.span, focus.proposed_text):
             return Resolution(
                 "DEFER",
@@ -204,7 +205,7 @@ class EvidenceResolver:
         # turn, so ASR already recognized it; a closed-set verifier listening to
         # the whole window is misled by that other occurrence. Refusing to revise
         # is safe (we only skip a revision, never invent one).
-        if operation == "REPLACE" and (
+        if operation == "REPLACE" and not structured_repetition and (
             focus.span in target.raw_text
             and focus.proposed_text in target.raw_text.replace(focus.span, "")
             and focus.proposed_text != focus.span
@@ -242,6 +243,7 @@ class EvidenceResolver:
             not self._is_safe_local_replacement(focus.span, focus.proposed_text, operation)
             and not acoustic_supported
             and not homophone_candidate
+            and not structured_repetition
         ):
             return Resolution(
                 "DEFER",
@@ -347,7 +349,10 @@ class EvidenceResolver:
 
         margin = top - (ordered[1][1] if len(ordered) > 1 else 0.0)
         strict_revision = self._strict_revision_enabled()
-        if strict_revision and near_variant:
+        if structured_repetition:
+            effective_margin_threshold = max(0.30, self.policy.thresholds.audio_margin)
+            effective_revise_threshold = 0.0
+        elif strict_revision and near_variant:
             effective_margin_threshold = max(0.10, self.policy.thresholds.audio_margin)
             effective_revise_threshold = max(0.75, self.policy.thresholds.revise)
         else:
@@ -372,7 +377,7 @@ class EvidenceResolver:
             independent_sources=len(set(focus.evidence_turn_ids)),
             acoustic_support=acoustic_support,
         )
-        if strict_revision and not near_variant and (
+        if strict_revision and not near_variant and not structured_repetition and (
             context_confidence < 0.85
             or top < 0.85
             or margin < 0.30

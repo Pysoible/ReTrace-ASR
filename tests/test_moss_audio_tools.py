@@ -86,3 +86,35 @@ def test_moss_verifier_rejects_when_focused_transcript_matches_no_candidate(tmp_
     assert result["ok"] is False
     assert result["failure_code"] == "no_closed_set_match"
     assert result["focused_transcript"] == "这这样子是怎么着"
+
+
+def test_moss_verifier_can_support_deleting_an_absent_inserted_span(tmp_path):
+    audio = tmp_path / "mono.wav"
+    sf.write(audio, np.zeros(32000, dtype=np.float32), 16000)
+
+    result = moss_audio_tools.verify_candidates(
+        str(audio),
+        0.0,
+        1.5,
+        ["清高的爱拉", moss_audio_tools.DELETE_CANDIDATE],
+        transcriber=lambda _path: "他曾经说这是一个说法",
+    )
+
+    assert result["ok"] is True
+    assert result["scores"][moss_audio_tools.DELETE_CANDIDATE] > result["scores"]["清高的爱拉"]
+
+
+def test_moss_verifier_does_not_delete_when_focused_observation_is_too_short(tmp_path):
+    audio = tmp_path / "mono.wav"
+    sf.write(audio, np.zeros(16000, dtype=np.float32), 16000)
+
+    result = moss_audio_tools.verify_candidates(
+        str(audio),
+        0.0,
+        0.5,
+        ["清高的爱拉", moss_audio_tools.DELETE_CANDIDATE],
+        transcriber=lambda _path: "他说",
+    )
+
+    assert result["ok"] is False
+    assert result["failure_code"] == "no_closed_set_match"
