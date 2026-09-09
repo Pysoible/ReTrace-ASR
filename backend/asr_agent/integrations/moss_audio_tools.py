@@ -6,6 +6,7 @@ focused second decode, but are not represented as independent acoustic evidence.
 from __future__ import annotations
 
 import math
+import os
 import re
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -121,6 +122,21 @@ def verify_candidates(
         )
         for candidate in unique
     }
+    non_delete_scores = [
+        score for candidate, score in similarities.items() if candidate != DELETE_CANDIDATE
+    ]
+    minimum_match = float(os.getenv("MOSS_VERIFIER_MIN_ABSOLUTE_SIMILARITY", "0.60"))
+    if not non_delete_scores or max(non_delete_scores) < minimum_match:
+        return {
+            "ok": False,
+            "failure_code": "no_closed_set_match",
+            "error": "MOSS focused transcript does not match any supplied candidate",
+            "focused_transcript": transcript,
+            "absolute_similarities": similarities,
+            "threshold": minimum_match,
+            "method": "same_model_focused_reobservation",
+            "independent_acoustic_evidence": False,
+        }
     # A softmax produces normalized evidence while preserving uncertainty when
     # the focused decode does not clearly contain any supplied candidate.
     weights = {candidate: math.exp(6.0 * score) for candidate, score in similarities.items()}

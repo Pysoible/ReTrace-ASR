@@ -45,3 +45,20 @@ def test_moss_retranscriber_returns_focused_observation(tmp_path):
     assert result["ok"] is True
     assert result["text"] == "局部转写"
     assert result["method"] == "same_model_focused_reobservation"
+
+
+def test_moss_verifier_rejects_when_focused_transcript_matches_no_candidate(tmp_path):
+    audio = tmp_path / "mono.wav"
+    sf.write(audio, np.zeros(16000, dtype=np.float32), 16000)
+
+    result = moss_audio_tools.verify_candidates(
+        str(audio),
+        0.0,
+        0.5,
+        ["像像这些", "像这些"],
+        transcriber=lambda _path: "这这样子是怎么着",
+    )
+
+    assert result["ok"] is False
+    assert result["failure_code"] == "no_closed_set_match"
+    assert result["focused_transcript"] == "这这样子是怎么着"
