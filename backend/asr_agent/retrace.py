@@ -267,6 +267,10 @@ class ReTraceService:
                 focus_to_candidate(focus, snapshot)
                 for focus in self._acoustic_focus(trigger)
             )
+            candidate_pool.extend(
+                focus_to_candidate(focus, snapshot)
+                for focus in self._gss_consensus_focus(snapshot, trigger)
+            )
             # Streaming sessions should use already-corroborated terminology as
             # soon as a same-pronunciation variant appears.  This bounded helper
             # existed but was not connected to the candidate pool, so only the
@@ -635,6 +639,47 @@ class ReTraceService:
             if len(focus) >= 3:
                 break
         return focus
+
+    @staticmethod
+    def _gss_consensus_focus(session: Session, trigger: Turn) -> list[FocusProposal]:
+        """Promote only repeated separated-audio candidates in one judge window.
+
+        A single GSS decode may contain artifacts.  The same multi-character
+        replacement observed for at least two turns from the same local window
+        is a much stronger acoustic-consistency signal and can enter the normal
+        resolver even when the general semantic judge omits it from a large
+        response.  The resolver still records and gates every individual edit.
+        """
+        window_ids = set((trigger.meta or {}).get("analysis_window_turn_ids") or [trigger.turn_id])
+        grouped: dict[tuple[str, str], list[str]] = {}
+        for turn in session.turns:
+            if turn.turn_id not in window_ids:
+                continue
+            candidates = ((((turn.meta or {}).get("uncertainty") or {}).get("overlap") or {}).get("substitution_candidates") or [])
+            for item in candidates:
+                if not isinstance(item, dict) or item.get("source") != "gss_overlap":
+                    continue
+                span = str(item.get("span") or "").strip()
+                candidate = str(item.get("candidate") or "").strip()
+                if len(span) < 2 or len(candidate) < 2 or span == candidate:
+                    continue
+                grouped.setdefault((span, candidate), []).append(turn.turn_id)
+        focus: list[FocusProposal] = []
+        for (span, candidate), turn_ids in grouped.items():
+            unique_ids = list(dict.fromkeys(turn_ids))
+            if len(unique_ids) < 2:
+                continue
+            for target_turn_id in unique_ids:
+                focus.append(FocusProposal(
+                    target_turn_id=target_turn_id,
+                    span=span,
+                    proposed_text=candidate,
+                    alternatives=[span, candidate],
+                    evidence_turn_ids=unique_ids,
+                    rationale="the same local substitution recurs in separated overlap audio",
+                    source="gss_overlap",
+                ))
+        return focus[:6]
 
     @staticmethod
     def _context_homophone_focus(session: Session, turn: Turn) -> list[FocusProposal]:

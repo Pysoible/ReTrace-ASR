@@ -2,7 +2,7 @@ import json
 
 from asr_agent.context_judge import BeliefProposal, ContextJudgment, FocusProposal
 from asr_agent.model_identity import ModelIdentity
-from asr_agent.models import MemoryBelief
+from asr_agent.models import MemoryBelief, Session, Turn
 from asr_agent.retrace import ReTraceService
 from asr_agent.resolver import EvidenceResolver
 
@@ -1264,3 +1264,19 @@ def test_decision_engine_uses_a_single_evidence_gate_for_revision(tmp_path):
     assert engine.decide(EvidenceBundle(audio_confidence=0.9, audio_margin=0.25, context_confidence=0.9, memory_support=0.8, has_audio=True)) == "REVISE"
     assert engine.decide(EvidenceBundle(audio_confidence=0.4, audio_margin=0.1, context_confidence=0.9, memory_support=0.8, has_audio=True)) == "DEFER"
     assert engine.summarize(EvidenceBundle(audio_confidence=0.9, audio_margin=0.25, context_confidence=0.9, memory_support=0.8, has_audio=True))["decision"] == "REVISE"
+
+
+def test_gss_consensus_focus_requires_two_multi_character_observations():
+    candidate = {"span": "代业", "candidate": "单页", "source": "gss_overlap"}
+    turns = [
+        Turn("t1", "宣传代业", "宣传代业", meta={"uncertainty": {"overlap": {"substitution_candidates": [candidate]}}}),
+        Turn("t2", "代业要多发", "代业要多发", meta={"uncertainty": {"overlap": {"substitution_candidates": [candidate]}}}),
+        Turn("t3", "开始宣传", "开始宣传", meta={"analysis_window_turn_ids": ["t1", "t2", "t3"]}),
+    ]
+
+    focus = ReTraceService._gss_consensus_focus(Session("s", turns=turns), turns[-1])
+
+    assert [(item.target_turn_id, item.span, item.proposed_text) for item in focus] == [
+        ("t1", "代业", "单页"),
+        ("t2", "代业", "单页"),
+    ]
