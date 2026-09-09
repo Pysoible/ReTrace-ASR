@@ -382,10 +382,21 @@ def evaluate_pair_payloads(
         baseline_edits = int(baseline_metric["edits"])
         committed = revision_quality["committed"]
         validated = int(funnel["validated_candidates"])
+        error_type_reduction = {
+            key: {
+                "net_removed": int(baseline_metric[key]) - int(final_metric[key]),
+                "relative": (
+                    (int(baseline_metric[key]) - int(final_metric[key])) / int(baseline_metric[key])
+                    if int(baseline_metric[key]) else 0.0
+                ),
+            }
+            for key in ("substitutions", "insertions", "deletions")
+        }
         effectiveness = {
             "ecer": (baseline_edits - int(final_metric["edits"])) / baseline_edits if baseline_edits else 0.0,
             "revision_precision": revision_quality["improved"] / committed if committed else None,
             "candidate_to_correction_yield": revision_quality["improved"] / validated if validated else None,
+            "error_type_reduction": error_type_reduction,
         }
     return {
         "valid": not invalid_reasons,
@@ -414,6 +425,14 @@ def aggregate_results(items: list[dict[str, Any]]) -> dict[str, Any]:
     invalid = [item for item in items if item.get("valid") is not True]
     baseline_edits = sum(int((item.get("baseline") or {}).get("edits") or 0) for item in valid)
     final_edits = sum(int((item.get("final") or {}).get("edits") or 0) for item in valid)
+    baseline_by_type = {
+        key: sum(int((item.get("baseline") or {}).get(key) or 0) for item in valid)
+        for key in ("substitutions", "insertions", "deletions")
+    }
+    final_by_type = {
+        key: sum(int((item.get("final") or {}).get(key) or 0) for item in valid)
+        for key in ("substitutions", "insertions", "deletions")
+    }
     committed = sum(int(((item.get("retrace") or {}).get("revision_quality") or {}).get("committed") or 0) for item in valid)
     improved = sum(int(((item.get("retrace") or {}).get("revision_quality") or {}).get("improved") or 0) for item in valid)
     validated = sum(int(((item.get("retrace") or {}).get("candidate_funnel") or {}).get("validated_candidates") or 0) for item in valid)
@@ -431,11 +450,23 @@ def aggregate_results(items: list[dict[str, Any]]) -> dict[str, Any]:
             "committed_revisions": committed,
             "improved_revisions": improved,
             "validated_candidates": validated,
+            "baseline_by_error_type": baseline_by_type,
+            "final_by_error_type": final_by_type,
         },
         "effectiveness": {
             "ecer": (baseline_edits - final_edits) / baseline_edits if baseline_edits else 0.0,
             "revision_precision": improved / committed if committed else None,
             "candidate_to_correction_yield": improved / validated if validated else None,
+            "error_type_reduction": {
+                key: {
+                    "net_removed": baseline_by_type[key] - final_by_type[key],
+                    "relative": (
+                        (baseline_by_type[key] - final_by_type[key]) / baseline_by_type[key]
+                        if baseline_by_type[key] else 0.0
+                    ),
+                }
+                for key in ("substitutions", "insertions", "deletions")
+            },
         },
         "stage_timings_ms": dict(stage_timings),
         "stage_call_counts": dict(stage_calls),

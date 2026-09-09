@@ -249,6 +249,11 @@ def test_paired_payloads_report_primary_effectiveness_metrics():
     assert item["effectiveness"]["ecer"] == 1.0
     assert item["effectiveness"]["revision_precision"] == 1.0
     assert item["effectiveness"]["candidate_to_correction_yield"] == 1.0
+    assert item["effectiveness"]["error_type_reduction"] == {
+        "substitutions": {"net_removed": 1, "relative": 1.0},
+        "insertions": {"net_removed": 0, "relative": 0.0},
+        "deletions": {"net_removed": 0, "relative": 0.0},
+    }
     assert item["retrace"]["committed_revisions"] == 1
 
 
@@ -301,5 +306,10 @@ def test_aggregate_uses_only_valid_pooled_counts():
         "ecer": 0.4,
         "revision_precision": 0.75,
         "candidate_to_correction_yield": 0.5,
+        "error_type_reduction": {
+            "substitutions": {"net_removed": 0, "relative": 0.0},
+            "insertions": {"net_removed": 0, "relative": 0.0},
+            "deletions": {"net_removed": 0, "relative": 0.0},
+        },
     }
     assert result["stage_timings_ms"] == {"context_judge": 100.0}

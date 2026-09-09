@@ -199,6 +199,12 @@ class ReTraceService:
                 trigger,
                 observed_version=observed_version,
             )
+            if recovery_event is None:
+                recovery_event = self._recover_overlapping_boundary(
+                    snapshot,
+                    trigger,
+                    observed_version=observed_version,
+                )
             tail_degenerate = assess_repeated_tail(trigger.raw_text, min_tail_chars=24)
             if recovery_event is None and tail_degenerate.degenerate:
                 trimmed_tail = trim_repeated_tail(trigger.raw_text, min_tail_chars=24)
@@ -260,6 +266,22 @@ class ReTraceService:
             candidate_pool.extend(
                 focus_to_candidate(focus, snapshot)
                 for focus in self._acoustic_focus(trigger)
+            )
+            # Deterministic repeated-session homophones were previously only
+            # exposed to the LLM prompt. Add a bounded set directly to the
+            # verifier queue so a CONSISTENT text-only judgment cannot hide a
+            # plausible substitution from local audio verification.
+            window_ids = set(trigger.meta.get("analysis_window_turn_ids") or [trigger.turn_id])
+            homophone_focus: list[FocusProposal] = []
+            for target in snapshot.turns:
+                if target.turn_id not in window_ids:
+                    continue
+                homophone_focus.extend(self._context_homophone_focus(snapshot, target))
+                if len(homophone_focus) >= 3:
+                    break
+            candidate_pool.extend(
+                focus_to_candidate(focus, snapshot)
+                for focus in homophone_focus[:3]
             )
             trigger_uncertainty = trigger.meta.get("uncertainty") or {}
             has_acoustic_disagreement = bool(trigger_uncertainty.get("acoustic_disagreement"))
@@ -617,7 +639,7 @@ class ReTraceService:
                     if all("\u4e00" <= char <= "\u9fff" for char in candidate):
                         occurrences.setdefault(candidate, []).append(historical.turn_id)
         focus: list[FocusProposal] = []
-        for span in sorted(current_spans, key=lambda value: (len(value), value)):
+        for span in sorted(current_spans, key=lambda value: (-len(value), value)):
             span_pinyin = lazy_pinyin(span)
             candidates = [
                 (candidate, ids)
@@ -640,6 +662,83 @@ class ReTraceService:
             if len(focus) >= 3:
                 break
         return focus
+
+    def _recover_overlapping_boundary(
+        self,
+        session: Session,
+        turn: Turn,
+        *,
+        observed_version: int | None,
+    ) -> RevisionEvent | None:
+        """Remove exact text duplicated by acoustically overlapping chunks.
+
+        This targets structural insertions, not conversational repetition. It
+        therefore requires both an exact suffix/prefix match and overlapping
+        audio timestamps; adjacent non-overlapping MOSS speaker turns are never
+        changed by this rule.
+        """
+        try:
+            index = next(i for i, item in enumerate(session.turns) if item.turn_id == turn.turn_id)
+        except StopIteration:
+            return None
+        if index == 0:
+            return None
+        previous = session.turns[index - 1]
+        previous_meta, current_meta = previous.meta or {}, turn.meta or {}
+        previous_end = previous_meta.get("end_sec")
+        current_start = current_meta.get("start_sec")
+        if previous_end is None or current_start is None or float(previous_end) <= float(current_start):
+            return None
+        previous_speaker = previous_meta.get("speaker")
+        current_speaker = current_meta.get("speaker")
+        if previous_speaker and current_speaker and previous_speaker != current_speaker:
+            return None
+
+        strip_ts = lambda value: re.sub(
+            r"^\[\d+(?:\.\d+)?[-~]\d+(?:\.\d+)?\]\s*", "", value or ""
+        )
+        left = strip_ts(previous.current_text or previous.raw_text)
+        right = strip_ts(turn.current_text or turn.raw_text)
+        width = 0
+        for candidate_width in range(min(24, len(left), len(right)), 1, -1):
+            if left[-candidate_width:] == right[:candidate_width]:
+                width = candidate_width
+                break
+        if width < 2 or not right[width:].strip():
+            return None
+        prefix_match = re.match(r"^(\[\d+(?:\.\d+)?[-~]\d+(?:\.\d+)?\]\s*)", turn.raw_text)
+        after_text = f"{prefix_match.group(1) if prefix_match else ''}{right[width:].lstrip()}"
+        turn.meta["boundary_overlap_dedup"] = {
+            "detected": True,
+            "overlap_text": right[:width],
+            "previous_turn_id": previous.turn_id,
+            "audio_overlap_sec": round(float(previous_end) - float(current_start), 3),
+        }
+        return RevisionEvent(
+            event_id=self._event_id(
+                session.session_id,
+                turn.turn_id,
+                observed_version,
+                "REVISE_CURRENT",
+                "boundary-overlap-dedup",
+            ),
+            action="REVISE_CURRENT",
+            target_turn_id=turn.turn_id,
+            source_turn_id=previous.turn_id,
+            span=right[:width],
+            before_text=turn.raw_text,
+            after_text=after_text,
+            entity_id=None,
+            score=0.95,
+            evidence=[
+                f"turn:{previous.turn_id}",
+                f"temporal_overlap:{current_start}-{previous_end}",
+                "exact_suffix_prefix_overlap",
+            ],
+            resolver="boundary-overlap-dedup",
+            rationale="exact text was duplicated across acoustically overlapping chunk boundaries",
+            replacement="",
+        )
 
     def _recover_degenerate_turn(
         self,

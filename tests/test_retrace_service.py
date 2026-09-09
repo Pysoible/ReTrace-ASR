@@ -937,6 +937,55 @@ def test_coverage_relisten_does_not_replace_turn_for_trivial_text_growth(tmp_pat
     assert turn["meta"]["relisten_uncertain"]["changed"] is False
 
 
+def test_consistent_judge_cannot_hide_repeated_homophone_substitution(tmp_path):
+    calls = []
+
+    def verify(*, candidates, **_kwargs):
+        calls.append(candidates)
+        return {"ok": True, "scores": {candidate: (0.95 if candidate == "涂博士" else 0.05) for candidate in candidates}}
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=lambda **_: ContextJudgment("CONSISTENT", 0.95),
+        audio_verifier=verify,
+    )
+    service.process_turn("s", "t1", "涂博士介绍实验")
+    service.process_turn("s", "t2", "请涂博士继续")
+    result = service.process_turn(
+        "s",
+        "t3",
+        "图博士开始发言",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 4.0, "end_sec": 6.0},
+    )
+
+    assert calls
+    assert result["session"]["turns"][2]["current_text"] == "涂博士开始发言"
+    assert result["revisions"][0]["resolver"] == "agent-context-audio"
+
+
+def test_exact_text_overlap_across_overlapping_chunks_removes_insertion(tmp_path):
+    service = ReTraceService(
+        tmp_path,
+        context_judge=lambda **_: ContextJudgment("CONSISTENT", 0.9),
+    )
+    service.process_turn(
+        "s",
+        "t1",
+        "今天讨论实验结果",
+        meta={"start_sec": 0.0, "end_sec": 5.0},
+    )
+    result = service.process_turn(
+        "s",
+        "t2",
+        "实验结果非常理想",
+        meta={"start_sec": 4.7, "end_sec": 9.0},
+    )
+
+    assert result["session"]["turns"][1]["current_text"] == "非常理想"
+    assert result["revisions"][0]["resolver"] == "boundary-overlap-dedup"
+    assert result["session"]["turns"][1]["meta"]["boundary_overlap_dedup"]["overlap_text"] == "实验结果"
+
+
 def test_judge_tolerates_single_object_focus_from_model(tmp_path):
     """A model returning "focus": {...} (single dict) instead of a list must not
     fail the whole judgment — it should be treated as a one-element list."""
