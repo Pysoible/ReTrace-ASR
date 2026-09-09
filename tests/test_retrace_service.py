@@ -997,7 +997,7 @@ def test_session_repetition_candidate_removes_only_audio_unsupported_copy(tmp_pa
         return {
             "ok": True,
             "scores": {
-                candidate: 0.95 if candidate == "实验结果" else 0.03
+                candidate: 0.95 if candidate == "总经总经理" else 0.03
                 for candidate in candidates
             },
         }
@@ -1011,7 +1011,7 @@ def test_session_repetition_candidate_removes_only_audio_unsupported_copy(tmp_pa
     observed = service.observe_turn(
         "s",
         "t1",
-        "我们讨论实验结果实验结果非常理想",
+        "我们请总经理总经理发言",
         meta={"audio_path": "/tmp/fake.wav", "start_sec": 0.0, "end_sec": 5.0},
     )
 
@@ -1022,8 +1022,8 @@ def test_session_repetition_candidate_removes_only_audio_unsupported_copy(tmp_pa
         session_complete=True,
     )
 
-    assert result["session"]["turns"][0]["current_text"] == "我们讨论实验结果非常理想"
-    assert result["revisions"][0]["replacement"] == "实验结果"
+    assert result["session"]["turns"][0]["current_text"] == "我们请总经总经理发言"
+    assert result["revisions"][0]["replacement"] == "总经总经理"
     assert "candidate_source:repetition_candidate" in result["revisions"][0]["evidence"]
 
 

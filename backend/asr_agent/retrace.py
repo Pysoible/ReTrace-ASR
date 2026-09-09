@@ -735,16 +735,17 @@ class ReTraceService:
                     if key in seen:
                         continue
                     seen.add(key)
+                    restarted = f"{token[:-1]}{token}"
                     ranked.append((
                         -width,
                         f"{turn.turn_id}:{index}:{token}",
                         FocusProposal(
                             target_turn_id=turn.turn_id,
                             span=doubled,
-                            proposed_text=token,
-                            alternatives=[doubled, token],
+                            proposed_text=restarted,
+                            alternatives=[doubled, restarted, token],
                             evidence_turn_ids=[turn.turn_id],
-                            rationale="adjacent repeated span may be an ASR insertion; verify single versus double audio realization",
+                            rationale="adjacent repeated span may have completed a spoken restart; verify full, partial, and single realizations",
                             source="repetition_candidate",
                         ),
                     ))
