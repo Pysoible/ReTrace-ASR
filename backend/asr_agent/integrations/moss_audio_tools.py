@@ -162,22 +162,38 @@ def retranscribe_window(
     domain_hints: list[str] | None = None,
     recover_coverage: bool = False,
 ) -> dict[str, Any]:
-    """Open MOSS re-decode of a local crop; hints are intentionally ignored."""
-    del domain_hints, recover_coverage
-    clipped: Path | None = None
+    """Open MOSS re-decode; split coverage-risk windows to avoid early EOS."""
+    del domain_hints
+    windows = [(start_sec, end_sec)]
+    if recover_coverage and end_sec - start_sec > 5.5:
+        windows = []
+        cursor = start_sec
+        while cursor < end_sec:
+            window_end = min(end_sec, cursor + 5.0)
+            windows.append((cursor, window_end))
+            cursor = window_end
+    parts: list[str] = []
     try:
-        clipped = _crop_mono_16k(audio_path, start_sec, end_sec)
-        transcript = (transcriber or _transcribe_crop)(clipped).strip()
+        for window_start, window_end in windows:
+            clipped: Path | None = None
+            try:
+                clipped = _crop_mono_16k(audio_path, window_start, window_end)
+                text = (transcriber or _transcribe_crop)(clipped).strip()
+                if text:
+                    parts.append(text)
+            finally:
+                if clipped is not None:
+                    clipped.unlink(missing_ok=True)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"MOSS focused retranscription failed: {exc}"}
-    finally:
-        if clipped is not None:
-            clipped.unlink(missing_ok=True)
+    transcript = "".join(parts)
     if not transcript:
         return {"ok": False, "error": "MOSS focused retranscription returned empty text"}
     return {
         "ok": True,
         "text": transcript,
+        "segmented": len(windows) > 1,
+        "window_count": len(windows),
         "method": "same_model_focused_reobservation",
         "independent_acoustic_evidence": False,
         "audio_path": audio_path,

@@ -909,6 +909,34 @@ def test_coverage_risk_uses_segmented_relisten_even_when_judge_is_consistent(tmp
     assert any("acoustic:coverage-risk" in item for item in result["revisions"][0]["evidence"])
 
 
+def test_coverage_relisten_does_not_replace_turn_for_trivial_text_growth(tmp_path):
+    def retranscribe(**_kwargs):
+        return {"ok": True, "text": "今年年初的疫情呢"}
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=lambda **_: ContextJudgment("CONSISTENT", 0.92),
+        audio_retranscriber=retranscribe,
+    )
+    result = service.process_turn(
+        "s",
+        "t1",
+        "今年年初的疫情",
+        source="moss-transcribe-diarize",
+        meta={
+            "audio_path": "/tmp/fake.wav",
+            "start_sec": 0.0,
+            "end_sec": 8.0,
+            "uncertainty": {"coverage": {"truncated": True, "char_density": 1.5}},
+        },
+    )
+
+    turn = result["session"]["turns"][0]
+    assert turn["current_text"] == "今年年初的疫情"
+    assert not [event for event in result["revisions"] if event["event_kind"] == "revision"]
+    assert turn["meta"]["relisten_uncertain"]["changed"] is False
+
+
 def test_judge_tolerates_single_object_focus_from_model(tmp_path):
     """A model returning "focus": {...} (single dict) instead of a list must not
     fail the whole judgment — it should be treated as a one-element list."""

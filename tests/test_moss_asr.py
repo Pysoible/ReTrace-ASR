@@ -19,6 +19,24 @@ def test_parse_moss_transcript_into_retrace_chunks():
     }
 
 
+def test_moss_segment_coverage_routes_sparse_long_turn_to_redecode(monkeypatch):
+    monkeypatch.setenv("MOSS_MIN_SEGMENT_CHAR_DENSITY", "2.0")
+
+    uncertainties = moss_asr.segment_coverage_uncertainties(
+        ["设置的呀", "这是一段正常速度的转录文本"],
+        [
+            {"start_sec": 0.0, "end_sec": 12.0},
+            {"start_sec": 12.0, "end_sec": 17.0},
+        ],
+    )
+
+    sparse = uncertainties[0]["coverage"]
+    assert sparse["truncated"] is True
+    assert sparse["reasons"] == ["low_transcript_density"]
+    assert sparse["recommended_actions"] == ["RESEGMENT", "REDECODE"]
+    assert uncertainties[1]["coverage"]["truncated"] is False
+
+
 def test_transcribe_audio_posts_to_moss_endpoint(monkeypatch, tmp_path):
     audio = tmp_path / "sample.wav"
     audio.write_bytes(b"audio")

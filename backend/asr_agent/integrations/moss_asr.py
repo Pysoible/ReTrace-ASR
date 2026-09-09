@@ -103,6 +103,41 @@ def transcript_completeness(
     }
 
 
+def segment_coverage_uncertainties(
+    chunks_text: list[str],
+    chunks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build conservative, GT-free coverage signals for MOSS turns.
+
+    MOSS exposes no token confidence. A long timestamp span with very few
+    recognized characters can still route the Agent to re-segment/re-decode;
+    the signal never supplies replacement text or authorizes a revision.
+    """
+    threshold = float(os.getenv("MOSS_MIN_SEGMENT_CHAR_DENSITY", "2.0"))
+    minimum_duration = float(os.getenv("MOSS_COVERAGE_MIN_SEGMENT_SEC", "6.0"))
+    output: list[dict[str, Any]] = []
+    for index, text in enumerate(chunks_text):
+        chunk = chunks[index] if index < len(chunks) else {}
+        start, end = chunk.get("start_sec"), chunk.get("end_sec")
+        duration = max(0.0, float(end) - float(start)) if start is not None and end is not None else 0.0
+        char_count = len(re.findall(r"[0-9A-Za-z\u4e00-\u9fff]", text or ""))
+        density = char_count / duration if duration > 0 else None
+        suspect = bool(duration >= minimum_duration and density is not None and density < threshold)
+        output.append({
+            "coverage": {
+                "detector": "moss_segment_char_density",
+                "speech_window_sec": round(duration, 3),
+                "char_count": char_count,
+                "char_density": round(density, 3) if density is not None else None,
+                "threshold": threshold,
+                "truncated": suspect,
+                "reasons": ["low_transcript_density"] if suspect else [],
+                "recommended_actions": ["RESEGMENT", "REDECODE"] if suspect else [],
+            }
+        })
+    return output
+
+
 def _multipart_form(fields: dict[str, str], file_field: str, file_path: Path) -> tuple[bytes, str]:
     boundary = f"----retrace-moss-{uuid.uuid4().hex}"
     parts: list[bytes] = []
@@ -191,7 +226,7 @@ def transcribe_audio(audio: str) -> dict[str, Any]:
         "audio": str(audio_path),
         "final_text": parsed["text"],
         "chunks_text": parsed["chunks_text"],
-        "uncertainties": [{} for _ in parsed["chunks_text"]],
+        "uncertainties": segment_coverage_uncertainties(parsed["chunks_text"], parsed["chunks"]),
         "backend": BACKEND,
         "model": MOSS_TRANSCRIBE_DIARIZE_MODEL,
         "duration_sec": duration,
@@ -211,5 +246,7 @@ def stream_transcribe_audio(audio: str, on_chunk) -> dict[str, Any]:
     for index, text in enumerate(result.get("chunks_text") or []):
         chunks = result.get("chunks") or []
         chunk = chunks[index] if index < len(chunks) else {"index": index}
-        on_chunk(index, text, {}, chunk)
+        uncertainties = result.get("uncertainties") or []
+        uncertainty = uncertainties[index] if index < len(uncertainties) else {}
+        on_chunk(index, text, uncertainty, chunk)
     return result

@@ -935,6 +935,13 @@ class ReTraceService:
             and len(paraformer_keep) > len(raw_keep)
             and difflib.SequenceMatcher(None, cand_keep, paraformer_keep).ratio() >= 0.7
         )
+        minimum_recovered_chars = int(os.getenv("ASR_COVERAGE_MIN_RECOVERED_CHARS", "4"))
+        minimum_growth_ratio = float(os.getenv("ASR_COVERAGE_MIN_GROWTH_RATIO", "1.20"))
+        coverage_growth_supported = bool(
+            coverage_risk
+            and len(cand_keep) >= len(raw_keep) + minimum_recovered_chars
+            and len(cand_keep) >= len(raw_keep) * minimum_growth_ratio
+        )
         hint_matches = [h for h in (hints or []) if h and h in cand_body]
         # Exception: when the second ASR itself flagged low-confidence characters
         # (char-level acoustic confidence), we have independent acoustic evidence
@@ -950,8 +957,7 @@ class ReTraceService:
         adopt = (
             (recoverable_degeneration and not cand_assessment.degenerate)
             or (
-                coverage_risk
-                and len(cand_keep) > len(raw_keep)
+                coverage_growth_supported
                 and not cand_assessment.degenerate
             )
         )
@@ -994,9 +1000,11 @@ class ReTraceService:
             "replacement": cand_no_ts,
             "acoustic_doubt": has_acoustic_doubt,
             "low_conf_chars": low_conf_chars,
-            "coverage_risk": coverage_risk,
-            "coverage": coverage,
-        }
+                "coverage_risk": coverage_risk,
+                "coverage": coverage,
+                "coverage_growth_supported": coverage_growth_supported,
+                "recovered_chars": len(cand_keep) - len(raw_keep),
+            }
         return RevisionEvent(
             event_id=self._event_id(
                 session.session_id,

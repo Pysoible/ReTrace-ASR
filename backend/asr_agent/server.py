@@ -481,6 +481,12 @@ def create_app(
             }
             if turn_id in moss_window_ids_by_trigger:
                 turn_meta["analysis_window_turn_ids"] = moss_window_ids_by_trigger[turn_id]
+            elif bool((uncertainty.get("coverage") or {}).get("truncated")):
+                # Coverage anomalies are sparse and must not be hidden merely
+                # because they occur in the middle of a batched Judge window.
+                # Keep this audit local so it adds one targeted re-listen, not a
+                # return to expensive per-turn semantic judging.
+                turn_meta["analysis_window_turn_ids"] = [turn_id]
             try:
                 if first_pass.family == "moss":
                     service.observe_turn(
@@ -511,11 +517,25 @@ def create_app(
             revisions.extend(result.get("revisions") or [])
 
         if first_pass.family == "moss":
-            for window_index, window in enumerate(moss_windows):
+            window_trigger_ids = {
+                str(window[-1]["turn_id"])
+                for window in moss_windows
+            }
+            coverage_trigger_ids = {
+                str(prepared["turn_id"])
+                for prepared in prepared_turns
+                if bool(((prepared.get("uncertainty") or {}).get("coverage") or {}).get("truncated"))
+            }
+            ordered_trigger_ids = [
+                str(prepared["turn_id"])
+                for prepared in prepared_turns
+                if str(prepared["turn_id"]) in window_trigger_ids | coverage_trigger_ids
+            ]
+            for trigger_id in ordered_trigger_ids:
                 audit = service.analyze_turn(
                     bound_session,
-                    str(window[-1]["turn_id"]),
-                    session_complete=window_index == len(moss_windows) - 1,
+                    trigger_id,
+                    session_complete=trigger_id == str(prepared_turns[-1]["turn_id"]),
                 )
                 revisions.extend(audit.get("revisions") or [])
         # Qwen's existing streaming-style per-turn analysis is retained, with

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import difflib
 import json
 import re
 import sys
@@ -54,6 +55,106 @@ def metrics(reference: str, hypothesis: str) -> dict[str, Any]:
         "edits": edits, "reference_chars": len(ref), "hypothesis_chars": len(hyp), **ops,
         "char_precision": precision, "char_recall": recall,
         "char_f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0,
+    }
+
+
+def _repeated_tail(text: str) -> bool:
+    value = clean(text)
+    for width in range(1, min(8, len(value) // 2) + 1):
+        if value[-width:] == value[-2 * width:-width]:
+            return True
+    return False
+
+
+def classify_gt_error(
+    reference: str,
+    hypothesis: str,
+    *,
+    assigned_rows: list[dict[str, Any]],
+    later_reference: str,
+) -> dict[str, Any]:
+    """Classify a GT mismatch after inference and nominate bounded Agent actions.
+
+    The labels are diagnostic opportunities, not oracle instructions. In
+    particular, a deletion is only *audio-action eligible*: the online Agent
+    still needs a coverage/VAD signal before it may re-decode the audio.
+    """
+    ref, hyp = clean(reference), clean(hypothesis)
+    ops = edit_ops(ref, hyp)
+    edits = ops["substitutions"] + ops["deletions"] + ops["insertions"]
+    if not edits:
+        return {
+            "primary_error_type": "correct",
+            "error_types": [],
+            "eligibility": [],
+            "recommended_actions": [],
+            "later_supported_spans": [],
+        }
+
+    error_types: list[str] = []
+    eligibility: list[str] = []
+    actions: list[str] = []
+    speakers = {str(row.get("spk") or "unknown") for row in assigned_rows}
+    if len(speakers) > 1:
+        error_types.append("segmentation_or_speaker_assignment")
+        eligibility.append("alignment_only")
+        actions.append("REALIGN_SPEAKER_BOUNDARIES")
+
+    deletion_heavy = ops["deletions"] >= max(2, ops["substitutions"], ops["insertions"])
+    severe_undercoverage = len(ref) >= max(len(hyp) + 4, int(len(hyp) * 1.35))
+    if (not hyp and ref) or deletion_heavy or severe_undercoverage:
+        error_types.append("omission_or_undercoverage")
+        eligibility.append("audio_action_eligible")
+        actions.extend(["EXPAND_WINDOW", "RESEGMENT", "REDECODE"])
+
+    insertion_heavy = ops["insertions"] >= max(2, ops["substitutions"], ops["deletions"])
+    if insertion_heavy or _repeated_tail(hypothesis):
+        error_types.append("insertion_or_repetition")
+        eligibility.append("audio_action_eligible")
+        actions.append("VERIFY_TIMING_AND_REDECODE")
+
+    if ops["substitutions"] and ops["substitutions"] >= max(ops["deletions"], ops["insertions"]):
+        error_types.append("acoustic_substitution")
+        eligibility.append("audio_action_eligible")
+        actions.append("VERIFY_LOCAL_AUDIO")
+
+    later_clean = clean(later_reference)
+    later_supported: list[str] = []
+    for tag, left_start, left_end, _right_start, _right_end in difflib.SequenceMatcher(
+        None, ref, hyp, autojunk=False
+    ).get_opcodes():
+        if tag == "equal":
+            continue
+        span = ref[left_start:left_end]
+        if 2 <= len(span) <= 12 and span in later_clean:
+            later_supported.append(span)
+    later_supported = list(dict.fromkeys(later_supported))
+    if later_supported:
+        error_types.append("later_evidence_candidate")
+        eligibility.append("context_action_candidate")
+        actions.extend(["WAIT", "RETRIEVE_MEMORY", "VERIFY_LOCAL_AUDIO"])
+
+    if not error_types:
+        error_types.append("mixed_or_unresolved")
+    priority = (
+        "segmentation_or_speaker_assignment"
+        if "segmentation_or_speaker_assignment" in error_types
+        else "omission_or_undercoverage"
+        if "omission_or_undercoverage" in error_types
+        else "insertion_or_repetition"
+        if "insertion_or_repetition" in error_types
+        else "acoustic_substitution"
+        if "acoustic_substitution" in error_types
+        else "later_evidence_candidate"
+        if "later_evidence_candidate" in error_types
+        else "mixed_or_unresolved"
+    )
+    return {
+        "primary_error_type": priority,
+        "error_types": list(dict.fromkeys(error_types)),
+        "eligibility": list(dict.fromkeys(eligibility)),
+        "recommended_actions": list(dict.fromkeys(actions)),
+        "later_supported_spans": later_supported,
     }
 
 
@@ -120,6 +221,7 @@ def retrace_miss_analysis(session: dict[str, Any], rows: list[dict[str, Any]]) -
             assigned[max(overlaps)[1]].append(row)
 
     categories, revision_outcomes = Counter(), Counter()
+    error_type_counts, eligibility_counts, action_counts = Counter(), Counter(), Counter()
     diagnostics = []
     raw_edits = final_edits = 0
     for index, start, end, turn in turns:
@@ -130,6 +232,15 @@ def retrace_miss_analysis(session: dict[str, Any], rows: list[dict[str, Any]]) -
         if not clean(reference) and not changed:
             continue
         raw_metric, final_metric = metrics(reference, raw), metrics(reference, current)
+        later_reference = "".join(
+            row["text"] for row in rows if float(row["start"]) >= end
+        )
+        taxonomy = classify_gt_error(
+            reference,
+            current,
+            assigned_rows=assigned[index],
+            later_reference=later_reference,
+        )
         raw_edits += raw_metric["edits"]
         final_edits += final_metric["edits"]
         meta, uncertainty = turn.get("meta") or {}, (turn.get("meta") or {}).get("uncertainty") or {}
@@ -148,6 +259,9 @@ def retrace_miss_analysis(session: dict[str, Any], rows: list[dict[str, Any]]) -
         else:
             category = "missed_no_online_signal"
         categories[category] += 1
+        error_type_counts.update(taxonomy["error_types"])
+        eligibility_counts.update(taxonomy["eligibility"])
+        action_counts.update(taxonomy["recommended_actions"])
         if changed:
             revision_outcomes["improved" if final_metric["edits"] < raw_metric["edits"] else "harmed" if final_metric["edits"] > raw_metric["edits"] else "neutral"] += 1
         if category != "correct":
@@ -155,12 +269,19 @@ def retrace_miss_analysis(session: dict[str, Any], rows: list[dict[str, Any]]) -
                 "turn_id": turn.get("turn_id"), "start_sec": start, "end_sec": end,
                 "category": category, "raw_edits": raw_metric["edits"], "final_edits": final_metric["edits"],
                 "reference": reference, "raw_text": raw, "current_text": current,
+                "gt_error_taxonomy": taxonomy,
                 "online_signals": {"acoustic_disagreement": uncertainty.get("acoustic_disagreement") or [], "low_conf_chars": uncertainty.get("low_conf_chars") or [], "acoustic_error": uncertainty.get("acoustic_error"), "quality": uncertainty.get("quality") or {}, "judgment": judgment},
             })
     diagnostics.sort(key=lambda item: (-item["final_edits"], item["start_sec"]))
     evaluated = sum(revision_outcomes.values())
     return {
         "purpose": "offline_gt_diagnostics_only", "categories": dict(categories),
+        "gt_error_taxonomy": {
+            "error_type_counts": dict(error_type_counts),
+            "eligibility_counts": dict(eligibility_counts),
+            "recommended_action_counts": dict(action_counts),
+            "note": "Ground Truth is used only after inference; eligibility labels nominate an action class and do not authorize an online revision.",
+        },
         "raw_edits": raw_edits, "final_edits": final_edits, "net_edits_removed": raw_edits - final_edits,
         "revision_quality": {**dict(revision_outcomes), "evaluated": evaluated, "improvement_rate": revision_outcomes["improved"] / evaluated if evaluated else 0.0, "harm_rate": revision_outcomes["harmed"] / evaluated if evaluated else 0.0},
         "candidate_pipeline": {

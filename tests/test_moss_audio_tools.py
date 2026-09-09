@@ -47,6 +47,30 @@ def test_moss_retranscriber_returns_focused_observation(tmp_path):
     assert result["method"] == "same_model_focused_reobservation"
 
 
+def test_moss_coverage_retranscriber_splits_long_window(tmp_path):
+    audio = tmp_path / "mono.wav"
+    sf.write(audio, np.zeros(12 * 16000, dtype=np.float32), 16000)
+    calls = []
+
+    def transcribe(path):
+        calls.append(sf.info(path).duration)
+        return f"第{len(calls)}段"
+
+    result = moss_audio_tools.retranscribe_window(
+        str(audio),
+        0.0,
+        12.0,
+        transcriber=transcribe,
+        recover_coverage=True,
+    )
+
+    assert result["ok"] is True
+    assert result["text"] == "第1段第2段第3段"
+    assert result["segmented"] is True
+    assert result["window_count"] == 3
+    assert calls == [5.0, 5.0, 2.0]
+
+
 def test_moss_verifier_rejects_when_focused_transcript_matches_no_candidate(tmp_path):
     audio = tmp_path / "mono.wav"
     sf.write(audio, np.zeros(16000, dtype=np.float32), 16000)

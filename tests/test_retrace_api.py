@@ -123,6 +123,50 @@ def test_moss_analysis_uses_bounded_windows_without_merging_turns(tmp_path, monk
     assert calls[-1]["session_complete"] is True
 
 
+def test_moss_coverage_anomaly_inside_window_gets_its_own_agent_action(tmp_path, monkeypatch):
+    calls = []
+
+    def judge(*, current_turn, **_):
+        calls.append((current_turn.turn_id, list(current_turn.meta.get("analysis_window_turn_ids") or [])))
+        return ContextJudgment("CONSISTENT", 0.9)
+
+    chunks = [
+        {"start_sec": float(index * 7), "end_sec": float(index * 7 + 7), "speaker": "S01"}
+        for index in range(12)
+    ]
+    uncertainties = [{} for _ in chunks]
+    uncertainties[4] = {"coverage": {"truncated": True, "char_density": 1.0}}
+    monkeypatch.setenv("ASR_JUDGE_WINDOW_MAX_TURNS", "10")
+    monkeypatch.setenv("ASR_JUDGE_WINDOW_MAX_CHARS", "10000")
+    monkeypatch.setenv("ASR_JUDGE_WINDOW_MAX_AUDIO_SEC", "10000")
+    monkeypatch.setattr(
+        server,
+        "transcribe_audio",
+        lambda _audio: {
+            "ok": True,
+            "backend": "moss-transcribe-diarize",
+            "model": "MOSS-Transcribe-Diarize",
+            "chunks_text": [f"第{index}句正常文本" for index in range(12)],
+            "chunks": chunks,
+            "uncertainties": uncertainties,
+        },
+    )
+    service = ReTraceService(
+        tmp_path / "service",
+        context_judge=judge,
+        audio_retranscriber=lambda **_: {"ok": True, "text": "第四句正常文本"},
+    )
+
+    with TestClient(create_app(tmp_path / "app", service=service)) as client:
+        client.post("/api/sessions/s/audio", json={"audio": "/tmp/moss.wav"}).raise_for_status()
+
+    assert calls == [
+        ("t005", ["t005"]),
+        ("t010", [f"t{index:03d}" for index in range(1, 11)]),
+        ("t012", ["t011", "t012"]),
+    ]
+
+
 def test_default_moss_service_uses_only_moss_audio_tools(tmp_path, monkeypatch):
     monkeypatch.setenv("ASR_BACKEND", "moss-transcribe-diarize")
 

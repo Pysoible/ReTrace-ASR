@@ -1,5 +1,6 @@
 from scripts.run_aishell4_eval import (
     clean,
+    classify_gt_error,
     evaluate_pair_payloads,
     aggregate_results,
     parse_reference,
@@ -11,6 +12,46 @@ from scripts.export_aishell4_errors import _group_for_display, _strip_time
 
 def test_clean_excludes_chunk_timestamp_from_cer():
     assert clean("[41.8-56.5] 学校<sil>表现") == "学校表现"
+
+
+def test_gt_taxonomy_routes_omission_to_audio_actions_without_oracle_revision():
+    result = classify_gt_error(
+        "看看咱这用的话业主们怎么停车呀",
+        "看看咱这用的话",
+        assigned_rows=[{"spk": "S01"}],
+        later_reference="",
+    )
+
+    assert result["primary_error_type"] == "omission_or_undercoverage"
+    assert "audio_action_eligible" in result["eligibility"]
+    assert result["recommended_actions"][:3] == ["EXPAND_WINDOW", "RESEGMENT", "REDECODE"]
+
+
+def test_gt_taxonomy_marks_repeated_later_span_as_context_candidate():
+    result = classify_gt_error(
+        "再去雕琢再去细化",
+        "再去交流再去细化",
+        assigned_rows=[{"spk": "S01"}],
+        later_reference="这个方案还需要雕琢",
+    )
+
+    assert "acoustic_substitution" in result["error_types"]
+    assert "later_evidence_candidate" in result["error_types"]
+    assert result["later_supported_spans"] == ["雕琢"]
+    assert "context_action_candidate" in result["eligibility"]
+
+
+def test_gt_taxonomy_keeps_multi_speaker_assignment_separate_from_text_agent():
+    result = classify_gt_error(
+        "甲乙丙丁",
+        "甲乙",
+        assigned_rows=[{"spk": "S01"}, {"spk": "S02"}],
+        later_reference="",
+    )
+
+    assert result["primary_error_type"] == "segmentation_or_speaker_assignment"
+    assert "alignment_only" in result["eligibility"]
+    assert "REALIGN_SPEAKER_BOUNDARIES" in result["recommended_actions"]
 
 
 def test_error_report_strips_chunk_timestamp_from_transcript_fields():
