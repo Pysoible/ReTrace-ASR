@@ -37,6 +37,28 @@ from asr_agent.retrace import ReTraceService
 _AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac", ".pcm"}
 
 
+def _derive_runtime_asr_signals(asr: dict[str, Any]) -> dict[str, Any]:
+    """Attach code-versioned signals without mutating immutable ASR evidence."""
+    derived = dict(asr)
+    if derived.get("backend") != "moss-transcribe-diarize":
+        return derived
+    from asr_agent.integrations.moss_asr import segment_coverage_uncertainties
+
+    coverage = segment_coverage_uncertainties(
+        list(derived.get("chunks_text") or []),
+        list(derived.get("chunks") or []),
+    )
+    existing = list(derived.get("uncertainties") or [])
+    derived["uncertainties"] = [
+        {
+            **(existing[index] if index < len(existing) else {}),
+            **signal,
+        }
+        for index, signal in enumerate(coverage)
+    ]
+    return derived
+
+
 class TurnRequest(BaseModel):
     turn_id: str
     text: str
@@ -599,6 +621,10 @@ def create_app(
                     artifact_repository.save(first_pass_artifact_id, asr)
         else:
             asr = transcribe_audio(audio_path)
+        # Cached first-pass artifacts intentionally remain immutable. Coverage
+        # routing is a derived Agent signal, so recompute it under the current
+        # code/config even when the transcript itself comes from an older cache.
+        asr = _derive_runtime_asr_signals(asr)
         first_pass_ms = (time.perf_counter() - asr_started) * 1000.0
         if experiment_mode == "baseline":
             if not asr.get("ok"):

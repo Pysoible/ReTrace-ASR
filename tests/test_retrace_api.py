@@ -123,6 +123,23 @@ def test_moss_analysis_uses_bounded_windows_without_merging_turns(tmp_path, monk
     assert calls[-1]["session_complete"] is True
 
 
+def test_runtime_coverage_is_derived_for_old_cached_moss_payload(monkeypatch):
+    monkeypatch.setenv("MOSS_MIN_SEGMENT_CHAR_DENSITY", "2.0")
+    payload = {
+        "ok": True,
+        "backend": "moss-transcribe-diarize",
+        "chunks_text": ["设置的呀"],
+        "chunks": [{"start_sec": 0.0, "end_sec": 12.0}],
+        "uncertainties": [{}],
+    }
+
+    derived = server._derive_runtime_asr_signals(payload)
+
+    assert "coverage" not in payload["uncertainties"][0]
+    assert derived["uncertainties"][0]["coverage"]["truncated"] is True
+    assert derived["uncertainties"][0]["coverage"]["detector"] == "moss_segment_char_density"
+
+
 def test_moss_coverage_anomaly_inside_window_gets_its_own_agent_action(tmp_path, monkeypatch):
     calls = []
 
@@ -134,6 +151,8 @@ def test_moss_coverage_anomaly_inside_window_gets_its_own_agent_action(tmp_path,
         {"start_sec": float(index * 7), "end_sec": float(index * 7 + 7), "speaker": "S01"}
         for index in range(12)
     ]
+    chunk_texts = ["这是正常速度的一整段完整转录文本内容" for _ in chunks]
+    chunk_texts[4] = "设置的呀"
     uncertainties = [{} for _ in chunks]
     uncertainties[4] = {"coverage": {"truncated": True, "char_density": 1.0}}
     monkeypatch.setenv("ASR_JUDGE_WINDOW_MAX_TURNS", "10")
@@ -146,7 +165,7 @@ def test_moss_coverage_anomaly_inside_window_gets_its_own_agent_action(tmp_path,
             "ok": True,
             "backend": "moss-transcribe-diarize",
             "model": "MOSS-Transcribe-Diarize",
-            "chunks_text": [f"第{index}句正常文本" for index in range(12)],
+            "chunks_text": chunk_texts,
             "chunks": chunks,
             "uncertainties": uncertainties,
         },
