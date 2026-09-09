@@ -271,14 +271,12 @@ class ReTraceService:
             # exposed to the LLM prompt. Add a bounded set directly to the
             # verifier queue so a CONSISTENT text-only judgment cannot hide a
             # plausible substitution from local audio verification.
-            window_ids = set(trigger.meta.get("analysis_window_turn_ids") or [trigger.turn_id])
             homophone_focus: list[FocusProposal] = []
-            for target in snapshot.turns:
-                if target.turn_id not in window_ids:
-                    continue
-                homophone_focus.extend(self._context_homophone_focus(snapshot, target))
-                if len(homophone_focus) >= 3:
-                    break
+            if trigger.meta.get("session_complete"):
+                # One global pass is enough: scanning every bounded Judge window
+                # repeats the same session-wide n-gram index and is quadratic on
+                # long meetings. Build the index once and prefer 3-4 char spans.
+                homophone_focus = self._session_homophone_focus(snapshot, limit=3)
             candidate_pool.extend(
                 focus_to_candidate(focus, snapshot)
                 for focus in homophone_focus[:3]
@@ -662,6 +660,55 @@ class ReTraceService:
             if len(focus) >= 3:
                 break
         return focus
+
+    @staticmethod
+    def _session_homophone_focus(session: Session, *, limit: int = 3) -> list[FocusProposal]:
+        """Index one complete session once and propose repeated homophone fixes."""
+        try:
+            from pypinyin import lazy_pinyin
+        except ImportError:
+            return []
+        occurrences: dict[tuple[str, ...], dict[str, list[str]]] = {}
+        for turn in session.turns:
+            text = re.sub(
+                r"^\[\d+(?:\.\d+)?[-~]\d+(?:\.\d+)?\]\s*",
+                "",
+                turn.current_text or turn.raw_text,
+            )
+            seen_in_turn: set[str] = set()
+            for width in (4, 3):
+                for index in range(len(text) - width + 1):
+                    value = text[index:index + width]
+                    if value in seen_in_turn or not all("\u4e00" <= char <= "\u9fff" for char in value):
+                        continue
+                    seen_in_turn.add(value)
+                    key = tuple(lazy_pinyin(value))
+                    occurrences.setdefault(key, {}).setdefault(value, []).append(turn.turn_id)
+        proposals: list[FocusProposal] = []
+        for variants in occurrences.values():
+            if len(variants) < 2:
+                continue
+            canonical, canonical_ids = max(
+                variants.items(), key=lambda item: (len(set(item[1])), len(item[0]), item[0])
+            )
+            if len(set(canonical_ids)) < 2:
+                continue
+            for observed, observed_ids in variants.items():
+                if observed == canonical or len(set(observed_ids)) >= len(set(canonical_ids)):
+                    continue
+                for target_id in list(dict.fromkeys(observed_ids)):
+                    proposals.append(FocusProposal(
+                        target_turn_id=target_id,
+                        span=observed,
+                        proposed_text=canonical,
+                        alternatives=[observed, canonical],
+                        evidence_turn_ids=list(dict.fromkeys(canonical_ids)),
+                        rationale="session-wide repeated homophone candidate; verify against target audio",
+                        source="history_homophone",
+                    ))
+                    if len(proposals) >= limit:
+                        return proposals
+        return proposals
 
     def _recover_overlapping_boundary(
         self,

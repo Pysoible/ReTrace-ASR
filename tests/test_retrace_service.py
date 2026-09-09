@@ -951,11 +951,17 @@ def test_consistent_judge_cannot_hide_repeated_homophone_substitution(tmp_path):
     )
     service.process_turn("s", "t1", "涂博士介绍实验")
     service.process_turn("s", "t2", "请涂博士继续")
-    result = service.process_turn(
+    observed = service.observe_turn(
         "s",
         "t3",
         "图博士开始发言",
         meta={"audio_path": "/tmp/fake.wav", "start_sec": 4.0, "end_sec": 6.0},
+    )
+    result = service.analyze_turn(
+        "s",
+        "t3",
+        observed_version=observed["observed_version"],
+        session_complete=True,
     )
 
     assert calls
