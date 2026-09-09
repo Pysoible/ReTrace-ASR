@@ -166,7 +166,13 @@ class EvidenceResolver:
     def _focus_audio_window(target: Turn, span: str, start_sec: float, end_sec: float) -> tuple[float, float]:
         """Narrow long turn windows around the focused transcript span."""
         duration = end_sec - start_sec
-        if duration <= 6.0:
+        # MOSS turn text is not word-timestamp aligned.  On an already short
+        # turn, projecting character position back to time can crop out the
+        # focused word entirely (especially around pauses and speaker overlap).
+        # Keep the full turn through 30 s; only narrow genuinely long windows.
+        # MOSS verifies these windows in well under the semantic-judge latency,
+        # so retaining the actual focused speech is the safer trade-off.
+        if duration <= 30.0:
             return start_sec, end_sec
         text = re.sub(r"^\[\d+(?:\.\d+)?-\d+(?:\.\d+)?\]\s*", "", target.raw_text or "")
         position = text.find(span)
@@ -354,7 +360,10 @@ class EvidenceResolver:
             effective_revise_threshold = 0.0
         elif strict_revision and near_variant:
             effective_margin_threshold = max(0.10, self.policy.thresholds.audio_margin)
-            effective_revise_threshold = max(0.75, self.policy.thresholds.revise)
+            effective_revise_threshold = max(
+                0.70 if len(set(focus.evidence_turn_ids)) >= 2 else 0.75,
+                self.policy.thresholds.revise,
+            )
         else:
             effective_margin_threshold = 0.0 if near_variant else self.policy.thresholds.audio_margin
             effective_revise_threshold = 0.40 if near_variant else self.policy.thresholds.revise
@@ -377,12 +386,18 @@ class EvidenceResolver:
             independent_sources=len(set(focus.evidence_turn_ids)),
             acoustic_support=acoustic_support,
         )
+        decisive_proposed_audio = (
+            ordered[0][0] == proposed_key
+            and proposed_score >= 0.90
+            and margin >= 0.30
+            and self._is_safe_local_replacement(focus.span, focus.proposed_text, operation)
+        )
         if strict_revision and not near_variant and not structured_repetition and (
             context_confidence < 0.85
             or top < 0.85
             or margin < 0.30
             or (not acoustic_support and self.policy.calibrator.predict(features) < 0.75)
-        ):
+        ) and not decisive_proposed_audio:
             return Resolution(
                 "DEFER",
                 target.turn_id,

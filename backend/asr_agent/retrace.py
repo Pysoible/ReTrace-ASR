@@ -267,6 +267,14 @@ class ReTraceService:
                 focus_to_candidate(focus, snapshot)
                 for focus in self._acoustic_focus(trigger)
             )
+            # Streaming sessions should use already-corroborated terminology as
+            # soon as a same-pronunciation variant appears.  This bounded helper
+            # existed but was not connected to the candidate pool, so only the
+            # end-of-session global scan could surface these substitutions.
+            candidate_pool.extend(
+                focus_to_candidate(focus, snapshot)
+                for focus in self._context_homophone_focus(snapshot, trigger)
+            )
             # Deterministic repeated-session homophones were previously only
             # exposed to the LLM prompt. Add a bounded set directly to the
             # verifier queue so a CONSISTENT text-only judgment cannot hide a
@@ -317,7 +325,27 @@ class ReTraceService:
                 except Exception:
                     pass
 
-            judgment.focus = [candidate_to_focus(item) for item in deduplicate_candidates(candidate_pool)]
+            deduplicated = deduplicate_candidates(candidate_pool)
+            selected_candidates: list[CorrectionCandidate] = []
+            occupied_by_turn: dict[str, list[tuple[int, int]]] = {}
+            for candidate in sorted(
+                deduplicated,
+                key=lambda item: (item.target_turn_id, -len(item.span), item.span, item.candidate),
+            ):
+                target = next(
+                    (turn for turn in snapshot.turns if turn.turn_id == candidate.target_turn_id),
+                    None,
+                )
+                target_text = (target.current_text or target.raw_text) if target is not None else ""
+                start = target_text.find(candidate.span)
+                end = start + len(candidate.span)
+                occupied = occupied_by_turn.setdefault(candidate.target_turn_id, [])
+                if start >= 0 and any(start < used_end and used_start < end for used_start, used_end in occupied):
+                    continue
+                selected_candidates.append(candidate)
+                if start >= 0:
+                    occupied.append((start, end))
+            judgment.focus = [candidate_to_focus(item) for item in selected_candidates]
             if judgment.focus and judgment.outcome not in {"CONFLICT", "UNCERTAIN"}:
                 judgment.outcome = "UNCERTAIN"
                 judgment.confidence = max(judgment.confidence, 0.5)
@@ -638,7 +666,14 @@ class ReTraceService:
                     if all("\u4e00" <= char <= "\u9fff" for char in candidate):
                         occurrences.setdefault(candidate, []).append(historical.turn_id)
         focus: list[FocusProposal] = []
+        occupied: list[tuple[int, int]] = []
+        # Prefer one complete term at a position. Shorter nested n-grams describe
+        # the same error and otherwise create duplicate ledger commits.
         for span in sorted(current_spans, key=lambda value: (-len(value), value)):
+            start = current.find(span)
+            end = start + len(span)
+            if start < 0 or any(start < used_end and used_start < end for used_start, used_end in occupied):
+                continue
             span_pinyin = lazy_pinyin(span)
             candidates = [
                 (candidate, ids)
@@ -658,6 +693,7 @@ class ReTraceService:
                 evidence_turn_ids=list(dict.fromkeys(evidence_ids)),
                 rationale="repeated session term is a same-pronunciation candidate; verify against local audio",
             ))
+            occupied.append((start, end))
             if len(focus) >= 3:
                 break
         return focus

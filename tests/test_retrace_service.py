@@ -4,6 +4,7 @@ from asr_agent.context_judge import BeliefProposal, ContextJudgment, FocusPropos
 from asr_agent.model_identity import ModelIdentity
 from asr_agent.models import MemoryBelief
 from asr_agent.retrace import ReTraceService
+from asr_agent.resolver import EvidenceResolver
 
 
 def conflict_judge(**_: object) -> ContextJudgment:
@@ -289,6 +290,48 @@ def test_strict_revision_accepts_open_candidate_with_decisive_evidence(tmp_path)
 
     assert result["revisions"][0]["action"] == "REVISE_HISTORY"
     assert result["session"]["turns"][0]["current_text"] == "他们今天开会讨论"
+
+
+def test_strict_revision_accepts_decisive_audio_when_semantic_confidence_is_low(tmp_path):
+    def judge(*, current_turn, **_):
+        return ContextJudgment(
+            "UNCERTAIN",
+            0.5,
+            focus=[FocusProposal(
+                target_turn_id=current_turn.turn_id,
+                span="总经里",
+                proposed_text="总经理",
+                alternatives=["总经里", "总经理"],
+                source="semantic_open",
+            )],
+        )
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=judge,
+        audio_verifier=lambda **_: {
+            "ok": True,
+            "scores": {"总经里": 0.002, "总经理": 0.995, "[DELETE]": 0.003},
+        },
+    )
+    result = service.process_turn(
+        "s",
+        "t1",
+        "刚才总经里已经说明了",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0.0, "end_sec": 5.0},
+    )
+
+    assert result["session"]["turns"][0]["current_text"] == "刚才总经理已经说明了"
+    assert result["revisions"][0]["replacement"] == "总经理"
+
+
+def test_short_turn_audio_window_is_not_position_cropped():
+    target = type("Target", (), {"raw_text": "行吧，我是咱那个刚才总经里也说了"})()
+
+    assert EvidenceResolver._focus_audio_window(target, "总经里", 41.25, 50.64) == (41.25, 50.64)
+
+    longer = type("Target", (), {"raw_text": "消防器材要巡查，消防安全通到咱都得检查"})()
+    assert EvidenceResolver._focus_audio_window(longer, "安全通到", 90.0, 115.0) == (90.0, 115.0)
 
 
 def test_delete_focus_removes_an_audio_unsupported_span(tmp_path):
@@ -1025,6 +1068,36 @@ def test_session_repetition_candidate_removes_only_audio_unsupported_copy(tmp_pa
     assert result["session"]["turns"][0]["current_text"] == "我们请总经总经理发言"
     assert result["revisions"][0]["replacement"] == "总经总经理"
     assert "candidate_source:repetition_candidate" in result["revisions"][0]["evidence"]
+
+
+def test_streaming_repeated_homophone_enters_targeted_audio_pipeline(tmp_path):
+    def verify(*, candidates, **_kwargs):
+        return {
+            "ok": True,
+            "scores": {
+                candidate: 0.95 if candidate in {"总经理", "经理"} else 0.03
+                for candidate in candidates
+            },
+        }
+
+    service = ReTraceService(
+        tmp_path,
+        context_judge=lambda **_: ContextJudgment("CONSISTENT", 0.9),
+        audio_verifier=verify,
+    )
+    service.process_turn("s", "t1", "总经理介绍方案")
+    service.process_turn("s", "t2", "仍由总经理负责")
+    result = service.process_turn(
+        "s",
+        "t3",
+        "刚才总经里已经说明了",
+        meta={"audio_path": "/tmp/fake.wav", "start_sec": 0.0, "end_sec": 5.0},
+    )
+
+    assert result["session"]["turns"][2]["current_text"] == "刚才总经理已经说明了"
+    assert len(result["revisions"]) == 1
+    assert result["revisions"][0]["replacement"] == "总经理"
+    assert "candidate_source:history_homophone" in result["revisions"][0]["evidence"]
 
 
 def test_judge_tolerates_single_object_focus_from_model(tmp_path):
