@@ -156,6 +156,39 @@ def test_deepseek_context_judge_receives_gss_overlap_substitution_candidates(mon
     ]
 
 
+def test_windowed_judge_receives_gss_candidates_from_every_turn(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    seen = {}
+
+    def fake_chat(messages, **_):
+        import json
+
+        seen["payload"] = json.loads(messages[1]["content"])
+        return {"outcome": "UNCERTAIN", "confidence": 0.7, "focus": []}
+
+    monkeypatch.setattr(deepseek, "_chat_json", fake_chat)
+    first = Turn(
+        "t1", "宣传代业", "宣传代业",
+        meta={"uncertainty": {"overlap": {"substitution_candidates": [
+            {"span": "代业", "candidate": "单页", "source": "gss_overlap"}
+        ]}}},
+    )
+    trigger = Turn(
+        "t2", "前期做宣传", "前期做宣传",
+        meta={"analysis_window_turn_ids": ["t1", "t2"]},
+    )
+
+    deepseek.judge_context(
+        session=Session("s", turns=[first, trigger]),
+        current_turn=trigger,
+        memory=MemoryPacket(),
+    )
+
+    assert seen["payload"]["overlap_candidates"] == [{
+        "span": "代业", "candidate": "单页", "source": "gss_overlap", "target_turn_id": "t1"
+    }]
+
+
 def test_deepseek_context_judge_returns_validated_focus(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr(

@@ -404,7 +404,6 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
     uncertainty = current_turn.meta.get("uncertainty") or {}
     acoustic_disagreement = uncertainty.get("acoustic_disagreement")
     low_conf_chars = uncertainty.get("low_conf_chars")
-    overlap_candidates = (uncertainty.get("overlap") or {}).get("substitution_candidates") or []
     session_complete = bool((current_turn.meta or {}).get("session_complete"))
     if session_complete:
         recent_turns = memory.recent_turns[-4:]
@@ -422,6 +421,19 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
         or [current_turn.turn_id]
     )
     windowed_analysis = bool((current_turn.meta or {}).get("analysis_window_turn_ids"))
+    if windowed_analysis:
+        overlap_candidates = []
+        for turn in session.turns:
+            if turn.turn_id not in window_ids:
+                continue
+            candidates = (((turn.meta or {}).get("uncertainty") or {}).get("overlap") or {}).get("substitution_candidates") or []
+            overlap_candidates.extend(
+                {**item, "target_turn_id": turn.turn_id}
+                for item in candidates
+                if isinstance(item, dict)
+            )
+    else:
+        overlap_candidates = (uncertainty.get("overlap") or {}).get("substitution_candidates") or []
     analysis_window = [
         {"turn_id": turn.turn_id, "text": turn.current_text or turn.raw_text}
         for turn in session.turns
