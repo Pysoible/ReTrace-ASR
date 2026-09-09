@@ -95,7 +95,8 @@ def classify_gt_error(
     eligibility: list[str] = []
     actions: list[str] = []
     speakers = {str(row.get("spk") or "unknown") for row in assigned_rows}
-    if len(speakers) > 1:
+    crosses_asr_turns = any(int(row.get("_asr_turn_overlap_count") or 1) > 1 for row in assigned_rows)
+    if len(speakers) > 1 or crosses_asr_turns:
         error_types.append("segmentation_or_speaker_assignment")
         eligibility.append("alignment_only")
         actions.append("REALIGN_SPEAKER_BOUNDARIES")
@@ -218,7 +219,10 @@ def retrace_miss_analysis(session: dict[str, Any], rows: list[dict[str, Any]]) -
         overlaps = [(max(0.0, min(row["end"], end) - max(row["start"], start)), index) for index, start, end, _ in turns]
         overlaps = [(amount, index) for amount, index in overlaps if amount > 0]
         if overlaps:
-            assigned[max(overlaps)[1]].append(row)
+            assigned[max(overlaps)[1]].append({
+                **row,
+                "_asr_turn_overlap_count": len(overlaps),
+            })
 
     categories, revision_outcomes = Counter(), Counter()
     error_type_counts, eligibility_counts, action_counts = Counter(), Counter(), Counter()

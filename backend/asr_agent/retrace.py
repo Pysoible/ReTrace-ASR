@@ -872,7 +872,11 @@ class ReTraceService:
         raw_keep = keep(raw_body)
         cand_keep = keep(cand_body)
         if raw_keep == cand_keep:
-            meta["relisten_uncertain"] = {"relistened": True, "changed": False}
+            meta["relisten_uncertain"] = {
+                "relistened": True,
+                "changed": False,
+                "observed_text": cand_body,
+            }
             return None
         import difflib
 
@@ -883,7 +887,12 @@ class ReTraceService:
         # small, acoustically-confident edit is applied. For other relistens, a
         # ratio > 0.9 means the relisten is essentially the same transcript.
         if not is_high_conf and ratio > 0.9:
-            meta["relisten_uncertain"] = {"relistened": True, "changed": False, "ratio": round(ratio, 3)}
+            meta["relisten_uncertain"] = {
+                "relistened": True,
+                "changed": False,
+                "ratio": round(ratio, 3),
+                "observed_text": cand_body,
+            }
             return None
         # A relisten that merely differs from the first pass is NOT automatically
         # better — it is the same ASR model and can be led astray (e.g. a stale
@@ -925,6 +934,7 @@ class ReTraceService:
                 "relistened": True,
                 "changed": False,
                 "ratio": round(ratio, 3),
+                "observed_text": cand_body,
                 "candidate_count": len(local_candidates),
             }
             return local_candidates or None
@@ -966,6 +976,7 @@ class ReTraceService:
                 "relistened": True,
                 "changed": False,
                 "ratio": round(ratio, 3),
+                "observed_text": cand_body,
                 "rejected": (
                     "normal turn requires targeted focus for revision"
                     if not raw_assessment.degenerate and not coverage_risk

@@ -54,6 +54,18 @@ def test_gt_taxonomy_keeps_multi_speaker_assignment_separate_from_text_agent():
     assert "REALIGN_SPEAKER_BOUNDARIES" in result["recommended_actions"]
 
 
+def test_gt_taxonomy_marks_reference_interval_crossing_asr_turns_as_alignment_only():
+    result = classify_gt_error(
+        "我这儿男装这儿说两句啊男装销量不理想",
+        "男装销量不理想",
+        assigned_rows=[{"spk": "S01", "_asr_turn_overlap_count": 2}],
+        later_reference="",
+    )
+
+    assert result["primary_error_type"] == "segmentation_or_speaker_assignment"
+    assert "alignment_only" in result["eligibility"]
+
+
 def test_error_report_strips_chunk_timestamp_from_transcript_fields():
     assert _strip_time("[41.8-56.5] 学校表现") == "学校表现"
 
