@@ -46,6 +46,27 @@ def test_public_deepseek_chat_uses_openai_compatible_endpoint(monkeypatch):
     assert seen["json"]["model"] == "deepseek-chat"
 
 
+def test_window_homophone_candidates_compare_all_turn_pairs():
+    session = Session(
+        "s",
+        turns=[
+            Turn("t1", "图博士介绍实验", "图博士介绍实验"),
+            Turn("t2", "今天讨论结果", "今天讨论结果"),
+            Turn("t3", "请涂博士总结", "请涂博士总结"),
+        ],
+    )
+
+    candidates = deepseek._window_homophone_candidates(session, {"t1", "t2", "t3"})
+
+    assert any(
+        item["target_turn_id"] == "t1"
+        and item["span"] == "图博士"
+        and item["candidate"] == "涂博士"
+        and item["evidence_turn_ids"] == ["t3"]
+        for item in candidates
+    )
+
+
 def test_deepseek_context_judge_receives_bounded_analysis_window(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     seen = {}

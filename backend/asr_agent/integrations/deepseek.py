@@ -270,6 +270,61 @@ def _homophone_candidates(
     return list(candidates.values())[:limit]
 
 
+def _window_homophone_candidates(
+    session: Session,
+    turn_ids: set[str],
+    limit: int = 64,
+) -> list[dict[str, Any]]:
+    """Find spelling conflicts between every turn in one bounded window."""
+    try:
+        from pypinyin import lazy_pinyin
+    except ImportError:
+        return []
+    selected = [
+        (
+            turn.turn_id,
+            re.sub(r"^\[\d+(?:\.\d+)?[-~]\d+(?:\.\d+)?\]\s*", "", turn.current_text or turn.raw_text),
+        )
+        for turn in session.turns
+        if turn.turn_id in turn_ids
+    ]
+    pronunciation_index: dict[tuple[int, tuple[str, ...]], list[tuple[str, str]]] = {}
+    for turn_id, text in selected:
+        for width in range(2, 5):
+            for start in range(len(text) - width + 1):
+                span = text[start : start + width]
+                if not all("\u4e00" <= char <= "\u9fff" for char in span):
+                    continue
+                key = (width, tuple(lazy_pinyin(span)))
+                bucket = pronunciation_index.setdefault(key, [])
+                if (turn_id, span) not in bucket:
+                    bucket.append((turn_id, span))
+
+    candidates: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for variants in pronunciation_index.values():
+        if len({span for _, span in variants}) < 2:
+            continue
+        for target_turn_id, span in variants:
+            for evidence_turn_id, candidate in variants:
+                if target_turn_id == evidence_turn_id or span == candidate:
+                    continue
+                key = (target_turn_id, span, candidate)
+                item = candidates.setdefault(
+                    key,
+                    {
+                        "target_turn_id": target_turn_id,
+                        "span": span,
+                        "candidate": candidate,
+                        "evidence_turn_ids": [],
+                    },
+                )
+                if evidence_turn_id not in item["evidence_turn_ids"]:
+                    item["evidence_turn_ids"].append(evidence_turn_id)
+                if len(candidates) >= limit:
+                    return list(candidates.values())
+    return list(candidates.values())
+
+
 def _resolve_homophone_focus(
     session: Session,
     current_turn: Turn,
@@ -390,10 +445,10 @@ def judge_context(*, session: Session, current_turn: Turn, memory: MemoryPacket)
         "long_term_beliefs": [item.as_dict() for item in memory.long_term_beliefs[-12:]],
         "domain_entities": _domain_entities(memory),
         "canonical_entities": _canonical_entities(memory),
-        "homophone_candidates": _homophone_candidates(
-            session,
-            current_turn,
-            turn_ids=window_ids if windowed_analysis else None,
+        "homophone_candidates": (
+            _window_homophone_candidates(session, window_ids)
+            if windowed_analysis
+            else _homophone_candidates(session, current_turn)
         ),
         # Acoustic uncertainty: spans where a second independent ASR disagreed
         # with the first pass. These are strong candidates for mis-hearings.
