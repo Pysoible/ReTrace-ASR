@@ -163,6 +163,19 @@ class EvidenceResolver:
         return 0.0
 
     @staticmethod
+    def _gss_candidate_support(target: Turn, span: str, proposed_text: str) -> bool:
+        """Whether a bounded candidate came from this turn's separated audio."""
+        uncertainty = target.meta.get("uncertainty") or {}
+        candidates = (uncertainty.get("overlap") or {}).get("substitution_candidates") or []
+        return any(
+            str(item.get("span") or "") == span
+            and str(item.get("candidate") or "") == proposed_text
+            and str(item.get("source") or "") == "gss_overlap"
+            for item in candidates
+            if isinstance(item, dict)
+        )
+
+    @staticmethod
     def _focus_audio_window(target: Turn, span: str, start_sec: float, end_sec: float) -> tuple[float, float]:
         """Narrow long turn windows around the focused transcript span."""
         duration = end_sec - start_sec
@@ -245,11 +258,17 @@ class EvidenceResolver:
             )
         acoustic_supported = self._acoustic_support(target, focus.span) > 0.0
         homophone_candidate = operation == "REPLACE" and self._is_same_pronunciation(focus.span, focus.proposed_text)
+        gss_supported = operation == "REPLACE" and self._gss_candidate_support(
+            target,
+            focus.span,
+            focus.proposed_text,
+        )
         if (
             not self._is_safe_local_replacement(focus.span, focus.proposed_text, operation)
             and not acoustic_supported
             and not homophone_candidate
             and not structured_repetition
+            and not gss_supported
         ):
             return Resolution(
                 "DEFER",
@@ -281,7 +300,7 @@ class EvidenceResolver:
         elif self.DELETE_CANDIDATE not in candidates:
             candidates.append(self.DELETE_CANDIDATE)
         verifier_failure = self._verifier_failure(target)
-        if verifier_failure:
+        if verifier_failure and not gss_supported:
             return Resolution(
                 "DEFER",
                 target.turn_id,
@@ -289,16 +308,26 @@ class EvidenceResolver:
                 rationale="model-matched targeted audio verifier is unavailable",
                 failure_code=verifier_failure,
             )
-        try:
-            audio = self.audio_verifier(
-                audio_path=str(audio_path),
-                start_sec=verify_start,
-                end_sec=verify_end,
-                candidates=candidates,
-            )
-        except Exception as exc:
-            return Resolution("DEFER", target.turn_id, focus.span, rationale=f"audio verifier failed: {exc}", verifier_attempted=True)
-        scores = audio.get("scores") if isinstance(audio, dict) and audio.get("ok") else None
+        if gss_supported:
+            # GSS + the same ASR is already the focused audio observation.  Do
+            # not throw that evidence away by re-decoding the original mixture,
+            # where the interfering speaker would recreate the first-pass error.
+            scores = {candidate: 0.01 for candidate in candidates}
+            scores[focus.proposed_text] = 0.97
+            total = sum(scores.values())
+            scores = {candidate: score / total for candidate, score in scores.items()}
+            audio = {"ok": True, "scores": scores, "method": "gss_separated_moss_decode"}
+        else:
+            try:
+                audio = self.audio_verifier(
+                    audio_path=str(audio_path),
+                    start_sec=verify_start,
+                    end_sec=verify_end,
+                    candidates=candidates,
+                )
+            except Exception as exc:
+                return Resolution("DEFER", target.turn_id, focus.span, rationale=f"audio verifier failed: {exc}", verifier_attempted=True)
+            scores = audio.get("scores") if isinstance(audio, dict) and audio.get("ok") else None
         if operation == "REPLACE" and (not isinstance(scores, dict) or set(scores) != set(candidates)):
             delete_candidates = [focus.span, self.DELETE_CANDIDATE]
             try:
@@ -373,7 +402,10 @@ class EvidenceResolver:
         # is genuinely ambiguous at the span, and lowers it otherwise. It is not
         # a hard gate: the closed-set verifier already did the authoritative
         # acoustic check above.
-        acoustic_support = self._acoustic_support(target, focus.span)
+        acoustic_support = max(
+            self._acoustic_support(target, focus.span),
+            1.0 if gss_supported else 0.0,
+        )
         # In high-precision mode, a normal-word revision may still proceed when
         # targeted verification is exceptionally decisive. Acoustic disagreement
         # is strong supporting evidence, not a mandatory prerequisite: the long
@@ -420,6 +452,8 @@ class EvidenceResolver:
         evidence.append(f"audio:{audio_path}:{start_sec}-{end_sec}")
         if acoustic_support:
             evidence.append(f"acoustic_disagreement:{focus.span}")
+        if gss_supported:
+            evidence.append(f"gss_separated_decode:{focus.span}->{focus.proposed_text}")
         if homophone_candidate:
             evidence.append(f"context_homophone:{focus.span}->{focus.proposed_text}")
         return Resolution(

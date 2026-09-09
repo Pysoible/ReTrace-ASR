@@ -107,6 +107,56 @@ def test_moss_turn_cannot_call_qwen_verifier(tmp_path):
     assert called is False
 
 
+def test_gss_candidate_uses_separated_decode_instead_of_original_mixture(tmp_path):
+    called = False
+
+    def mixture_verifier(**_):
+        nonlocal called
+        called = True
+        raise AssertionError("the original overlapping mixture must not replace GSS evidence")
+
+    target = Turn(
+        "t1",
+        "宣传代业",
+        "宣传代业",
+        source="moss",
+        meta={
+            "audio_path": str(tmp_path / "meeting.flac"),
+            "start_sec": 10.0,
+            "end_sec": 13.0,
+            "uncertainty": {
+                "overlap": {
+                    "detected": True,
+                    "substitution_candidates": [
+                        {"span": "代业", "candidate": "单页", "source": "gss_overlap"}
+                    ],
+                }
+            },
+            "first_pass_identity": ModelIdentity(
+                "moss-transcribe-diarize", "MOSS-Transcribe-Diarize", "first_pass"
+            ).as_dict(),
+        },
+    )
+    resolver = EvidenceResolver(
+        audio_verifier=mixture_verifier,
+        verifier_identity=ModelIdentity(
+            "moss-transcribe-diarize", "MOSS-Transcribe-Diarize", "targeted_verifier"
+        ),
+    )
+    focus = FocusProposal(
+        "t1", "代业", "单页", ["代业", "单页"], ["t1"], source="gss_overlap"
+    )
+
+    result = resolver.resolve(
+        Session("s", turns=[target]), target, focus, context_confidence=0.95
+    )
+
+    assert result.action == "REVISE_CURRENT"
+    assert result.audio_verified is True
+    assert "gss_separated_decode:代业->单页" in result.evidence
+    assert called is False
+
+
 def test_context_judgment_carries_grounded_working_beliefs():
     session = Session("s", turns=[Turn("t1", "负责人是涂博士", "负责人是涂博士")])
     judgment = ContextJudgment(

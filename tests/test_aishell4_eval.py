@@ -305,6 +305,7 @@ def test_aggregate_uses_only_valid_pooled_counts():
     assert result["effectiveness"] == {
         "ecer": 0.4,
         "revision_precision": 0.75,
+        "harmful_revision_rate": 0.0,
         "candidate_to_correction_yield": 0.5,
         "error_type_reduction": {
             "substitutions": {"net_removed": 0, "relative": 0.0},

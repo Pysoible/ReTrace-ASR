@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from asr_agent.integrations import moss_asr
+from asr_agent.integrations import gss_overlap
 
 
 def test_parse_moss_transcript_into_retrace_chunks():
@@ -139,6 +140,20 @@ def test_moss_uncertainty_exposes_gss_span_candidates_without_authorizing_revisi
         {"span": "代业", "candidate": "单页", "source": "gss_overlap"}
     ]
     assert uncertainties[0]["overlap"]["automatic_revision_allowed"] is False
+
+
+def test_gss_selects_largest_overlap_components():
+    chunks = [
+        {"index": 0, "overlap": True, "overlap_duration_sec": 2.0, "overlap_with_indices": [1]},
+        {"index": 1, "overlap": True, "overlap_duration_sec": 2.0, "overlap_with_indices": [0]},
+        {"index": 2, "overlap": True, "overlap_duration_sec": 0.5, "overlap_with_indices": [3]},
+        {"index": 3, "overlap": True, "overlap_duration_sec": 0.5, "overlap_with_indices": [2]},
+    ]
+
+    positions, components = gss_overlap._selected_positions(chunks, 1)
+
+    assert positions == [0, 1]
+    assert components == [{"positions": [0, 1], "overlap_duration_sec": 2.0}]
 
 
 def test_transcribe_audio_posts_to_moss_endpoint(monkeypatch, tmp_path):

@@ -37,7 +37,12 @@ from asr_agent.retrace import ReTraceService
 _AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac", ".pcm"}
 
 
-def _derive_runtime_asr_signals(asr: dict[str, Any]) -> dict[str, Any]:
+def _derive_runtime_asr_signals(
+    asr: dict[str, Any],
+    *,
+    audio_path: str | None = None,
+    enable_gss: bool = False,
+) -> dict[str, Any]:
     """Attach code-versioned signals without mutating immutable ASR evidence."""
     derived = dict(asr)
     if derived.get("backend") != "moss-transcribe-diarize":
@@ -46,6 +51,12 @@ def _derive_runtime_asr_signals(asr: dict[str, Any]) -> dict[str, Any]:
 
     chunks = annotate_speaker_overlaps(list(derived.get("chunks") or []))
     derived["chunks"] = chunks
+
+    if enable_gss and audio_path:
+        from asr_agent.integrations.gss_overlap import enrich
+
+        derived = enrich(audio_path, derived)
+        chunks = list(derived.get("chunks") or [])
 
     coverage = segment_coverage_uncertainties(
         list(derived.get("chunks_text") or []),
@@ -331,6 +342,8 @@ def create_app(
     def integrations_status() -> dict[str, Any]:
         disabled = {"0", "false", "no", "off"}
         first_pass_identity = ModelIdentity.from_asr_result(asr_status())
+        from asr_agent.integrations.gss_overlap import status as gss_status
+
         return {
             "qwen_asr": asr_status(),
             "asr": asr_status(),
@@ -346,6 +359,7 @@ def create_app(
                     if service.relistener_identity is not None else None
                 ),
             },
+            "gss_overlap": gss_status(),
             "retrace_policy": {
                 "fast_normal_turns": os.getenv("ASR_FAST_NORMAL_TURNS", "0").strip().lower() not in disabled,
                 "strict_revision": os.getenv("ASR_STRICT_REVISION", "1").strip().lower() not in disabled,
@@ -630,7 +644,11 @@ def create_app(
         # Cached first-pass artifacts intentionally remain immutable. Coverage
         # routing is a derived Agent signal, so recompute it under the current
         # code/config even when the transcript itself comes from an older cache.
-        asr = _derive_runtime_asr_signals(asr)
+        asr = _derive_runtime_asr_signals(
+            asr,
+            audio_path=audio_path,
+            enable_gss=experiment_mode == "retrace",
+        )
         first_pass_ms = (time.perf_counter() - asr_started) * 1000.0
         if experiment_mode == "baseline":
             if not asr.get("ok"):
@@ -665,6 +683,12 @@ def create_app(
             mode="retrace",
         )
         result["stage_timings_ms"]["first_pass_asr"] = first_pass_ms
+        gss_audit = asr.get("gss_overlap_audit") or {}
+        if gss_audit.get("status") == "ok":
+            result["stage_timings_ms"]["gss_enhancement"] = float(gss_audit.get("gss_elapsed_sec") or 0.0) * 1000.0
+            result["stage_timings_ms"]["gss_local_moss_decode"] = float(gss_audit.get("decode_elapsed_sec") or 0.0) * 1000.0
+            result["stage_call_counts"]["gss_enhancement"] = 0 if gss_audit.get("cache_hit") else 1
+            result["stage_call_counts"]["gss_local_moss_decode"] = 0 if gss_audit.get("cache_hit") else int(gss_audit.get("decoded_chunks") or 0)
         result["stage_timings_ms"]["request_total"] = (time.perf_counter() - request_started) * 1000.0
         result["stage_call_counts"]["first_pass_asr"] = 1
         result["stage_call_counts"]["request_total"] = 1

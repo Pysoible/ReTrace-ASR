@@ -338,6 +338,45 @@ def _committed_revision_quality(session: dict[str, Any], rows: list[dict[str, An
     }
 
 
+def overlap_region_metrics(session: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Score only turns routed by the online overlap detector.
+
+    Ground Truth is used here after inference only.  This diagnostic isolates
+    the region targeted by GSS so a small local gain is not hidden by thousands
+    of unrelated characters in the meeting-wide CER.
+    """
+    references = _turn_references(session, rows)
+    selected = [
+        turn
+        for turn in session.get("turns") or []
+        if bool((turn.get("meta") or {}).get("overlap"))
+    ]
+    reference = "".join(references.get(str(turn.get("turn_id")), "") for turn in selected)
+    raw = "".join(str(turn.get("raw_text") or "") for turn in selected)
+    final = "".join(str(turn.get("current_text") or turn.get("raw_text") or "") for turn in selected)
+    baseline_metric, final_metric = metrics(reference, raw), metrics(reference, final)
+    baseline_substitutions = int(baseline_metric["substitutions"])
+    committed = sum(
+        clean(str(turn.get("raw_text") or "")) != clean(str(turn.get("current_text") or turn.get("raw_text") or ""))
+        for turn in selected
+    )
+    return {
+        "kind": "offline_gt_overlap_region_diagnostic",
+        "selected_turns": len(selected),
+        "reference_chars": len(clean(reference)),
+        "baseline": baseline_metric,
+        "final": final_metric,
+        "changed_turns": committed,
+        "substitution_net_removed": baseline_substitutions - int(final_metric["substitutions"]),
+        "overlap_substitution_reduction_rate": (
+            (baseline_substitutions - int(final_metric["substitutions"])) / baseline_substitutions
+            if baseline_substitutions else 0.0
+        ),
+        "insertion_net_change": int(final_metric["insertions"]) - int(baseline_metric["insertions"]),
+        "cer_absolute_change": float(final_metric["cer"]) - float(baseline_metric["cer"]),
+    }
+
+
 def evaluate_pair_payloads(
     baseline_payload: dict[str, Any],
     retrace_payload: dict[str, Any],
@@ -376,6 +415,7 @@ def evaluate_pair_payloads(
     raw_metric = metrics(reference, raw_text)
     final_metric = metrics(reference, final_text)
     revision_quality = _committed_revision_quality(session, rows)
+    overlap_diagnostic = overlap_region_metrics(session, rows)
     funnel = candidate_pipeline_metrics(session)
     effectiveness = None
     if not invalid_reasons:
@@ -406,6 +446,7 @@ def evaluate_pair_payloads(
         "raw": raw_metric,
         "final": final_metric,
         "effectiveness": effectiveness,
+        "overlap_region": overlap_diagnostic,
         "retrace": {
             "committed_revisions": revision_quality["committed"],
             "revision_quality": revision_quality,
@@ -436,6 +477,15 @@ def aggregate_results(items: list[dict[str, Any]]) -> dict[str, Any]:
     committed = sum(int(((item.get("retrace") or {}).get("revision_quality") or {}).get("committed") or 0) for item in valid)
     improved = sum(int(((item.get("retrace") or {}).get("revision_quality") or {}).get("improved") or 0) for item in valid)
     validated = sum(int(((item.get("retrace") or {}).get("candidate_funnel") or {}).get("validated_candidates") or 0) for item in valid)
+    harmed = sum(int(((item.get("retrace") or {}).get("revision_quality") or {}).get("harmed") or 0) for item in valid)
+    overlap_baseline = {
+        key: sum(int((((item.get("overlap_region") or {}).get("baseline") or {}).get(key)) or 0) for item in valid)
+        for key in ("edits", "reference_chars", "substitutions", "insertions", "deletions")
+    }
+    overlap_final = {
+        key: sum(int((((item.get("overlap_region") or {}).get("final") or {}).get(key)) or 0) for item in valid)
+        for key in ("edits", "reference_chars", "substitutions", "insertions", "deletions")
+    }
     stage_timings: Counter[str] = Counter()
     stage_calls: Counter[str] = Counter()
     for item in valid:
@@ -456,6 +506,7 @@ def aggregate_results(items: list[dict[str, Any]]) -> dict[str, Any]:
         "effectiveness": {
             "ecer": (baseline_edits - final_edits) / baseline_edits if baseline_edits else 0.0,
             "revision_precision": improved / committed if committed else None,
+            "harmful_revision_rate": harmed / committed if committed else None,
             "candidate_to_correction_yield": improved / validated if validated else None,
             "error_type_reduction": {
                 key: {
@@ -467,6 +518,19 @@ def aggregate_results(items: list[dict[str, Any]]) -> dict[str, Any]:
                 }
                 for key in ("substitutions", "insertions", "deletions")
             },
+        },
+        "overlap_region": {
+            "kind": "offline_gt_overlap_region_diagnostic",
+            "baseline": overlap_baseline,
+            "final": overlap_final,
+            "baseline_cer": overlap_baseline["edits"] / overlap_baseline["reference_chars"] if overlap_baseline["reference_chars"] else 0.0,
+            "final_cer": overlap_final["edits"] / overlap_final["reference_chars"] if overlap_final["reference_chars"] else 0.0,
+            "substitution_net_removed": overlap_baseline["substitutions"] - overlap_final["substitutions"],
+            "overlap_substitution_reduction_rate": (
+                (overlap_baseline["substitutions"] - overlap_final["substitutions"]) / overlap_baseline["substitutions"]
+                if overlap_baseline["substitutions"] else 0.0
+            ),
+            "insertion_net_change": overlap_final["insertions"] - overlap_baseline["insertions"],
         },
         "stage_timings_ms": dict(stage_timings),
         "stage_call_counts": dict(stage_calls),
