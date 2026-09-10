@@ -73,7 +73,13 @@ def _hypothesis(row: dict[str, object]) -> EvidenceHypothesis:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run frozen-evidence ReTrace V2 inference")
     parser.add_argument("--raw", type=Path, required=True)
-    parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument(
+        "--evidence",
+        type=Path,
+        action="append",
+        required=True,
+        help="Evidence JSONL; repeat to combine independent acoustic views",
+    )
     parser.add_argument("--predicted-rttm", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-tool-calls", type=int, default=3)
@@ -81,7 +87,7 @@ def main() -> None:
     args = parser.parse_args()
 
     raw_rows = _read_jsonl(args.raw)
-    evidence_rows = _read_jsonl(args.evidence)
+    evidence_rows = [row for path in args.evidence for row in _read_jsonl(path)]
     baseline_ids = {str(row.get("model_id") or "") for row in raw_rows}
     evidence_ids = {str(row.get("model_id") or "") for row in evidence_rows}
     if len(baseline_ids) != 1 or "" in baseline_ids:
@@ -132,7 +138,10 @@ def main() -> None:
             "run_id": manifest.run_id,
             "models": {role.value: identity for role, identity in manifest.models.items()},
             "rttm_source": manifest.rttm_source,
-            "inputs": {"raw": str(args.raw), "evidence": str(args.evidence)},
+            "inputs": {
+                "raw": str(args.raw),
+                "evidence": [str(path) for path in args.evidence],
+            },
             "policy": {
                 "commit_margin": policy.commit_margin,
                 "max_tool_calls": policy.max_tool_calls,
