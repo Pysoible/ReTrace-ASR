@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Mapping, Sequence
 
 
@@ -12,6 +13,27 @@ class ReferenceSpan:
     end_sec: float
     speaker: str
     text: str
+
+
+def parse_textgrid(path: Path) -> list[ReferenceSpan]:
+    speaker = "unknown"
+    start: float | None = None
+    end: float | None = None
+    spans: list[ReferenceSpan] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if match := re.fullmatch(r'name\s*=\s*"(.*)"', stripped):
+            speaker = match.group(1) or "unknown"
+        elif match := re.fullmatch(r"xmin\s*=\s*([0-9.]+)", stripped):
+            start = float(match.group(1))
+        elif match := re.fullmatch(r"xmax\s*=\s*([0-9.]+)", stripped):
+            end = float(match.group(1))
+        elif match := re.fullmatch(r'text\s*=\s*"(.*)"', stripped):
+            text = re.sub(r"<[^>]+>", "", match.group(1)).strip()
+            if text and start is not None and end is not None and end > start:
+                spans.append(ReferenceSpan(start, end, speaker, text))
+            start = end = None
+    return sorted(spans, key=lambda span: (span.start_sec, span.end_sec, span.speaker))
 
 
 def extract_raw_rows(

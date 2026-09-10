@@ -2,7 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from retrace_v2.dataset import ReferenceSpan, assign_references, extract_raw_rows
+from retrace_v2.dataset import (
+    ReferenceSpan,
+    assign_references,
+    extract_raw_rows,
+    parse_textgrid,
+)
 
 
 def moss_payload() -> dict[str, object]:
@@ -71,4 +76,33 @@ def test_assign_references_uses_largest_time_overlap() -> None:
     assert assigned == [
         {"segment_id": "rec1:t1", "reference_text": "甲"},
         {"segment_id": "rec1:t2", "reference_text": "乙"},
+    ]
+
+
+def test_parse_textgrid_keeps_speaker_and_nonempty_intervals(tmp_path: Path) -> None:
+    path = tmp_path / "rec1.TextGrid"
+    path.write_text(
+        '''item [1]:
+        name = "speaker_a"
+        intervals [1]:
+            xmin = 0.2
+            xmax = 0.8
+            text = "甲"
+        intervals [2]:
+            xmin = 0.8
+            xmax = 1.0
+            text = ""
+        item [2]:
+        name = "speaker_b"
+        intervals [1]:
+            xmin = 0.9
+            xmax = 1.8
+            text = "乙<sil>"
+        ''',
+        encoding="utf-8",
+    )
+
+    assert parse_textgrid(path) == [
+        ReferenceSpan(0.2, 0.8, "speaker_a", "甲"),
+        ReferenceSpan(0.9, 1.8, "speaker_b", "乙"),
     ]
