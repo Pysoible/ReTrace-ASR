@@ -33,8 +33,13 @@ def moss_payload() -> dict[str, object]:
 
 
 def test_extract_raw_rows_uses_immutable_raw_not_legacy_current_text() -> None:
+    payload = moss_payload()
+    payload["asr"] = {
+        "backend": "moss-transcribe-diarize",
+        "model": "MOSS-Transcribe-Diarize",
+    }
     rows = extract_raw_rows(
-        moss_payload(),
+        payload,
         recording_id="rec1",
         audio_path=Path("/data/rec1.wav"),
         baseline_model="MOSS-Transcribe-Diarize",

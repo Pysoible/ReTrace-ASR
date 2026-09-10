@@ -49,7 +49,10 @@ def extract_raw_rows(
     payload_model = str(asr_meta.get("model") or "").casefold()
     expected = baseline_model.casefold()
     if "moss" in expected and (
-        backend != "moss" or "moss" not in payload_model or "omni" in payload_model
+        "moss" not in backend
+        or "omni" in backend
+        or "moss" not in payload_model
+        or "omni" in payload_model
     ):
         raise ValueError("payload model identity does not prove a MOSS baseline")
 
