@@ -60,6 +60,26 @@ class EditCandidate:
 
 
 @dataclass(frozen=True)
+class EvidenceHypothesis:
+    hypothesis_id: str
+    model_id: str
+    view: str
+    text: str
+    start_sec: float
+    end_sec: float
+    acoustic_score: float
+    speaker: str | None = None
+
+
+@dataclass(frozen=True)
+class SpeakerTurn:
+    recording_id: str
+    speaker: str
+    start_sec: float
+    end_sec: float
+
+
+@dataclass(frozen=True)
 class RunManifest:
     run_id: str
     models: Mapping[ModelRole, str]
