@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
 
 from retrace_v2.adapters.paraformer import ParaformerAdapter
 from retrace_v2.artifacts import ArtifactWriter
-from retrace_v2.evidence import generate_evidence_rows
+from retrace_v2.evidence import expand_audio_windows, generate_evidence_rows
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
@@ -26,13 +26,27 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--recording-id", action="append", default=[])
+    parser.add_argument("--window-padding-sec", type=float, default=0.0)
     args = parser.parse_args()
 
     raw_rows = _read_jsonl(args.raw)
+    if args.recording_id:
+        selected_recordings = set(args.recording_id)
+        raw_rows = [
+            row for row in raw_rows if str(row.get("recording_id")) in selected_recordings
+        ]
     if args.limit > 0:
         raw_rows = raw_rows[: args.limit]
+    view = "original"
+    if args.window_padding_sec:
+        raw_rows = expand_audio_windows(
+            raw_rows,
+            padding_sec=args.window_padding_sec,
+        )
+        view = f"expanded_{args.window_padding_sec:g}s"
     adapter = ParaformerAdapter(args.model)
-    evidence, failures, timings = generate_evidence_rows(raw_rows, adapter)
+    evidence, failures, timings = generate_evidence_rows(raw_rows, adapter, view=view)
     writer = ArtifactWriter(args.output_dir)
     writer.write_jsonl("evidence.jsonl", evidence)
     writer.write_jsonl("failures.jsonl", failures)
@@ -43,6 +57,7 @@ def main() -> None:
             "evidence_model": args.model,
             "input": str(args.raw),
             "requested_segments": len(raw_rows),
+            "window_padding_sec": args.window_padding_sec,
             "successful_hypotheses": len(evidence),
             "failed_segments": len(failures),
         }
