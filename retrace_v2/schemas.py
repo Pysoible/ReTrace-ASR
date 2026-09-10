@@ -31,6 +31,35 @@ class RawSegment:
 
 
 @dataclass(frozen=True)
+class CharacterEdit:
+    kind: str
+    start: int
+    end: int
+    replacement: str
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"SUB", "INS", "DEL"}:
+            raise ValueError(f"invalid edit kind: {self.kind}")
+        if self.start < 0 or self.end < self.start:
+            raise ValueError("invalid edit span")
+
+
+@dataclass(frozen=True)
+class EditCandidate:
+    candidate_id: str
+    raw_text: str
+    candidate_text: str
+    edits: tuple[CharacterEdit, ...]
+    evidence_sources: tuple[str, ...]
+    acoustic_score: float = 0.0
+    semantic_score: float = 0.0
+
+    @classmethod
+    def keep(cls, raw_text: str) -> "EditCandidate":
+        return cls("keep", raw_text, raw_text, (), ())
+
+
+@dataclass(frozen=True)
 class RunManifest:
     run_id: str
     models: Mapping[ModelRole, str]
