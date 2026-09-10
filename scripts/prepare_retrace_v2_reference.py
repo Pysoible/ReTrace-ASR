@@ -36,6 +36,7 @@ def main() -> None:
     parser.add_argument("--raw", type=Path, required=True)
     parser.add_argument("--textgrid-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--recording-output", type=Path)
     args = parser.parse_args()
 
     by_recording: dict[str, list[dict[str, object]]] = defaultdict(list)
@@ -43,9 +44,16 @@ def main() -> None:
         by_recording[str(row["recording_id"])].append(row)
 
     output: list[dict[str, str]] = []
+    recording_output: list[dict[str, str]] = []
     for recording_id, raw_rows in sorted(by_recording.items()):
         spans = parse_textgrid(_textgrid_for(args.textgrid_dir, recording_id))
         output.extend(assign_references(raw_rows, spans))
+        recording_output.append(
+            {
+                "recording_id": recording_id,
+                "reference_text": "".join(span.text for span in spans),
+            }
+        )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")
@@ -53,6 +61,15 @@ def main() -> None:
         for row in output:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     temporary.replace(args.output)
+    recording_path = args.recording_output or args.output.with_name(
+        "recording_reference.jsonl"
+    )
+    recording_path.parent.mkdir(parents=True, exist_ok=True)
+    recording_temporary = recording_path.with_suffix(recording_path.suffix + ".tmp")
+    with recording_temporary.open("w", encoding="utf-8") as handle:
+        for row in recording_output:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    recording_temporary.replace(recording_path)
     print(json.dumps({"recordings": len(by_recording), "segments": len(output)}))
 
 

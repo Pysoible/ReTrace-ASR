@@ -1,7 +1,7 @@
 """Reference-aware scoring that runs only after V2 inference."""
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
@@ -110,4 +110,60 @@ def score_rows(rows: Iterable[Mapping[str, object]]) -> ScoreReport:
         improving_revisions=improving,
         harmful_revisions=harmful,
         neutral_revisions=neutral,
+    )
+
+
+def score_recordings(
+    rows: Iterable[Mapping[str, object]],
+    recording_references: Mapping[str, str],
+) -> ScoreReport:
+    values = list(rows)
+    by_recording: dict[str, list[Mapping[str, object]]] = defaultdict(list)
+    for row in values:
+        by_recording[str(row["recording_id"])].append(row)
+    if set(by_recording) != set(recording_references):
+        raise ValueError("inference and recording reference IDs must match exactly")
+
+    raw_total: Counter[str] = Counter()
+    final_total: Counter[str] = Counter()
+    oracle_total: Counter[str] = Counter()
+    for recording_id, recording_rows in by_recording.items():
+        ordered = sorted(
+            recording_rows,
+            key=lambda row: (
+                float(row.get("start_sec") or 0.0),
+                float(row.get("end_sec") or 0.0),
+                str(row.get("segment_id") or ""),
+            ),
+        )
+        raw_parts: list[str] = []
+        final_parts: list[str] = []
+        oracle_parts: list[str] = []
+        for row in ordered:
+            local_reference = str(row.get("reference_text") or "")
+            raw = str(row.get("raw_text") or "")
+            final = str(row.get("final_text") or raw)
+            candidates_value = row.get("candidates") or [raw]
+            candidates = [str(item) for item in candidates_value]  # type: ignore[union-attr]
+            if raw not in candidates:
+                candidates.insert(0, raw)
+            raw_parts.append(raw)
+            final_parts.append(final)
+            oracle_parts.append(
+                min(candidates, key=lambda candidate: _distance(local_reference, candidate))
+            )
+        reference = recording_references[recording_id]
+        raw_total.update(_counts(reference, "".join(raw_parts)))
+        final_total.update(_counts(reference, "".join(final_parts)))
+        oracle_total.update(_counts(reference, "".join(oracle_parts)))
+
+    local = score_rows(values)
+    return ScoreReport(
+        raw=_metric(raw_total),
+        final=_metric(final_total),
+        oracle_candidate=_metric(oracle_total),
+        committed_revisions=local.committed_revisions,
+        improving_revisions=local.improving_revisions,
+        harmful_revisions=local.harmful_revisions,
+        neutral_revisions=local.neutral_revisions,
     )

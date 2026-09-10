@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from retrace_v2.artifacts import ArtifactWriter
-from retrace_v2.scoring import score_rows
+from retrace_v2.scoring import score_recordings, score_rows
 
 
 def scored_row(
@@ -73,3 +73,25 @@ def test_revision_precision_counts_only_committed_changes() -> None:
     assert report.improving_revisions == 1
     assert report.harmful_revisions == 1
     assert report.revision_precision == pytest.approx(0.5)
+
+
+def test_recording_score_uses_whole_recording_order_not_turn_error_sum() -> None:
+    rows = [
+        {
+            **scored_row("乙", "甲", "甲", ["甲"]),
+            "segment_id": "s1",
+            "recording_id": "rec",
+            "start_sec": 0.0,
+        },
+        {
+            **scored_row("甲", "乙", "乙", ["乙"]),
+            "segment_id": "s2",
+            "recording_id": "rec",
+            "start_sec": 0.5,
+        },
+    ]
+
+    report = score_recordings(rows, {"rec": "甲乙"})
+
+    assert score_rows(rows).raw.edits == 2
+    assert report.raw.edits == 0

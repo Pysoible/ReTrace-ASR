@@ -48,6 +48,8 @@ def test_inference_has_no_reference_option_and_scorer_is_separate(tmp_path: Path
             str(run_dir),
             "--reference",
             str(ROOT / "tests_v2/fixtures/reference.jsonl"),
+            "--recording-reference",
+            str(ROOT / "tests_v2/fixtures/recording_reference.jsonl"),
         ],
         cwd=ROOT,
         capture_output=True,

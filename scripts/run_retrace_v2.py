@@ -172,11 +172,14 @@ def main() -> None:
             {
                 "segment_id": result.segment_id,
                 "region_id": result.region_id,
+                "recording_id": str(raw_row["recording_id"]),
+                "start_sec": float(raw_row["start_sec"]),
+                "end_sec": float(raw_row["end_sec"]),
                 "raw_text": result.raw_text,
                 "final_text": result.final_text,
                 "candidates": [item.candidate_text for item in result.candidates],
             }
-            for result in results
+            for result, raw_row in zip(results, raw_rows, strict=True)
         ),
     )
     writer.write_json(

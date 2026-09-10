@@ -105,3 +105,6 @@ def test_reference_cli_assigns_textgrid_after_raw_export(tmp_path: Path) -> None
         "segment_id": "rec1:t1",
         "reference_text": "方案",
     }
+    assert json.loads(
+        (tmp_path / "recording_reference.jsonl").read_text(encoding="utf-8")
+    ) == {"recording_id": "rec1", "reference_text": "方案"}

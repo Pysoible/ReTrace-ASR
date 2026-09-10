@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from retrace_v2.artifacts import ArtifactWriter
-from retrace_v2.scoring import ErrorMetric, score_rows
+from retrace_v2.scoring import ErrorMetric, score_recordings
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
@@ -28,6 +28,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Offline scoring for a finalized V2 run")
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
+    parser.add_argument("--recording-reference", type=Path, required=True)
     args = parser.parse_args()
 
     hypotheses = _read_jsonl(args.run / "final_hypothesis.jsonl")
@@ -45,7 +46,11 @@ def main() -> None:
         }
         for row in hypotheses
     ]
-    report = score_rows(rows)
+    recording_references = {
+        str(row["recording_id"]): str(row.get("reference_text") or "")
+        for row in _read_jsonl(args.recording_reference)
+    }
+    report = score_recordings(rows, recording_references)
     payload = {
         "raw": _metric_payload(report.raw),
         "final": _metric_payload(report.final),
