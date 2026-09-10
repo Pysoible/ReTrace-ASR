@@ -1,0 +1,1 @@
+{"segment_id":"s1","region_id":"r1","start_sec":0.0,"end_sec":1.0,"speaker":"spk0","text":"方按","model_id":"MOSS-Transcribe-Diarize","raw_acoustic_score":0.5,"overlap_probability":0.0,"triggers":["asr_disagreement"]}

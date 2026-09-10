@@ -61,6 +61,11 @@ class ArtifactWriter:
         temporary.replace(target)
         return target
 
+    def write_json(self, filename: str, payload: object) -> Path:
+        if Path(filename).name != filename or not filename.endswith(".json"):
+            raise ValueError("artifact filename must be a local .json name")
+        return self._write_json(filename, payload)
+
     def _write_json(self, filename: str, payload: object) -> Path:
         target = self.output_dir / filename
         temporary = target.with_suffix(target.suffix + ".tmp")

@@ -107,6 +107,7 @@ class AgentAction:
 @dataclass(frozen=True)
 class AgentResult:
     region_id: str
+    segment_id: str
     raw_text: str
     final_text: str
     decision: str

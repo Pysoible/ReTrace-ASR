@@ -119,6 +119,7 @@ class ReTraceAgent:
     ) -> AgentResult:
         return AgentResult(
             region_id=region.region_id,
+            segment_id=region.segment_id,
             raw_text=region.raw_text,
             final_text=selected.candidate_text,
             decision="COMMIT",
@@ -137,6 +138,7 @@ class ReTraceAgent:
         actions.append(AgentAction("KEEP", reason))
         return AgentResult(
             region_id=region.region_id,
+            segment_id=region.segment_id,
             raw_text=region.raw_text,
             final_text=region.raw_text,
             decision="KEEP",
