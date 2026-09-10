@@ -80,6 +80,42 @@ class SpeakerTurn:
 
 
 @dataclass(frozen=True)
+class SuspiciousRegion:
+    region_id: str
+    segment_id: str
+    start_sec: float
+    end_sec: float
+    raw_text: str
+    raw_acoustic_score: float
+    overlap_probability: float
+    triggers: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.end_sec <= self.start_sec:
+            raise ValueError("region end must be after start")
+        if not 0.0 <= self.overlap_probability <= 1.0:
+            raise ValueError("overlap_probability must be in [0, 1]")
+
+
+@dataclass(frozen=True)
+class AgentAction:
+    kind: str
+    reason: str
+    tool_cost: int = 0
+
+
+@dataclass(frozen=True)
+class AgentResult:
+    region_id: str
+    raw_text: str
+    final_text: str
+    decision: str
+    actions: tuple[AgentAction, ...]
+    candidates: tuple[EditCandidate, ...]
+    selected_candidate_id: str | None = None
+
+
+@dataclass(frozen=True)
 class RunManifest:
     run_id: str
     models: Mapping[ModelRole, str]
