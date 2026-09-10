@@ -7,6 +7,30 @@ from scripts.run_aishell4_eval import (
     resolve_reference_path,
     retrace_miss_analysis,
 )
+
+
+def test_parse_textgrid_reference_keeps_multiline_interval_text(tmp_path):
+    reference = tmp_path / "meeting.TextGrid"
+    reference.write_text(
+        '''File type = "ooTextFile"
+item [1]:
+    name = "001-M"
+    intervals [1]:
+        xmin = 1.0
+        xmax = 3.0
+        text = "第一行内容
+第二行内容
+"
+''',
+        encoding="utf-8",
+    )
+
+    text, rows = parse_reference(reference)
+
+    assert text == "第一行内容第二行内容"
+    assert rows == [
+        {"start": 1.0, "end": 3.0, "spk": "001-M", "text": "第一行内容第二行内容"}
+    ]
 from scripts.export_aishell4_errors import _group_for_display, _strip_time
 
 

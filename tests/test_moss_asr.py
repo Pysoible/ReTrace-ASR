@@ -192,6 +192,46 @@ def test_transcribe_audio_posts_to_moss_endpoint(monkeypatch, tmp_path):
     assert result["chunks"][0]["speaker"] == "S01"
 
 
+def test_transcribe_audio_sends_optional_closed_set_prompt(monkeypatch, tmp_path):
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"audio")
+    seen = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            return json.dumps({"text": "[0.00][S01]室内比较好[1.00]"}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        seen["body"] = request.data.decode("utf-8", errors="ignore")
+        return Response()
+
+    monkeypatch.setattr(moss_asr.urllib.request, "urlopen", fake_urlopen)
+
+    result = moss_asr.transcribe_audio(str(audio), prompt="候选关键词：室内")
+
+    assert 'name="prompt"' in seen["body"]
+    assert "候选关键词：室内" in seen["body"]
+    assert result["prompted"] is True
+
+
+def test_parse_prompted_transcript_without_speaker_labels_keeps_timestamps():
+    parsed = moss_asr.parse_moss_transcript(
+        "[0.15]什么时候开？[1.61][2.72]还是室内比较好。[5.95]"
+    )
+
+    assert parsed["chunks_text"] == ["什么时候开？", "还是室内比较好。"]
+    assert parsed["chunks"] == [
+        {"index": 0, "start_sec": 0.15, "end_sec": 1.61},
+        {"index": 1, "start_sec": 2.72, "end_sec": 5.95},
+    ]
+
+
 def test_moss_request_uses_transcription_completion_parameter(monkeypatch, tmp_path):
     audio = tmp_path / "sample.wav"
     audio.write_bytes(b"audio")

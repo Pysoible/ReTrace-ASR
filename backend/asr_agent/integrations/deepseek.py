@@ -155,6 +155,104 @@ def context_judge_identity() -> dict[str, str]:
     }
 
 
+def select_closed_set_replacement(
+    sentence: str,
+    candidate: dict[str, Any],
+    *,
+    minimum_confidence: float = 0.80,
+) -> dict[str, Any]:
+    """Use DeepSeek only to keep the baseline or choose one acoustic candidate.
+
+    The model sees neither reference text nor an open generation instruction.
+    Any response outside the two allowed decisions is converted to KEEP_BASELINE.
+    Selection only routes the candidate to acoustic verification; it never
+    authorizes a transcript edit by itself.
+    """
+    candidate_id = str(candidate.get("candidate_id") or "")
+    baseline = str(candidate.get("source_text") or "")
+    replacement = str(candidate.get("candidate_text") or "")
+    allowed = ["KEEP_BASELINE", candidate_id]
+    base_result = {
+        "decision": "KEEP_BASELINE",
+        "selected": False,
+        "eligible_for_acoustic_verification": False,
+        "confidence": 0.0,
+        "rationale": "",
+        "candidate_id": candidate_id,
+        "judge": context_judge_identity(),
+    }
+    if not _api_key():
+        return {**base_result, "reason": "deepseek_unavailable"}
+    if not candidate_id or not baseline or not replacement:
+        return {**base_result, "reason": "invalid_candidate"}
+    start = int(candidate.get("anchor_start", -1))
+    end = int(candidate.get("anchor_end", -1))
+    if start < 0 or end <= start or sentence[start:end] != baseline:
+        return {**base_result, "reason": "source_offset_mismatch"}
+    candidate_sentence = sentence[:start] + replacement + sentence[end:]
+    payload = {
+        "sentence": sentence,
+        "sentence_options": [
+            {"decision": "KEEP_BASELINE", "text": sentence},
+            {"decision": candidate_id, "text": candidate_sentence},
+        ],
+        "acoustic_candidate": {
+            "candidate_id": candidate_id,
+            "baseline_span": baseline,
+            "candidate_span": replacement,
+            "supporting_view_count": int(candidate.get("support") or 0),
+            "supporting_views": list(candidate.get("sources") or []),
+        },
+        "allowed_decisions": allowed,
+        "instruction": (
+            "只做闭集语义选择。直接比较 sentence_options 中两条完整句子，重点检查局部句法、"
+            "常见搭配、前后因果关系和口语自然度；不要仅因为原句勉强可解释就忽略明显更自然的候选。"
+            "只有候选句明显更合理才选择它，否则保留原句。声学视图只是候选来源，不代表答案。"
+            "只能返回 JSON：decision 必须严格等于 allowed_decisions 中一个值；"
+            "confidence 为 0 到 1；rationale 简短说明语义理由。不得生成新转写或第三个候选。"
+            "不确定时必须选择 KEEP_BASELINE。"
+        ),
+    }
+    try:
+        result = _chat_json(
+            [
+                {
+                    "role": "system",
+                    "content": "你是 ASR 闭集语义门，只能保留原文或选择给定声学候选。",
+                },
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            max_tokens=int(os.getenv("ASR_CLOSED_SET_JUDGE_MAX_TOKENS", "180")),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {**base_result, "reason": "judge_error", "error_type": type(exc).__name__}
+    if not isinstance(result, dict):
+        return {**base_result, "reason": "malformed_response"}
+    decision = str(result.get("decision") or "")
+    confidence = max(0.0, min(1.0, float(result.get("confidence") or 0.0)))
+    rationale = str(result.get("rationale") or "")[:300]
+    if decision not in allowed:
+        return {
+            **base_result,
+            "confidence": confidence,
+            "rationale": rationale,
+            "reason": "out_of_closed_set_response",
+        }
+    selected = decision == candidate_id and confidence >= minimum_confidence
+    return {
+        **base_result,
+        "decision": candidate_id if selected else "KEEP_BASELINE",
+        "selected": selected,
+        "eligible_for_acoustic_verification": selected,
+        "confidence": confidence,
+        "rationale": rationale,
+        "reason": "selected" if selected else (
+            "below_confidence_threshold" if decision == candidate_id else "kept_baseline"
+        ),
+        "minimum_confidence": minimum_confidence,
+    }
+
+
 def _chat_json(messages: list[dict[str, str]], *, max_tokens: int = 800) -> Any:
     transport = os.getenv("LLM_TRANSPORT", "http").strip().lower() or "http"
     if transport == "websocket":

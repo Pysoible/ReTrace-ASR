@@ -174,7 +174,11 @@ def _parse_textgrid_reference(path: Path) -> tuple[str, list[dict[str, Any]]]:
     speaker = "unknown"
     start: float | None = None
     end: float | None = None
-    for line in path.read_text(encoding="utf-8").splitlines():
+    lines = path.read_text(encoding="utf-8").splitlines()
+    line_index = 0
+    while line_index < len(lines):
+        line = lines[line_index]
+        line_index += 1
         if name_match := _TEXTGRID_NAME_RE.match(line):
             speaker = name_match[1] or speaker
             continue
@@ -184,8 +188,22 @@ def _parse_textgrid_reference(path: Path) -> tuple[str, list[dict[str, Any]]]:
         if xmax_match := _TEXTGRID_XMAX_RE.match(line):
             end = float(xmax_match[1])
             continue
-        if text_match := _TEXTGRID_TEXT_RE.match(line):
-            text = re.sub(r"<[^>]+>", "", text_match[1]).strip()
+        stripped = line.strip()
+        if stripped.startswith('text = "'):
+            value = stripped[len('text = "'):]
+            if value.endswith('"'):
+                value = value[:-1]
+            else:
+                continuation = [value]
+                while line_index < len(lines):
+                    current = lines[line_index]
+                    line_index += 1
+                    if current.rstrip().endswith('"'):
+                        continuation.append(current.rstrip()[:-1])
+                        break
+                    continuation.append(current)
+                value = "".join(continuation)
+            text = re.sub(r"<[^>]+>", "", value.replace('""', '"')).strip()
             if text and start is not None and end is not None and end > start:
                 rows.append({"start": start, "end": end, "spk": speaker, "text": text})
             start = end = None

@@ -3,6 +3,73 @@ from asr_agent.memory import MemoryPacket
 from asr_agent.models import Session, Turn
 
 
+def test_closed_set_semantic_selector_cannot_invent_a_candidate(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    seen = {}
+
+    def fake_chat(messages, **_):
+        import json
+
+        seen["payload"] = json.loads(messages[1]["content"])
+        return {
+            "decision": "replace:2:4:时间:室内",
+            "confidence": 0.93,
+            "rationale": "因为天气冷，室内更符合语义",
+        }
+
+    monkeypatch.setattr(deepseek, "_chat_json", fake_chat)
+    candidate = {
+        "candidate_id": "replace:2:4:时间:室内",
+        "operation": "replace",
+        "anchor_start": 2,
+        "anchor_end": 4,
+        "source_text": "时间",
+        "candidate_text": "室内",
+        "support": 3,
+        "sources": ["beam_270", "channel_2", "channel_5"],
+    }
+
+    result = deepseek.select_closed_set_replacement("还是时间比较好，因为天气冷", candidate)
+
+    assert result["decision"] == candidate["candidate_id"]
+    assert result["selected"] is True
+    assert result["eligible_for_acoustic_verification"] is True
+    assert seen["payload"]["allowed_decisions"] == ["KEEP_BASELINE", candidate["candidate_id"]]
+    assert seen["payload"]["sentence_options"] == [
+        {"decision": "KEEP_BASELINE", "text": "还是时间比较好，因为天气冷"},
+        {"decision": candidate["candidate_id"], "text": "还是室内比较好，因为天气冷"},
+    ]
+    assert "reference" not in seen["payload"]
+
+
+def test_closed_set_semantic_selector_rejects_out_of_set_model_answer(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(
+        deepseek,
+        "_chat_json",
+        lambda *_args, **_kwargs: {
+            "decision": "replace:invented",
+            "confidence": 0.99,
+            "rationale": "invented",
+        },
+    )
+    candidate = {
+        "candidate_id": "replace:2:4:时间:室内",
+        "anchor_start": 2,
+        "anchor_end": 4,
+        "source_text": "时间",
+        "candidate_text": "室内",
+        "support": 3,
+        "sources": ["a", "b", "c"],
+    }
+
+    result = deepseek.select_closed_set_replacement("还是时间比较好", candidate)
+
+    assert result["decision"] == "KEEP_BASELINE"
+    assert result["selected"] is False
+    assert result["reason"] == "out_of_closed_set_response"
+
+
 def test_public_deepseek_status_does_not_require_domainterms_repo(monkeypatch, tmp_path):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")

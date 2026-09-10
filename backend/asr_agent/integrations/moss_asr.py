@@ -23,6 +23,10 @@ _SEGMENT_RE = re.compile(
     r"\[(?P<start>\d+(?:\.\d+)?)\]\[(?P<speaker>S\d+)\](?P<text>.*?)\[(?P<end>\d+(?:\.\d+)?)\]",
     re.DOTALL,
 )
+_UNLABELED_SEGMENT_RE = re.compile(
+    r"\[(?P<start>\d+(?:\.\d+)?)\](?P<text>.*?)\[(?P<end>\d+(?:\.\d+)?)\]",
+    re.DOTALL,
+)
 _TRANSCRIPT_CHAR_RE = re.compile(r"[0-9A-Za-z\u4e00-\u9fff]")
 
 
@@ -195,21 +199,26 @@ def parse_moss_transcript(raw: str) -> dict[str, Any]:
     """Parse canonical MOSS ``[start][Sxx]text[end]`` output."""
     chunks_text: list[str] = []
     chunks: list[dict[str, Any]] = []
-    for index, match in enumerate(_SEGMENT_RE.finditer(raw or "")):
+    matches = list(_SEGMENT_RE.finditer(raw or ""))
+    speaker_labeled = bool(matches)
+    if not matches:
+        matches = list(_UNLABELED_SEGMENT_RE.finditer(raw or ""))
+    for index, match in enumerate(matches):
         text = re.sub(r"\s+", " ", match.group("text")).strip()
         if not text:
             continue
         chunks_text.append(text)
-        chunks.append(
-            {
-                "index": index,
-                "start_sec": float(match.group("start")),
-                "end_sec": float(match.group("end")),
-                "speaker": match.group("speaker"),
-            }
-        )
+        chunk = {
+            "index": index,
+            "start_sec": float(match.group("start")),
+            "end_sec": float(match.group("end")),
+        }
+        if speaker_labeled:
+            chunk["speaker"] = match.group("speaker")
+        chunks.append(chunk)
     if chunks_text:
-        chunks = annotate_speaker_overlaps(chunks)
+        if speaker_labeled:
+            chunks = annotate_speaker_overlaps(chunks)
         return {"text": "".join(chunks_text), "chunks_text": chunks_text, "chunks": chunks}
     text = re.sub(r"\s+", " ", raw or "").strip()
     return {
@@ -333,13 +342,15 @@ def _multipart_form(fields: dict[str, str], file_field: str, file_path: Path) ->
     return b"".join(parts), boundary
 
 
-def _post_transcription(audio_path: Path) -> dict[str, Any]:
+def _post_transcription(audio_path: Path, prompt: str = "") -> dict[str, Any]:
     fields = {
         "model": os.getenv("MOSS_MODEL_NAME", MOSS_TRANSCRIBE_DIARIZE_MODEL),
         "response_format": os.getenv("MOSS_RESPONSE_FORMAT", "json"),
         "temperature": os.getenv("MOSS_TEMPERATURE", "0"),
         "max_completion_tokens": _env_max_completion_tokens(),
     }
+    if prompt.strip():
+        fields["prompt"] = prompt.strip()
     body, boundary = _multipart_form(fields, "file", audio_path)
     request = urllib.request.Request(
         _env_url(),
@@ -374,7 +385,7 @@ def shutdown_engines() -> None:
     return None
 
 
-def transcribe_audio(audio: str) -> dict[str, Any]:
+def transcribe_audio(audio: str, prompt: str = "") -> dict[str, Any]:
     started = time.perf_counter()
     audio_path = Path((audio or "").strip()).expanduser()
     if not str(audio_path):
@@ -382,7 +393,7 @@ def transcribe_audio(audio: str) -> dict[str, Any]:
     if not audio_path.exists():
         return {"ok": False, "error": f"找不到音频文件: {audio}"}
     try:
-        payload = _post_transcription(audio_path)
+        payload = _post_transcription(audio_path, prompt) if prompt.strip() else _post_transcription(audio_path)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         return {"ok": False, "error": f"MOSS HTTP {exc.code}: {detail}"}
@@ -408,6 +419,7 @@ def transcribe_audio(audio: str) -> dict[str, Any]:
         "chunk_count": len(parsed["chunks_text"]),
         "chunks": parsed["chunks"],
         "raw_response": payload,
+        "prompted": bool(prompt.strip()),
         "elapsed_sec": round(time.perf_counter() - started, 3),
     }
 
