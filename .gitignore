@@ -8,3 +8,14 @@ frontend/node_modules/
 node_modules/
 .DS_Store
 .worktrees/
+.tools/
+
+retrace_state/
+*.wav
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.fdb_latexmk
+paper/*.fls
+paper/*.log
+paper/*.pdf
